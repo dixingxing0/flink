@@ -107,6 +107,7 @@ import org.apache.flink.runtime.taskmanager.Task;
 import org.apache.flink.runtime.taskmanager.TaskExecutionState;
 import org.apache.flink.runtime.taskmanager.TaskManagerActions;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
+import org.apache.flink.runtime.util.log.LogLevelWorker;
 import org.apache.flink.types.SerializableOptional;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkException;
@@ -1868,5 +1869,11 @@ public class TaskExecutor extends RpcEndpoint implements TaskExecutorGateway {
 					})
 					.collect(Collectors.toList()));
 		}
+	}
+
+	@Override
+	public void changeTaskManagerLogLevel(String params) {
+		log.info("Changing log level, params is : {}.", params);
+		new LogLevelWorker(params).changeLogLevel();
 	}
 }

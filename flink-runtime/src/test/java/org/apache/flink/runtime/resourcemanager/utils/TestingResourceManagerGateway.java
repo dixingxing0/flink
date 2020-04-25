@@ -322,4 +322,9 @@ public class TestingResourceManagerGateway implements ResourceManagerGateway {
 	public String getHostname() {
 		return hostname;
 	}
+
+	@Override
+	public void changeTaskManagerLogLevel(ResourceID taskManagerId, String param) {
+
+	}
 }

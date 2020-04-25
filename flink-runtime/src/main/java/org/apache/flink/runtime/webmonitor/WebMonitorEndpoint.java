@@ -77,10 +77,7 @@ import org.apache.flink.runtime.rest.handler.legacy.files.StaticFileServerHandle
 import org.apache.flink.runtime.rest.handler.legacy.files.StdoutFileHandlerSpecification;
 import org.apache.flink.runtime.rest.handler.legacy.files.WebContentHandlerSpecification;
 import org.apache.flink.runtime.rest.handler.legacy.metrics.MetricFetcher;
-import org.apache.flink.runtime.rest.handler.taskmanager.TaskManagerDetailsHandler;
-import org.apache.flink.runtime.rest.handler.taskmanager.TaskManagerLogFileHandler;
-import org.apache.flink.runtime.rest.handler.taskmanager.TaskManagerStdoutFileHandler;
-import org.apache.flink.runtime.rest.handler.taskmanager.TaskManagersHandler;
+import org.apache.flink.runtime.rest.handler.taskmanager.*;
 import org.apache.flink.runtime.rest.messages.ClusterConfigurationInfoHeaders;
 import org.apache.flink.runtime.rest.messages.ClusterOverviewHeaders;
 import org.apache.flink.runtime.rest.messages.DashboardConfigurationHeaders;
@@ -109,6 +106,7 @@ import org.apache.flink.runtime.rest.messages.job.JobDetailsHeaders;
 import org.apache.flink.runtime.rest.messages.job.SubtaskCurrentAttemptDetailsHeaders;
 import org.apache.flink.runtime.rest.messages.job.SubtaskExecutionAttemptAccumulatorsHeaders;
 import org.apache.flink.runtime.rest.messages.job.SubtaskExecutionAttemptDetailsHeaders;
+import org.apache.flink.runtime.rest.messages.log.Log4jHeaders;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerDetailsHeaders;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerLogFileHeaders;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerStdoutFileHeaders;
@@ -631,8 +629,16 @@ public class WebMonitorEndpoint<T extends RestfulGateway> extends RestServerEndp
 			transientBlobService,
 			cacheEntryDuration);
 
+		final Log4jHandler log4jHandler = new Log4jHandler(
+			leaderRetriever,
+			timeout,
+			responseHeaders,
+			Log4jHeaders.getInstance(),
+			resourceManagerRetriever);
+
 		handlers.add(Tuple2.of(TaskManagerLogFileHeaders.getInstance(), taskManagerLogFileHandler));
 		handlers.add(Tuple2.of(TaskManagerStdoutFileHeaders.getInstance(), taskManagerStdoutFileHandler));
+		handlers.add(Tuple2.of(Log4jHeaders.getInstance(), log4jHandler));
 
 		handlers.stream()
 			.map(tuple -> tuple.f1)

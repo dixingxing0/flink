@@ -1213,5 +1213,17 @@ public abstract class ResourceManager<WorkerType extends ResourceIDRetrievable>
 		final ResourceProfile resourceProfile = TaskManagerServices.computeSlotResourceProfile(numSlots, managedMemoryBytes);
 		return Collections.nCopies(numSlots, resourceProfile);
 	}
+
+	@Override
+	public void changeTaskManagerLogLevel(ResourceID taskManagerId, String params) {
+		final WorkerRegistration<WorkerType> taskExecutor = taskExecutors.get(taskManagerId);
+		if (taskExecutor != null) {
+			log.info("Changing log level for taskmanager {}, params is : {}",
+				taskExecutor.getTaskExecutorGateway().getAddress(), params);
+			taskExecutor.getTaskExecutorGateway().changeTaskManagerLogLevel(params);
+		} else {
+			log.info("WorkerRegistration is null for resourceId : {}", taskManagerId);
+		}
+	}
 }
 

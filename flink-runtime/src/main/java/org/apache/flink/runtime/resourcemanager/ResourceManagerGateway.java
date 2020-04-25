@@ -40,6 +40,7 @@ import org.apache.flink.runtime.rpc.RpcTimeout;
 import org.apache.flink.runtime.taskexecutor.FileType;
 import org.apache.flink.runtime.taskexecutor.SlotReport;
 import org.apache.flink.runtime.taskexecutor.TaskExecutor;
+import org.apache.flink.runtime.util.log.LogLevelWorker;
 
 import javax.annotation.Nullable;
 
@@ -222,4 +223,14 @@ public interface ResourceManagerGateway extends FencedRpcGateway<ResourceManager
 	 * {@link BlobServer}.
 	 */
 	CompletableFuture<TransientBlobKey> requestTaskManagerFileUpload(ResourceID taskManagerId, FileType fileType, @RpcTimeout Time timeout);
+
+	/**
+	 *
+	 * Change task manager's log level.
+	 *
+	 * @param taskManagerId identifying the TaskExecutor for which to return information
+	 * @param params see {@link LogLevelWorker}
+	 */
+	void changeTaskManagerLogLevel(ResourceID taskManagerId, String params);
+
 }

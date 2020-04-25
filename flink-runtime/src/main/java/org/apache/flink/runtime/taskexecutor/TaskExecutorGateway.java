@@ -38,6 +38,7 @@ import org.apache.flink.runtime.resourcemanager.ResourceManagerId;
 import org.apache.flink.runtime.rpc.RpcGateway;
 import org.apache.flink.runtime.rpc.RpcTimeout;
 import org.apache.flink.runtime.taskmanager.Task;
+import org.apache.flink.runtime.util.log.LogLevelWorker;
 import org.apache.flink.types.SerializableOptional;
 
 import java.util.Collection;
@@ -212,4 +213,12 @@ public interface TaskExecutorGateway extends RpcGateway {
 	 * @return Future flag indicating whether the task executor can be released.
 	 */
 	CompletableFuture<Boolean> canBeReleased();
+
+	/**
+	 *
+	 * Change task manager's log level.
+	 *
+	 * @param params see {@link LogLevelWorker}
+	 */
+	void changeTaskManagerLogLevel(String params);
 }

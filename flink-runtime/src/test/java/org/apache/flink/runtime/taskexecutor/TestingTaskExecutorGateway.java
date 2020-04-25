@@ -198,4 +198,9 @@ public class TestingTaskExecutorGateway implements TaskExecutorGateway {
 	public String getHostname() {
 		return hostname;
 	}
+
+	@Override
+	public void changeTaskManagerLogLevel(String param) {
+
+	}
 }
