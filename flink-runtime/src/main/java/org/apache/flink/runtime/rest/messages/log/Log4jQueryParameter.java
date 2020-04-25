@@ -22,11 +22,6 @@ import org.apache.flink.runtime.rest.messages.MessageQueryParameter;
 
 public class Log4jQueryParameter extends MessageQueryParameter<String> {
 
-	// type|loggerName|level|expireSecs
-	// type : jobManager,taskManager
-	// loggerName : com.autohome.xxx
-	// level : trace, debug, info, warn, error, fatal
-	// expireSecs : 回退回info级别
 	private static final String KEY = "params";
 
 	public Log4jQueryParameter() {
@@ -45,6 +40,6 @@ public class Log4jQueryParameter extends MessageQueryParameter<String> {
 
 	@Override
 	public String getDescription() {
-		return "log4j manager";
+		return "Log4j dynamic log level setting.";
 	}
 }
