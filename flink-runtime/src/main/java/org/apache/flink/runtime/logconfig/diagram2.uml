@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Diagram>
+  <ID>JAVA</ID>
+  <OriginalElement />
+  <nodes>
+    <node x="313.625" y="738.0">org.apache.flink.runtime.logconfig.manager.DefaultLogConfigWorkerManager</node>
+    <node x="553.0" y="564.0">org.apache.flink.runtime.logconfig.LogConfigWorkerManager</node>
+    <node x="0.0" y="582.0">org.apache.flink.runtime.logconfig.LogConfigWorkerFactory</node>
+    <node x="324.825" y="0.0">org.apache.flink.runtime.logconfig.LogConfigWorker</node>
+    <node x="248.825" y="210.0">org.apache.flink.runtime.logconfig.worker.AbstractLogConfigWorker</node>
+  </nodes>
+  <notes />
+  <edges>
+    <edge source="org.apache.flink.runtime.logconfig.manager.DefaultLogConfigWorkerManager" target="org.apache.flink.runtime.logconfig.worker.AbstractLogConfigWorker">
+      <point x="0.0" y="-62.0" />
+      <point x="524.125" y="713.0" />
+      <point x="531.5" y="713.0" />
+      <point x="531.5" y="539.0" />
+      <point x="451.325" y="539.0" />
+      <point x="0.0" y="152.0" />
+    </edge>
+    <edge source="org.apache.flink.runtime.logconfig.manager.DefaultLogConfigWorkerManager" target="org.apache.flink.runtime.logconfig.LogConfigWorkerManager">
+      <point x="168.39999999999998" y="-62.0" />
+      <point x="692.525" y="713.0" />
+      <point x="721.5" y="713.0" />
+      <point x="0.0" y="62.0" />
+    </edge>
+    <edge source="org.apache.flink.runtime.logconfig.manager.DefaultLogConfigWorkerManager" target="org.apache.flink.runtime.logconfig.LogConfigWorkerFactory">
+      <point x="-84.19999999999993" y="-62.0" />
+      <point x="439.92500000000007" y="713.0" />
+      <point x="390.75" y="713.0" />
+      <point x="130.25" y="44.0" />
+    </edge>
+    <edge source="org.apache.flink.runtime.logconfig.worker.AbstractLogConfigWorker" target="org.apache.flink.runtime.logconfig.LogConfigWorker">
+      <point x="0.0" y="-152.0" />
+      <point x="0.0" y="80.0" />
+    </edge>
+    <edge source="org.apache.flink.runtime.logconfig.LogConfigWorkerFactory" target="org.apache.flink.runtime.logconfig.worker.AbstractLogConfigWorker">
+      <point x="0.0" y="-44.0" />
+      <point x="260.5" y="539.0" />
+      <point x="316.325" y="539.0" />
+      <point x="-135.0" y="152.0" />
+    </edge>
+  </edges>
+  <settings layout="Hierarchic Group" zoom="1.0" x="445.0" y="431.0" />
+  <SelectedNodes />
+  <Categories>
+    <Category>Methods</Category>
+  </Categories>
+  <SCOPE>All</SCOPE>
+  <VISIBILITY>private</VISIBILITY>
+</Diagram>
+

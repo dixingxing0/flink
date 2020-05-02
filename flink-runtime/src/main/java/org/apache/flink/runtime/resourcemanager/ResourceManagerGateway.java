@@ -31,6 +31,7 @@ import org.apache.flink.runtime.instance.InstanceID;
 import org.apache.flink.runtime.io.network.partition.ClusterPartitionManager;
 import org.apache.flink.runtime.jobmaster.JobMaster;
 import org.apache.flink.runtime.jobmaster.JobMasterId;
+import org.apache.flink.runtime.logconfig.LogConfig;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.metrics.dump.MetricQueryService;
 import org.apache.flink.runtime.registration.RegistrationResponse;
@@ -238,4 +239,24 @@ public interface ResourceManagerGateway extends FencedRpcGateway<ResourceManager
 	 * @return Future which is completed with the historical log list
 	 */
 	CompletableFuture<Collection<LogInfo>> requestTaskManagerLogList(ResourceID taskManagerId, @RpcTimeout Time timeout);
+
+
+	/**
+	 *
+	 * Change task manager's log level at runtime.
+	 *
+	 * @param taskManagerId identifying the TaskExecutor for which to return information
+	 * @param logConfig
+	 */
+	void changeTaskManagerLogLevel(ResourceID taskManagerId, LogConfig logConfig);
+
+	/**
+	 *
+	 * Change task manager's log level at runtime.
+	 *
+	 * @param taskManagerId identifying the TaskExecutor for which to return information
+	 * @param logConfig
+	 */
+	void changeTaskManagerLogLevel(ResourceID taskManagerId, LogConfig logConfig);
+
 }
