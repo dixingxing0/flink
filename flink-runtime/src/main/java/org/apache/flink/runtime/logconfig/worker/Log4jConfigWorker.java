@@ -1,34 +1,29 @@
 package org.apache.flink.runtime.logconfig.worker;
 
 import org.apache.flink.runtime.logconfig.LogConfig;
-import org.apache.logging.log4j.Level;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.core.config.Configurator;
+import org.apache.log4j.Level;
+import org.apache.log4j.Logger;
 
 public class Log4jConfigWorker extends AbstractLogConfigWorker {
-	private org.apache.logging.log4j.Logger logger;
+	private org.apache.log4j.Logger logger;
 
 	public Log4jConfigWorker(LogConfig logConfig) {
 		super(logConfig);
 		if (isRootLogger()) {
-			this.logger = LogManager.getRootLogger();
+			this.logger = Logger.getRootLogger();
 		} else {
-			this.logger = LogManager.getLogger(logConfig.getLogger());
+			this.logger = Logger.getLogger(logConfig.getLogger());
 		}
 	}
 
 	@Override
-	public String currentLogLevel(String loggerName) {
-		return logger.getLevel().name();
+	public String currentLogLevel() {
+		return logger.getLevel().toString();
 	}
 
 	@Override
-	public void doChangeLogLevel(String loggerName, String logLevel) {
+	public void doChangeLogLevel(String logLevel) {
 		Level level = Level.toLevel(logLevel);
-		if (isRootLogger()) {
-			Configurator.setRootLevel(level);
-		} else {
-			Configurator.setLevel(logConfig.getLogger(), level);
-		}
+		logger.setLevel(level);
 	}
 }

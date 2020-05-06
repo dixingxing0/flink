@@ -9,9 +9,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-/**
- *
- */
 public abstract class AbstractLogConfigWorker implements LogConfigWorker {
 	private final Logger LOG = LoggerFactory.getLogger(this.getClass());
 
@@ -23,7 +20,6 @@ public abstract class AbstractLogConfigWorker implements LogConfigWorker {
 		this.logConfig = logConfig;
 	}
 
-
 	/**
 	 * Change the log level for a specific logger at runtime.
 	 * <p>
@@ -33,10 +29,10 @@ public abstract class AbstractLogConfigWorker implements LogConfigWorker {
 	public void changeLevel() {
 		synchronized (AbstractLogConfigWorker.class) {
 			LOG.info("Changing logger level : {} to {}", logConfig.getLogger(), logConfig.getTargetLevel());
-			originLogLevel = currentLogLevel(logConfig.getLogger());
-			doChangeLogLevel(logConfig.getLogger(), logConfig.getTargetLevel());
+			originLogLevel = currentLogLevel();
+			doChangeLogLevel(logConfig.getTargetLevel());
 			scheduledExecutorService = Executors.newSingleThreadScheduledExecutor(r -> {
-				String name = "log4j-level-change-" + System.currentTimeMillis();
+				String name = "log-level-change-" + System.currentTimeMillis();
 				Thread t = new Thread(r, name);
 				t.setDaemon(true);
 				return t;
@@ -47,9 +43,19 @@ public abstract class AbstractLogConfigWorker implements LogConfigWorker {
 		}
 	}
 
+	/**
+	 * return current log level
+	 */
+	public abstract String currentLogLevel();
+
+	/**
+	 * Change the log level for a specific logger at runtime.
+	 */
+	public abstract void doChangeLogLevel(String logLevel);
+
 	protected void resetLogLevel() {
 		LOG.info("Reseting logger level : {} to {}", logConfig.getLogger(), logConfig.getResetLevel());
-		doChangeLogLevel(logConfig.getLogger(), logConfig.getResetLevel());
+		doChangeLogLevel(logConfig.getResetLevel());
 		scheduledExecutorService.shutdown();
 	}
 
@@ -59,7 +65,7 @@ public abstract class AbstractLogConfigWorker implements LogConfigWorker {
 			LOG.info("Origin log level is null, ignore.");
 		} else {
 			LOG.info("Cancelling for logger {}, reseting log level to origin level : {}", logConfig.getLogger(), originLogLevel);
-			doChangeLogLevel(logConfig.getLogger(), originLogLevel);
+			doChangeLogLevel(originLogLevel);
 			scheduledExecutorService.shutdown();
 		}
 	}
@@ -72,10 +78,5 @@ public abstract class AbstractLogConfigWorker implements LogConfigWorker {
 	public boolean isRootLogger() {
 		return "ROOT".equalsIgnoreCase(logConfig.getLogger());
 	}
-
-	public abstract String currentLogLevel(String loggerName);
-
-	public abstract void doChangeLogLevel(String loggerName, String logLevel);
-
 
 }
