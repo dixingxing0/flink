@@ -1,30 +1,35 @@
 package org.apache.flink.runtime.logconfig;
 
-import java.util.List;
+import java.util.Collection;
 
 /**
- * Maintan all effective log config settings.
+ * Maintain all effective log config settings.
  */
 public interface LogConfigManager {
-
-	/**
-	 * Add for new log config setting.
-	 *
-	 * @param logConfig
-	 */
-	void addLogConfig(LogConfig logConfig);
-
 	/**
 	 * List all effective log config settings.
 	 *
 	 * @return all effective log config settings.
 	 */
-	List<LogConfig> listAllLogConfig();
+	Collection<LogConfig> listAllLogConfig();
 
 	/**
-	 * Remove the specific log config setting.
-	 *
-	 * @param logConfig
+	 * Change the log level for a specific logger at runtime.
 	 */
-	void removeLogConfig(LogConfig logConfig);
+	void changeLevel(LogConfig logConfig);
+
+	/**
+	 * Cancel log level setting.
+	 */
+	void clear(LogConfig logConfig);
+
+	/**
+	 * Cancel all the log level settings.
+	 */
+	void clearAll();
+
+	/**
+	 * Shutdown the scheduledExecutorService.
+	 */
+	void shutdown();
 }

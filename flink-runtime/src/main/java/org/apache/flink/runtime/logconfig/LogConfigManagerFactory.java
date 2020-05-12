@@ -1,17 +1,17 @@
 package org.apache.flink.runtime.logconfig;
 
-import org.apache.flink.runtime.logconfig.worker.Log4j2ConfigWorker;
-import org.apache.flink.runtime.logconfig.worker.Log4jConfigWorker;
+import org.apache.flink.runtime.logconfig.manager.Log4j2ConfigManager;
+import org.apache.flink.runtime.logconfig.manager.Log4jConfigManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Method;
 
 /**
- * LogConfigWorker factory.
+ * LogConfigManager factory.
  */
-public class LogConfigWorkerFactory {
-	private static final Logger LOG = LoggerFactory.getLogger(LogConfigWorkerFactory.class);
+public class LogConfigManagerFactory {
+	private static final Logger LOG = LoggerFactory.getLogger(LogConfigManagerFactory.class);
 
 	private static volatile LoggingBackend loggingBackend;
 
@@ -19,34 +19,33 @@ public class LogConfigWorkerFactory {
 	 * Enum of logging backend.
 	 */
 	public enum LoggingBackend {
-		LOG4J(Log4jConfigWorker.class),
-		LOG4J2(Log4j2ConfigWorker.class),
+		LOG4J(Log4jConfigManager.class),
+		LOG4J2(Log4j2ConfigManager.class),
 		UNKNOWN(null);
-		private final Class<? extends LogConfigWorker> workerClass;
+		private final Class<? extends LogConfigManager> managerClass;
 
-		LoggingBackend(Class<? extends LogConfigWorker> workerClass) {
-			this.workerClass = workerClass;
+		LoggingBackend(Class<? extends LogConfigManager> managerClass) {
+			this.managerClass = managerClass;
 		}
 	}
 
 	/**
-	 * Create the LogConfigWorker instance corresponding to the specific implementation:
+	 * Create the LogConfigManager instance corresponding to the specific implementation:
 	 * <ul>
-	 * <li>Log4j2ConfigWorker
-	 * <li>Log4jConfigWorker
-	 * <li>LogbackConfigWorker
+	 * <li>Log4j2ConfigManager
+	 * <li>Log4jConfigManager
+	 * <li>LogbackConfigManager
 	 * </ul>
 	 *
-	 * @param logConfig The config info, contains the REST request payload.
-	 * @return The worker instance.
+	 * @return The manager instance.
 	 */
-	public LogConfigWorker createWorker(LogConfig logConfig) {
+	public LogConfigManager createManager() {
 		LoggingBackend loggingBackend = getLoggingBackend();
-		if (loggingBackend != null && loggingBackend.workerClass != null) {
+		if (loggingBackend != null && loggingBackend.managerClass != null) {
 			try {
-				return loggingBackend.workerClass.getConstructor(LogConfig.class).newInstance(logConfig);
+				return loggingBackend.managerClass.getConstructor().newInstance();
 			} catch (Exception e) {
-				LOG.error("Error while create LogConfigWorker instance : " + loggingBackend.workerClass, e);
+				LOG.error("Error while create LogConfigManager instance : " + loggingBackend.managerClass, e);
 			}
 		}
 		return null;

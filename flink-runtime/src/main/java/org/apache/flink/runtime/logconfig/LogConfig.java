@@ -14,6 +14,13 @@ public class LogConfig implements Serializable {
 	private String resetLevel;
 	private long startTime;
 
+	//
+	private String originLevel;
+
+	public boolean expired() {
+		return (System.currentTimeMillis() - startTime) / 1000 >= timeout;
+	}
+
 	public long getStartTime() {
 		return startTime;
 	}
@@ -68,5 +75,13 @@ public class LogConfig implements Serializable {
 
 	public void setResetLevel(String resetLevel) {
 		this.resetLevel = resetLevel;
+	}
+
+	public String getOriginLevel() {
+		return originLevel;
+	}
+
+	public void setOriginLevel(String originLevel) {
+		this.originLevel = originLevel;
 	}
 }
