@@ -47,6 +47,7 @@ import org.apache.flink.runtime.jobmaster.JobMasterId;
 import org.apache.flink.runtime.jobmaster.JobMasterRegistrationSuccess;
 import org.apache.flink.runtime.leaderelection.LeaderContender;
 import org.apache.flink.runtime.leaderelection.LeaderElectionService;
+import org.apache.flink.runtime.logconfig.LogConfig;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.metrics.MetricNames;
 import org.apache.flink.runtime.metrics.groups.ResourceManagerMetricGroup;
@@ -58,6 +59,7 @@ import org.apache.flink.runtime.resourcemanager.registration.WorkerRegistration;
 import org.apache.flink.runtime.resourcemanager.slotmanager.ResourceActions;
 import org.apache.flink.runtime.resourcemanager.slotmanager.SlotManager;
 import org.apache.flink.runtime.rest.messages.LogInfo;
+import org.apache.flink.runtime.rest.messages.logconfig.LogConfigResponseBody;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerInfo;
 import org.apache.flink.runtime.rpc.FatalErrorHandler;
 import org.apache.flink.runtime.rpc.FencedRpcEndpoint;
@@ -646,6 +648,17 @@ public abstract class ResourceManager<WorkerType extends ResourceIDRetrievable>
 	@Override
 	public CompletableFuture<Map<IntermediateDataSetID, DataSetMetaInfo>> listDataSets() {
 		return CompletableFuture.completedFuture(clusterPartitionTracker.listDataSets());
+	}
+
+	@Override
+	public CompletableFuture<LogConfigResponseBody> changeTaskManagerLogLevel(ResourceID taskManagerId, LogConfig logConfig) {
+		final WorkerRegistration<WorkerType> taskExecutor = taskExecutors.get(taskManagerId);
+		if (taskExecutor == null) {
+			log.debug("Requested log list from unregistered TaskExecutor {}.", taskManagerId);
+			return FutureUtils.completedExceptionally(new UnknownTaskExecutorException(taskManagerId));
+		} else {
+			return taskExecutor.getTaskExecutorGateway().changeTaskManagerLogLevel(logConfig);
+		}
 	}
 
 	// ------------------------------------------------------------------------

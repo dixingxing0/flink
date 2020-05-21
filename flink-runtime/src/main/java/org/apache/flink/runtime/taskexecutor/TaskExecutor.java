@@ -69,6 +69,9 @@ import org.apache.flink.runtime.jobmaster.JobMasterId;
 import org.apache.flink.runtime.jobmaster.ResourceManagerAddress;
 import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalListener;
 import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService;
+import org.apache.flink.runtime.logconfig.LogConfig;
+import org.apache.flink.runtime.logconfig.LogConfigManager;
+import org.apache.flink.runtime.logconfig.LogConfigManagerFactory;
 import org.apache.flink.runtime.memory.MemoryManager;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.messages.TaskBackPressureResponse;
@@ -85,6 +88,7 @@ import org.apache.flink.runtime.resourcemanager.ResourceManagerGateway;
 import org.apache.flink.runtime.resourcemanager.ResourceManagerId;
 import org.apache.flink.runtime.resourcemanager.TaskExecutorRegistration;
 import org.apache.flink.runtime.rest.messages.LogInfo;
+import org.apache.flink.runtime.rest.messages.logconfig.LogConfigResponseBody;
 import org.apache.flink.runtime.rpc.FatalErrorHandler;
 import org.apache.flink.runtime.rpc.RpcEndpoint;
 import org.apache.flink.runtime.rpc.RpcService;
@@ -231,6 +235,7 @@ public class TaskExecutor extends RpcEndpoint implements TaskExecutorGateway {
 
 	private final BackPressureSampleService backPressureSampleService;
 
+	private final LogConfigManagerFactory logConfigManagerFactory = new LogConfigManagerFactory();
 	// --------- resource manager --------
 
 	@Nullable
@@ -335,6 +340,28 @@ public class TaskExecutor extends RpcEndpoint implements TaskExecutorGateway {
 						.collect(Collectors.toList());
 			}
 			return Collections.emptyList();
+		}, ioExecutor);
+	}
+
+	@Override
+	public CompletableFuture<LogConfigResponseBody> changeTaskManagerLogLevel(LogConfig logConfig) {
+		LogConfigManager manager = null;
+		String loggerFactoryClassStr = null;
+		try {
+			loggerFactoryClassStr = LogConfigManagerFactory.getLoggerFactoryClassStr();
+			manager = logConfigManagerFactory.createManager();
+		} catch (Throwable e) {
+			log.error(e.getMessage(), e);
+		}
+		if (manager == null) {
+			LogConfigResponseBody response = new LogConfigResponseBody();
+			response.setStatus(LogConfigResponseBody.STATUS_ERROR);
+			response.setMessage(String.format("Detect current logging backend is '%s' which do not support dynamic log level setting", loggerFactoryClassStr));
+			return CompletableFuture.completedFuture(response);
+		}
+		final LogConfigManager finalLogConfigManager = manager;
+		return CompletableFuture.supplyAsync(() -> {
+			return finalLogConfigManager.changeLogLevel(logConfig);
 		}, ioExecutor);
 	}
 

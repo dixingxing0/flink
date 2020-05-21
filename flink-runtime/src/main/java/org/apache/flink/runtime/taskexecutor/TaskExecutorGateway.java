@@ -35,11 +35,13 @@ import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobmaster.AllocatedSlotReport;
 import org.apache.flink.runtime.jobmaster.JobMasterId;
+import org.apache.flink.runtime.logconfig.LogConfig;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.messages.TaskBackPressureResponse;
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
 import org.apache.flink.runtime.resourcemanager.ResourceManagerId;
 import org.apache.flink.runtime.rest.messages.LogInfo;
+import org.apache.flink.runtime.rest.messages.logconfig.LogConfigResponseBody;
 import org.apache.flink.runtime.rpc.RpcGateway;
 import org.apache.flink.runtime.rpc.RpcTimeout;
 import org.apache.flink.runtime.taskmanager.Task;
@@ -249,4 +251,11 @@ public interface TaskExecutorGateway extends RpcGateway, TaskExecutorOperatorEve
 			ExecutionAttemptID task,
 			OperatorID operator,
 			SerializedValue<OperatorEvent> evt);
+
+	/**
+	 * Change task manager's log level at runtime.
+	 * @param logConfig logger name and target log level
+	 * @return Future which is completed with the {@link LogConfigResponseBody} after change log level
+	 */
+	CompletableFuture<LogConfigResponseBody> changeTaskManagerLogLevel(LogConfig logConfig);
 }

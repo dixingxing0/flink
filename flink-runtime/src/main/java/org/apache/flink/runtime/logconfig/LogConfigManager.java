@@ -1,35 +1,13 @@
 package org.apache.flink.runtime.logconfig;
 
-import java.util.Collection;
+import org.apache.flink.runtime.rest.messages.logconfig.LogConfigResponseBody;
 
 /**
- * Maintain all effective log config settings.
+ * Change log level for a specific logging backend, e.g. log4j2.
  */
 public interface LogConfigManager {
 	/**
-	 * List all effective log config settings.
-	 *
-	 * @return all effective log config settings.
+	 * Change log level at runtime.
 	 */
-	Collection<LogConfig> listAllLogConfig();
-
-	/**
-	 * Change the log level for a specific logger at runtime.
-	 */
-	void changeLevel(LogConfig logConfig);
-
-	/**
-	 * Cancel log level setting.
-	 */
-	void clear(LogConfig logConfig);
-
-	/**
-	 * Cancel all the log level settings.
-	 */
-	void clearAll();
-
-	/**
-	 * Shutdown the scheduledExecutorService.
-	 */
-	void shutdown();
+	LogConfigResponseBody changeLogLevel(LogConfig logConfig);
 }

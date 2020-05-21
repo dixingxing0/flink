@@ -35,6 +35,7 @@ import org.apache.flink.runtime.io.network.partition.DataSetMetaInfo;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
 import org.apache.flink.runtime.jobmaster.JobMasterId;
 import org.apache.flink.runtime.jobmaster.JobMasterRegistrationSuccess;
+import org.apache.flink.runtime.logconfig.LogConfig;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.registration.RegistrationResponse;
 import org.apache.flink.runtime.resourcemanager.ResourceManagerGateway;
@@ -44,6 +45,7 @@ import org.apache.flink.runtime.resourcemanager.SlotRequest;
 import org.apache.flink.runtime.resourcemanager.TaskExecutorRegistration;
 import org.apache.flink.runtime.resourcemanager.exceptions.UnknownTaskExecutorException;
 import org.apache.flink.runtime.rest.messages.LogInfo;
+import org.apache.flink.runtime.rest.messages.logconfig.LogConfigResponseBody;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerInfo;
 import org.apache.flink.runtime.taskexecutor.FileType;
 import org.apache.flink.runtime.taskexecutor.SlotReport;
@@ -370,5 +372,10 @@ public class TestingResourceManagerGateway implements ResourceManagerGateway {
 	@Override
 	public CompletableFuture<Void> releaseClusterPartitions(IntermediateDataSetID dataSetToRelease) {
 		return CompletableFuture.completedFuture(null);
+	}
+
+	@Override
+	public CompletableFuture<LogConfigResponseBody> changeTaskManagerLogLevel(ResourceID taskManagerId, LogConfig logConfig) {
+		return CompletableFuture.completedFuture(new LogConfigResponseBody());
 	}
 }

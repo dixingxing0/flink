@@ -36,6 +36,7 @@ import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.metrics.dump.MetricQueryService;
 import org.apache.flink.runtime.registration.RegistrationResponse;
 import org.apache.flink.runtime.rest.messages.LogInfo;
+import org.apache.flink.runtime.rest.messages.logconfig.LogConfigResponseBody;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerInfo;
 import org.apache.flink.runtime.rpc.FencedRpcGateway;
 import org.apache.flink.runtime.rpc.RpcTimeout;
@@ -240,23 +241,12 @@ public interface ResourceManagerGateway extends FencedRpcGateway<ResourceManager
 	 */
 	CompletableFuture<Collection<LogInfo>> requestTaskManagerLogList(ResourceID taskManagerId, @RpcTimeout Time timeout);
 
-
 	/**
-	 *
 	 * Change task manager's log level at runtime.
-	 *
-	 * @param taskManagerId identifying the TaskExecutor for which to return information
-	 * @param logConfig
+	 * @param taskManagerId identifying the {@link TaskExecutor} to change log level
+	 * @param logConfig logger name and target log level
+	 * @return Future which is completed with the {@link LogConfigResponseBody} after change log level
 	 */
-	void changeTaskManagerLogLevel(ResourceID taskManagerId, LogConfig logConfig);
-
-	/**
-	 *
-	 * Change task manager's log level at runtime.
-	 *
-	 * @param taskManagerId identifying the TaskExecutor for which to return information
-	 * @param logConfig
-	 */
-	void changeTaskManagerLogLevel(ResourceID taskManagerId, LogConfig logConfig);
+	CompletableFuture<LogConfigResponseBody> changeTaskManagerLogLevel(ResourceID taskManagerId, LogConfig logConfig);
 
 }

@@ -1,6 +1,8 @@
 package org.apache.flink.runtime.rest.handler.logconfig;
 
 import org.apache.flink.api.common.time.Time;
+import org.apache.flink.runtime.logconfig.LogConfigManager;
+import org.apache.flink.runtime.logconfig.LogConfigManagerFactory;
 import org.apache.flink.runtime.resourcemanager.ResourceManagerGateway;
 import org.apache.flink.runtime.rest.handler.HandlerRequest;
 import org.apache.flink.runtime.rest.handler.RestHandlerException;
@@ -21,8 +23,25 @@ public class LogConfigHandler extends AbstractResourceManagerHandler<RestfulGate
 		super(leaderRetriever, timeout, responseHeaders, messageHeaders, resourceManagerGatewayRetriever);
 	}
 
+	private LogConfigManagerFactory logConfigManagerFactory = new LogConfigManagerFactory();
 	@Override
 	protected CompletableFuture<LogConfigResponseBody> handleRequest(@Nonnull HandlerRequest<LogConfigRequestBody, EmptyMessageParameters> request, @Nonnull ResourceManagerGateway gateway) throws RestHandlerException {
-		return null;
+
+		LogConfigManager manager = null;
+		String loggerFactoryClassStr = null;
+		try {
+			loggerFactoryClassStr = LogConfigManagerFactory.getLoggerFactoryClassStr();
+			manager = logConfigManagerFactory.createManager();
+		} catch (Throwable e) {
+			log.error(e.getMessage(), e);
+		}
+		if (manager == null) {
+			LogConfigResponseBody response = new LogConfigResponseBody();
+			response.setStatus(LogConfigResponseBody.STATUS_ERROR);
+			response.setMessage(String.format("Detect current logging backend is '%s' which do not support dynamic log level setting", loggerFactoryClassStr));
+			return CompletableFuture.completedFuture(response);
+		}
+		final LogConfigManager finalLogConfigManager = manager;
+		return CompletableFuture.completedFuture(finalLogConfigManager.changeLogLevel(logConfig));
 	}
 }

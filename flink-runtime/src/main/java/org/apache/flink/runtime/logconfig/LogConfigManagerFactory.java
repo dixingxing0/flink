@@ -119,7 +119,7 @@ public class LogConfigManagerFactory {
 	 * @return logger factory class name.
 	 * @see <a href="http://www.slf4j.org/codes.html#StaticLoggerBinder">StaticLoggerBinder</a>
 	 */
-	protected static String getLoggerFactoryClassStr() {
+	public static String getLoggerFactoryClassStr() {
 		try {
 			String binderClassStr = "org.slf4j.impl.StaticLoggerBinder";
 			Class<?> binderClass = Class.forName(binderClassStr);
