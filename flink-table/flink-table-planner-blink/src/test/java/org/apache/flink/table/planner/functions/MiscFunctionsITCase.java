@@ -30,6 +30,7 @@ import java.util.List;
 
 import static org.apache.flink.table.api.Expressions.$;
 import static org.apache.flink.table.api.Expressions.call;
+import static org.apache.flink.table.api.Expressions.callSql;
 
 /** Tests for miscellaneous {@link BuiltInFunctionDefinitions}. */
 public class MiscFunctionsITCase extends BuiltInFunctionTestBase {
@@ -73,13 +74,34 @@ public class MiscFunctionsITCase extends BuiltInFunctionTestBase {
                                 "IFNULL(f1, f0)",
                                 new BigDecimal("123.45"),
                                 DataTypes.DECIMAL(12, 2).notNull())
+                        .testSqlError(
+                                "IFNULL(SUBSTR(''), f0)",
+                                "Invalid number of arguments to function 'SUBSTR'.")
                         .testResult(
                                 $("f1").ifNull($("f0")),
                                 "IFNULL(f1, f0)",
                                 new BigDecimal("123.45"),
                                 DataTypes.DECIMAL(12, 2).notNull())
-                        .testSqlResult(
-                                "TakesNotNull(IFNULL(f0, 12))", 12, DataTypes.INT().notNull()));
+                        .testResult(
+                                call("TakesNotNull", $("f0").ifNull(12)),
+                                "TakesNotNull(IFNULL(f0, 12))",
+                                12,
+                                DataTypes.INT().notNull()),
+                TestSpec.forExpression("SQL call")
+                        .onFieldsWithData(null, 12, "Hello World")
+                        .andDataTypes(
+                                DataTypes.INT().nullable(),
+                                DataTypes.INT().notNull(),
+                                DataTypes.STRING().notNull())
+                        .testTableApiResult(
+                                callSql("f2 || '!'"), "Hello World!", DataTypes.STRING().notNull())
+                        .testTableApiResult(callSql("ABS(f0)"), null, DataTypes.INT().nullable())
+                        .testTableApiResult(
+                                callSql("UPPER(f2)").plus(callSql("LOWER(f2)")).substring(2, 20),
+                                "ELLO WORLDhello worl",
+                                DataTypes.STRING().notNull())
+                        .testTableApiError(
+                                callSql("UPPER(f1)"), "Invalid SQL expression: UPPER(f1)"));
     }
 
     // --------------------------------------------------------------------------------------------

@@ -22,8 +22,8 @@ import org.apache.flink.table.functions.UserDefinedFunction
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory
 import org.apache.flink.table.planner.plan.`trait`.{FlinkRelDistribution, FlinkRelDistributionTraitDef}
 import org.apache.flink.table.planner.plan.nodes.exec.batch.BatchExecSortAggregate
-import org.apache.flink.table.planner.plan.nodes.exec.{ExecEdge, ExecNode}
-import org.apache.flink.table.planner.plan.rules.physical.batch.BatchExecJoinRuleBase
+import org.apache.flink.table.planner.plan.nodes.exec.{InputProperty, ExecNode}
+import org.apache.flink.table.planner.plan.rules.physical.batch.BatchPhysicalJoinRuleBase
 import org.apache.flink.table.planner.plan.utils.{FlinkRelOptUtil, RelExplainUtil}
 
 import org.apache.calcite.plan.{RelOptCluster, RelOptRule, RelTraitSet}
@@ -112,7 +112,7 @@ class BatchPhysicalSortAggregate(
           // If partialKey is enabled, try to use partial key to satisfy the required distribution
           val tableConfig = FlinkRelOptUtil.getTableConfigFromContext(this)
           val partialKeyEnabled = tableConfig.getConfiguration.getBoolean(
-            BatchExecJoinRuleBase.TABLE_OPTIMIZER_SHUFFLE_BY_PARTIAL_KEY_ENABLED)
+            BatchPhysicalJoinRuleBase.TABLE_OPTIMIZER_SHUFFLE_BY_PARTIAL_KEY_ENABLED)
           partialKeyEnabled && groupKeysList.containsAll(shuffleKeys)
         }
       case _ => false
@@ -161,17 +161,17 @@ class BatchPhysicalSortAggregate(
       FlinkTypeFactory.toLogicalRowType(aggInputRowType),
       isMerge,
       true, // isFinal is always true
-      getInputEdge,
+      getInputProperty,
       FlinkTypeFactory.toLogicalRowType(getRowType),
       getRelDetailedDescription
     )
   }
 
-  private def getInputEdge: ExecEdge = {
+  private def getInputProperty: InputProperty = {
     if (grouping.length == 0) {
-      ExecEdge.builder().damBehavior(ExecEdge.DamBehavior.END_INPUT).build()
+      InputProperty.builder().damBehavior(InputProperty.DamBehavior.END_INPUT).build()
     } else {
-      ExecEdge.DEFAULT
+      InputProperty.DEFAULT
     }
   }
 }

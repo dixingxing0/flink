@@ -666,6 +666,52 @@ public class FunctionITCase extends StreamingTestBase {
     }
 
     @Test
+    public void testVarArgScalarFunction() throws Exception {
+        final List<Row> sourceData = Arrays.asList(Row.of("Bob", 1), Row.of("Alice", 2));
+
+        TestCollectionTableFactory.reset();
+        TestCollectionTableFactory.initData(sourceData);
+
+        tEnv().executeSql(
+                        "CREATE TABLE SourceTable("
+                                + "  s STRING, "
+                                + "  i INT"
+                                + ")"
+                                + "WITH ("
+                                + "  'connector' = 'COLLECTION'"
+                                + ")");
+
+        tEnv().createTemporarySystemFunction("VarArgScalarFunction", VarArgScalarFunction.class);
+
+        final TableResult result =
+                tEnv().executeSql(
+                                "SELECT "
+                                        + "  VarArgScalarFunction(), "
+                                        + "  VarArgScalarFunction(i), "
+                                        + "  VarArgScalarFunction(i, i), "
+                                        + "  VarArgScalarFunction(s), "
+                                        + "  VarArgScalarFunction(s, i) "
+                                        + "FROM SourceTable");
+
+        final List<Row> actual = CollectionUtil.iteratorToList(result.collect());
+        final List<Row> expected =
+                Arrays.asList(
+                        Row.of(
+                                "(INT...)",
+                                "(INT...)",
+                                "(INT...)",
+                                "(STRING, INT...)",
+                                "(STRING, INT...)"),
+                        Row.of(
+                                "(INT...)",
+                                "(INT...)",
+                                "(INT...)",
+                                "(STRING, INT...)",
+                                "(STRING, INT...)"));
+        assertThat(actual, equalTo(expected));
+    }
+
+    @Test
     public void testRawLiteralScalarFunction() throws Exception {
         final List<Row> sourceData =
                 Arrays.asList(
@@ -1049,7 +1095,7 @@ public class FunctionITCase extends StreamingTestBase {
         TestCollectionTableFactory.initData(sourceData);
 
         tEnv().executeSql(
-                        "CREATE TABLE SourceTable(i INT, ts AS LOCALTIMESTAMP, WATERMARK FOR ts AS ts) "
+                        "CREATE TABLE SourceTable(i INT, ts AS CAST(LOCALTIMESTAMP AS TIMESTAMP(3)), WATERMARK FOR ts AS ts) "
                                 + "WITH ('connector' = 'COLLECTION')");
         tEnv().executeSql("CREATE FUNCTION MyYear AS '" + MyYear.class.getName() + "'");
         CollectionUtil.iteratorToList(
@@ -1171,6 +1217,18 @@ public class FunctionITCase extends StreamingTestBase {
             return TypeInference.newBuilder()
                     .outputTypeStrategy(TypeStrategies.argument(0))
                     .build();
+        }
+    }
+
+    /** Function for testing variable arguments. */
+    @SuppressWarnings("unused")
+    public static class VarArgScalarFunction extends ScalarFunction {
+        public String eval(Integer... i) {
+            return "(INT...)";
+        }
+
+        public String eval(String s, Integer... i2) {
+            return "(STRING, INT...)";
         }
     }
 

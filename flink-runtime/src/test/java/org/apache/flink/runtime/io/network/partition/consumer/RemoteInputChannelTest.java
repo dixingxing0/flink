@@ -21,6 +21,8 @@ package org.apache.flink.runtime.io.network.partition.consumer;
 import org.apache.flink.core.testutils.OneShotLatch;
 import org.apache.flink.runtime.checkpoint.CheckpointException;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.runtime.checkpoint.channel.ChannelStateWriter;
+import org.apache.flink.runtime.checkpoint.channel.InputChannelInfo;
 import org.apache.flink.runtime.execution.CancelTaskException;
 import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.io.network.ConnectionID;
@@ -33,6 +35,7 @@ import org.apache.flink.runtime.io.network.TestingPartitionRequestClient;
 import org.apache.flink.runtime.io.network.api.CheckpointBarrier;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.Buffer.DataType;
+import org.apache.flink.runtime.io.network.buffer.BufferBuilder;
 import org.apache.flink.runtime.io.network.buffer.BufferListener.NotificationResult;
 import org.apache.flink.runtime.io.network.buffer.BufferPool;
 import org.apache.flink.runtime.io.network.buffer.NetworkBufferPool;
@@ -44,9 +47,11 @@ import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.io.network.partition.consumer.InputChannel.BufferAndAvailability;
 import org.apache.flink.runtime.io.network.util.TestBufferFactory;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
+import org.apache.flink.runtime.operators.testutils.ExpectedTestException;
 import org.apache.flink.runtime.taskexecutor.PartitionProducerStateChecker;
 import org.apache.flink.runtime.taskmanager.Task;
 import org.apache.flink.runtime.taskmanager.TestTaskBuilder;
+import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.util.ExceptionUtils;
 
 import org.apache.flink.shaded.guava18.com.google.common.collect.Lists;
@@ -169,6 +174,62 @@ public class RemoteInputChannelTest {
             inputChannel.releaseAllResources();
             assertTrue(buffer.isRecycled());
         }
+    }
+
+    @Test
+    public void testExceptionOnPersisting() throws Exception {
+        // Setup
+        final SingleInputGate inputGate = createSingleInputGate(1);
+        final RemoteInputChannel inputChannel =
+                InputChannelBuilder.newBuilder()
+                        .setStateWriter(
+                                new ChannelStateWriter.NoOpChannelStateWriter() {
+                                    @Override
+                                    public void addInputData(
+                                            long checkpointId,
+                                            InputChannelInfo info,
+                                            int startSeqNum,
+                                            CloseableIterator<Buffer> data) {
+                                        try {
+                                            data.close();
+                                        } catch (Exception e) {
+                                            throw new RuntimeException(e);
+                                        }
+                                        throw new ExpectedTestException();
+                                    }
+                                })
+                        .buildRemoteChannel(inputGate);
+
+        inputChannel.checkpointStarted(
+                new CheckpointBarrier(
+                        42, System.currentTimeMillis(), CheckpointOptions.unaligned(getDefault())));
+
+        final Buffer buffer = createBuffer(TestBufferFactory.BUFFER_SIZE);
+
+        assertFalse(buffer.isRecycled());
+        try {
+            inputChannel.onBuffer(buffer, 0, -1);
+            fail("This should have failed");
+        } catch (ExpectedTestException ex) {
+            // ignore
+        }
+        // This check is not strictly speaking necessary. Generally speaking if exception happens
+        // during persisting, there are two potentially correct outcomes:
+        // 1. buffer is recycled only once, in #onBuffer call when handling exception
+        // 2. buffer is stored inside RemoteInputChannel and recycled on releaseAllResources.
+        // What's not acceptable is that it would be released twice, in both places. Without this
+        // check below, we would be just relaying on Buffer throwing IllegalReferenceCountException.
+        // I've added this check just to be sure. It's freezing the current implementation that's
+        // unlikely to change, on the other hand, thanks to it we don't need to relay on
+        // IllegalReferenceCountException being thrown from the Buffer.
+        //
+        // In other words, if you end up reading this after refactoring RemoteInputChannel, it might
+        // be safe to remove this assertion. Just make sure double recycling of the same buffer is
+        // still throwing IllegalReferenceCountException.
+        assertFalse(buffer.isRecycled());
+
+        inputChannel.releaseAllResources();
+        assertTrue(buffer.isRecycled());
     }
 
     @Test
@@ -1177,9 +1238,11 @@ public class RemoteInputChannelTest {
             final Callable<Void> bufferPoolInteractionsTask =
                     () -> {
                         for (int i = 0; i < retries; ++i) {
-                            Buffer buffer =
-                                    buildSingleBuffer(bufferPool.requestBufferBuilderBlocking());
-                            buffer.recycleBuffer();
+                            try (BufferBuilder bufferBuilder =
+                                    bufferPool.requestBufferBuilderBlocking()) {
+                                Buffer buffer = buildSingleBuffer(bufferBuilder);
+                                buffer.recycleBuffer();
+                            }
                         }
                         return null;
                     };

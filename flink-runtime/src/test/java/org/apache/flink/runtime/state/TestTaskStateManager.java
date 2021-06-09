@@ -22,6 +22,7 @@ import org.apache.flink.api.common.JobID;
 import org.apache.flink.core.testutils.OneShotLatch;
 import org.apache.flink.runtime.checkpoint.CheckpointMetaData;
 import org.apache.flink.runtime.checkpoint.CheckpointMetrics;
+import org.apache.flink.runtime.checkpoint.InflightDataRescalingDescriptor;
 import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.runtime.checkpoint.PrioritizedOperatorSubtaskState;
 import org.apache.flink.runtime.checkpoint.TaskStateSnapshot;
@@ -68,10 +69,6 @@ public class TestTaskStateManager implements TaskStateManager {
                 localRecoveryConfig);
     }
 
-    public TestTaskStateManager(JobID jobId, ExecutionAttemptID executionAttemptID) {
-        this(jobId, executionAttemptID, null, TestLocalRecoveryConfig.disabled());
-    }
-
     public TestTaskStateManager(
             JobID jobId,
             ExecutionAttemptID executionAttemptID,
@@ -115,6 +112,22 @@ public class TestTaskStateManager implements TaskStateManager {
         if (waitForReportLatch != null) {
             waitForReportLatch.trigger();
         }
+    }
+
+    @Override
+    public InflightDataRescalingDescriptor getInputRescalingDescriptor() {
+        return InflightDataRescalingDescriptor.NO_RESCALE;
+    }
+
+    @Override
+    public InflightDataRescalingDescriptor getOutputRescalingDescriptor() {
+        return InflightDataRescalingDescriptor.NO_RESCALE;
+    }
+
+    @Override
+    public void reportIncompleteTaskStateSnapshots(
+            CheckpointMetaData checkpointMetaData, CheckpointMetrics checkpointMetrics) {
+        reportedCheckpointId = checkpointMetaData.getCheckpointId();
     }
 
     @Nonnull

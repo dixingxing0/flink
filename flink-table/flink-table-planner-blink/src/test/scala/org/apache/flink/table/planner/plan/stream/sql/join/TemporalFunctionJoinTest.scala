@@ -36,7 +36,7 @@ class TemporalFunctionJoinTest extends TableTestBase {
   private val ratesHistory = util.addDataStream[(String, Int, Timestamp)](
     "RatesHistory", 'currency, 'rate, 'rowtime.rowtime)
 
-  util.addFunction(
+  util.addTemporarySystemFunction(
     "Rates",
     ratesHistory.createTemporalTableFunction($"rowtime", $"currency"))
 
@@ -46,7 +46,7 @@ class TemporalFunctionJoinTest extends TableTestBase {
   private val proctimeRatesHistory = util.addDataStream[(String, Int)](
     "ProctimeRatesHistory", 'currency, 'rate, 'proctime.proctime)
 
-  util.addFunction(
+  util.addTemporarySystemFunction(
     "ProctimeRates",
     proctimeRatesHistory.createTemporalTableFunction($"proctime", $"currency"))
 
@@ -112,7 +112,7 @@ class TemporalFunctionJoinTest extends TableTestBase {
         "secondary_key as secondary_key " +
         "FROM Orders AS o, " +
         "LATERAL TABLE (Rates(o_rowtime)) AS r " +
-        "WHERE currency = o_currency OR secondary_key = o_secondary_key), " +
+        "WHERE currency = o_currency AND (rate > 120 OR secondary_key = o_secondary_key)), " +
         "Table3 " +
         "WHERE t3_secondary_key = secondary_key"
 

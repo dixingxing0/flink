@@ -46,13 +46,17 @@ import org.apache.flink.table.types.utils.DataTypeUtils.transform
 import org.apache.flink.types.Row
 import org.apache.flink.util.Collector
 
-import org.apache.calcite.rex.{RexNode, RexProgram}
+import org.apache.calcite.rel.`type`.RelDataType
+import org.apache.calcite.rex.RexNode
 
 import java.util
 
 import scala.collection.JavaConverters._
 
 object LookupJoinCodeGenerator {
+
+  case class GeneratedTableFunctionWithDataType[F <: Function](
+      tableFunc: GeneratedFunction[F], dataType: DataType)
 
   private val ARRAY_LIST = className[util.ArrayList[_]]
 
@@ -65,7 +69,7 @@ object LookupJoinCodeGenerator {
       inputType: LogicalType,
       tableSourceType: LogicalType,
       returnType: LogicalType,
-      lookupKeys: Map[Int, LookupKey],
+      lookupKeys: util.Map[Integer, LookupKey],
       lookupKeyOrder: Array[Int],
       syncLookupFunction: TableFunction[_],
       functionName: String,
@@ -80,7 +84,7 @@ object LookupJoinCodeGenerator {
          |""".stripMargin
     }
 
-    val (function, _) = generateLookupFunction(
+    generateLookupFunction(
       classOf[FlatMapFunction[RowData, RowData]],
       config,
       dataTypeFactory,
@@ -93,9 +97,7 @@ object LookupJoinCodeGenerator {
       syncLookupFunction,
       functionName,
       fieldCopy,
-      bodyCode)
-
-    function
+      bodyCode).tableFunc
   }
 
   /**
@@ -107,11 +109,11 @@ object LookupJoinCodeGenerator {
       inputType: LogicalType,
       tableSourceType: LogicalType,
       returnType: LogicalType,
-      lookupKeys: Map[Int, LookupKey],
+      lookupKeys: util.Map[Integer, LookupKey],
       lookupKeyOrder: Array[Int],
       asyncLookupFunction: AsyncTableFunction[_],
       functionName: String)
-    : (GeneratedFunction[AsyncFunction[RowData, AnyRef]], DataType) = {
+    : GeneratedTableFunctionWithDataType[AsyncFunction[RowData, AnyRef]] = {
 
     generateLookupFunction(
       classOf[AsyncFunction[RowData, AnyRef]],
@@ -136,24 +138,20 @@ object LookupJoinCodeGenerator {
       inputType: LogicalType,
       tableSourceType: LogicalType,
       returnType: LogicalType,
-      lookupKeys: Map[Int, LookupKey],
+      lookupKeys: util.Map[Integer, LookupKey],
       lookupKeyOrder: Array[Int],
       lookupFunctionBase: Class[_],
       lookupFunction: UserDefinedFunction,
       functionName: String,
       fieldCopy: Boolean,
       bodyCode: GeneratedExpression => String)
-    : (GeneratedFunction[F], DataType) = {
+    : GeneratedTableFunctionWithDataType[F] = {
 
     val callContext = new LookupCallContext(
       dataTypeFactory,
       lookupFunction,
       inputType,
-      lookupKeys
-          .map { case (k, v) =>
-            (Int.box(k), v)
-          }
-          .asJava,
+      lookupKeys,
       lookupKeyOrder,
       tableSourceType)
 
@@ -199,26 +197,27 @@ object LookupJoinCodeGenerator {
       returnType,
       inputType)
 
-     (function, callWithDataType._2)
+     GeneratedTableFunctionWithDataType(function, callWithDataType._2)
   }
 
   private def prepareOperands(
       ctx: CodeGeneratorContext,
       inputType: LogicalType,
-      lookupKeys: Map[Int, LookupKey],
+      lookupKeys: util.Map[Integer, LookupKey],
       lookupKeyOrder: Array[Int],
       fieldCopy: Boolean)
     : Seq[GeneratedExpression] = {
 
     lookupKeyOrder
+        .map(Integer.valueOf)
         .map(lookupKeys.get)
         .map {
-          case Some(constantKey: ConstantLookupKey) =>
+          case constantKey: ConstantLookupKey =>
             generateLiteral(
               ctx,
               constantKey.sourceType,
               constantKey.literal.getValue3)
-          case Some(fieldKey: FieldRefLookupKey) =>
+          case fieldKey: FieldRefLookupKey =>
             generateInputAccess(
               ctx,
               inputType,
@@ -507,23 +506,18 @@ object LookupJoinCodeGenerator {
     */
   def generateCalcMapFunction(
       config: TableConfig,
-      calcProgram: Option[RexProgram],
+      projection: Seq[RexNode],
+      condition: RexNode,
+      outputType: RelDataType,
       tableSourceRowType: RowType)
-    : GeneratedFunction[FlatMapFunction[RowData, RowData]] = {
-
-    val program = calcProgram.get
-    val condition = if (program.getCondition != null) {
-      Some(program.expandLocalRef(program.getCondition))
-    } else {
-      None
-    }
+  : GeneratedFunction[FlatMapFunction[RowData, RowData]] = {
     CalcCodeGenerator.generateFunction(
       tableSourceRowType,
       "TableCalcMapFunction",
-      FlinkTypeFactory.toLogicalRowType(program.getOutputRowType),
+      FlinkTypeFactory.toLogicalRowType(outputType),
       classOf[GenericRowData],
-      program,
-      condition,
+      projection,
+      Option(condition),
       config)
   }
 }

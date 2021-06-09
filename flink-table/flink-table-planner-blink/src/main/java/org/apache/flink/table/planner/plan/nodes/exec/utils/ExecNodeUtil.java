@@ -20,16 +20,13 @@ package org.apache.flink.table.planner.plan.nodes.exec.utils;
 
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.dag.Transformation;
-import org.apache.flink.configuration.ConfigOption;
-import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.core.memory.ManagedMemoryUseCase;
 import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
 import org.apache.flink.streaming.api.transformations.OneInputTransformation;
 import org.apache.flink.streaming.api.transformations.TwoInputTransformation;
-import org.apache.flink.table.api.TableConfig;
 import org.apache.flink.table.api.TableException;
-import org.apache.flink.table.planner.plan.nodes.exec.ExecEdge;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNode;
+import org.apache.flink.table.planner.plan.nodes.exec.InputProperty;
 
 import java.util.List;
 import java.util.Optional;
@@ -37,16 +34,6 @@ import java.util.stream.Collectors;
 
 /** An Utility class that helps translating {@link ExecNode} to {@link Transformation}. */
 public class ExecNodeUtil {
-
-    /**
-     * Return bytes size for given option in {@link TableConfig}.
-     *
-     * <p>TODO: This method can be removed once FLINK-20879 is finished.
-     */
-    public static long getMemorySize(TableConfig tableConfig, ConfigOption<String> option) {
-        return MemorySize.parse(tableConfig.getConfiguration().getString(option)).getBytes();
-    }
-
     /**
      * Set memoryBytes to {@link
      * Transformation#declareManagedMemoryUseCaseAtOperatorScope(ManagedMemoryUseCase, int)}.
@@ -100,14 +87,16 @@ public class ExecNodeUtil {
 
     /** Return description for multiple input node. */
     public static String getMultipleInputDescription(
-            ExecNode<?> rootNode, List<ExecNode<?>> inputNodes, List<ExecEdge> inputEdges) {
+            ExecNode<?> rootNode,
+            List<ExecNode<?>> inputNodes,
+            List<InputProperty> inputProperties) {
         String members =
                 ExecNodePlanDumper.treeToString(rootNode, inputNodes, true).replace("\n", "\\n");
         StringBuilder sb = new StringBuilder();
         sb.append("MultipleInput(");
         List<String> readOrders =
-                inputEdges.stream()
-                        .map(ExecEdge::getPriority)
+                inputProperties.stream()
+                        .map(InputProperty::getPriority)
                         .map(Object::toString)
                         .collect(Collectors.toList());
         boolean hasDiffReadOrder = readOrders.stream().distinct().count() > 1;

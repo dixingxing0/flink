@@ -24,14 +24,12 @@ import org.apache.flink.runtime.heartbeat.HeartbeatServices;
 import org.apache.flink.runtime.heartbeat.TestingHeartbeatServices;
 import org.apache.flink.runtime.highavailability.TestingHighAvailabilityServices;
 import org.apache.flink.runtime.leaderelection.TestingLeaderElectionService;
+import org.apache.flink.runtime.resourcemanager.DefaultJobLeaderIdService;
 import org.apache.flink.runtime.resourcemanager.JobLeaderIdService;
 import org.apache.flink.runtime.resourcemanager.slotmanager.SlotManager;
 import org.apache.flink.runtime.resourcemanager.slotmanager.SlotManagerBuilder;
 import org.apache.flink.runtime.rpc.RpcService;
 import org.apache.flink.runtime.testutils.DirectScheduledExecutorService;
-
-import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
@@ -70,20 +68,9 @@ public class MockResourceManagerRuntimeServices {
         highAvailabilityServices.setResourceManagerLeaderElectionService(rmLeaderElectionService);
         heartbeatServices = new TestingHeartbeatServices();
         jobLeaderIdService =
-                new JobLeaderIdService(
+                new DefaultJobLeaderIdService(
                         highAvailabilityServices,
                         rpcService.getScheduledExecutor(),
                         Time.minutes(5L));
-    }
-
-    public void grantLeadership() throws Exception {
-        UUID rmLeaderSessionId = UUID.randomUUID();
-        rmLeaderElectionService
-                .isLeader(rmLeaderSessionId)
-                .get(timeout.toMilliseconds(), TimeUnit.MILLISECONDS);
-    }
-
-    public void revokeLeadership() {
-        rmLeaderElectionService.notLeader();
     }
 }

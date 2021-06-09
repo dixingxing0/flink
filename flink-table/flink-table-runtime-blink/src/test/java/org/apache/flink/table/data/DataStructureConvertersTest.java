@@ -153,11 +153,13 @@ public class DataStructureConvertersTest {
                         .convertedTo(Instant.class, Instant.ofEpochSecond(12_345))
                         .convertedTo(Integer.class, 12_345)
                         .convertedTo(Long.class, 12_345_000L)
+                        .convertedTo(java.sql.Timestamp.class, new Timestamp(12_345_000L))
                         .convertedTo(
                                 TimestampData.class, TimestampData.fromEpochMillis(12_345_000)),
                 TestSpec.forDataType(TIMESTAMP_WITH_LOCAL_TIME_ZONE(3))
                         .convertedTo(Instant.class, Instant.ofEpochSecond(12_345, 1_000_000))
                         .convertedTo(Long.class, 12_345_001L)
+                        .convertedTo(java.sql.Timestamp.class, new Timestamp(12_345_001L))
                         .convertedTo(
                                 TimestampData.class, TimestampData.fromEpochMillis(12_345_001)),
                 TestSpec.forDataType(TIMESTAMP_WITH_LOCAL_TIME_ZONE(9))
@@ -354,7 +356,13 @@ public class DataStructureConvertersTest {
                                         Arrays.asList(
                                                 Arrays.asList(1.0, null, 2.0, null),
                                                 Collections.emptyList(),
-                                                null))));
+                                                null))),
+                TestSpec.forDataType(DataTypes.STRUCTURED(GenericPojo.class, FIELD("value", INT())))
+                        .convertedTo(GenericPojo.class, new GenericPojo<>(12)),
+                TestSpec.forDataType(
+                                DataTypes.STRUCTURED(GenericPojo.class, FIELD("value", DATE())))
+                        .convertedTo(
+                                GenericPojo.class, new GenericPojo<>(LocalDate.ofEpochDay(123))));
     }
 
     @Parameter public TestSpec testSpec;
@@ -741,7 +749,7 @@ public class DataStructureConvertersTest {
         }
     }
 
-    /** Pojo with {@link List}. */
+    /** POJO with {@link List}. */
     public static class PojoWithList {
 
         public List<List<Double>> factors;
@@ -765,6 +773,32 @@ public class DataStructureConvertersTest {
         @Override
         public int hashCode() {
             return Objects.hash(factors);
+        }
+    }
+
+    /** POJO with a generic field. */
+    public static class GenericPojo<T> {
+        public T value;
+
+        public GenericPojo(T value) {
+            this.value = value;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            GenericPojo<?> that = (GenericPojo<?>) o;
+            return Objects.equals(value, that.value);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(value);
         }
     }
 }

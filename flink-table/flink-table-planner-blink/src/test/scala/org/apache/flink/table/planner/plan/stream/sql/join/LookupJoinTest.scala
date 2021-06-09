@@ -369,6 +369,9 @@ class LookupJoinTest(legacyTableSource: Boolean) extends TableTestBase with Seri
 
   @Test
   def testJoinTemporalTableWithTrueCondition(): Unit = {
+    thrown.expect(classOf[TableException])
+    thrown.expectMessage("Temporal table join requires an equality condition on fields of " +
+      "table [default_catalog.default_database.LookupTable]")
     val sql =
       """
         |SELECT * FROM MyTable AS T
@@ -377,7 +380,7 @@ class LookupJoinTest(legacyTableSource: Boolean) extends TableTestBase with Seri
         |WHERE T.c > 1000
       """.stripMargin
 
-    util.verifyExecPlan(sql)
+    util.verifyExplain(sql)
   }
 
   @Test
@@ -460,6 +463,14 @@ class LookupJoinTest(legacyTableSource: Boolean) extends TableTestBase with Seri
         |  MyTable AS T JOIN LookupTableWithComputedColumn FOR SYSTEM_TIME AS OF T.proctime AS D
         |  ON T.a = D.id and D.nominal_age > 12
         |""".stripMargin
+    util.verifyExecPlan(sql)
+  }
+
+  @Test
+  def testJoinTemporalTableWithMultiConditionOnSameDimField(): Unit = {
+    val sql = "SELECT * FROM MyTable AS T JOIN LookupTable " +
+      "FOR SYSTEM_TIME AS OF T.proctime AS D ON T.a = D.id and CAST(T.c as INT) = D.id"
+
     util.verifyExecPlan(sql)
   }
 

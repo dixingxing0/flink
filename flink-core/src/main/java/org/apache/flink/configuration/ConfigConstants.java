@@ -767,38 +767,22 @@ public final class ConfigConstants {
     public static final String JOB_MANAGER_WEB_CHECKPOINTS_HISTORY_SIZE =
             "jobmanager.web.checkpoints.history";
 
-    /**
-     * Time after which cached stats are cleaned up if not accessed.
-     *
-     * @deprecated Use {@link WebOptions#BACKPRESSURE_CLEANUP_INTERVAL} instead.
-     */
+    /** @deprecated - no longer used. */
     @Deprecated
     public static final String JOB_MANAGER_WEB_BACK_PRESSURE_CLEAN_UP_INTERVAL =
             "jobmanager.web.backpressure.cleanup-interval";
 
-    /**
-     * Time after which available stats are deprecated and need to be refreshed (by resampling).
-     *
-     * @deprecated Use {@link WebOptions#BACKPRESSURE_REFRESH_INTERVAL} instead.
-     */
+    /** @deprecated - no longer used. */
     @Deprecated
     public static final String JOB_MANAGER_WEB_BACK_PRESSURE_REFRESH_INTERVAL =
             "jobmanager.web.backpressure.refresh-interval";
 
-    /**
-     * Number of samples to take to determine back pressure.
-     *
-     * @deprecated Use {@link WebOptions#BACKPRESSURE_NUM_SAMPLES} instead.
-     */
+    /** @deprecated - no longer used. */
     @Deprecated
     public static final String JOB_MANAGER_WEB_BACK_PRESSURE_NUM_SAMPLES =
             "jobmanager.web.backpressure.num-samples";
 
-    /**
-     * Delay between samples to determine back pressure.
-     *
-     * @deprecated Use {@link WebOptions#BACKPRESSURE_DELAY} instead.
-     */
+    /** @deprecated - no longer used. */
     @Deprecated
     public static final String JOB_MANAGER_WEB_BACK_PRESSURE_DELAY =
             "jobmanager.web.backpressure.delay-between-samples";
@@ -1029,7 +1013,7 @@ public final class ConfigConstants {
     public static final String HA_ZOOKEEPER_NAMESPACE_KEY =
             "high-availability.zookeeper.path.namespace";
 
-    /** @deprecated in favor of {@link HighAvailabilityOptions#HA_ZOOKEEPER_LATCH_PATH}. */
+    /** @deprecated no longer used. */
     @PublicEvolving @Deprecated
     public static final String HA_ZOOKEEPER_LATCH_PATH = "high-availability.zookeeper.path.latch";
 
@@ -1042,14 +1026,14 @@ public final class ConfigConstants {
     public static final String HA_ZOOKEEPER_JOBGRAPHS_PATH =
             "high-availability.zookeeper.path.jobgraphs";
 
-    /** @deprecated in favor of {@link HighAvailabilityOptions#HA_ZOOKEEPER_LEADER_PATH}. */
+    /** @deprecated no longer used. */
     @PublicEvolving @Deprecated
     public static final String HA_ZOOKEEPER_LEADER_PATH = "high-availability.zookeeper.path.leader";
 
     /**
      * ZooKeeper root path (ZNode) for completed checkpoints.
      *
-     * @deprecated in favor of {@link HighAvailabilityOptions#HA_ZOOKEEPER_CHECKPOINTS_PATH}.
+     * @deprecated no longer used.
      */
     @PublicEvolving @Deprecated
     public static final String HA_ZOOKEEPER_CHECKPOINTS_PATH =
@@ -1058,7 +1042,7 @@ public final class ConfigConstants {
     /**
      * ZooKeeper root path (ZNode) for checkpoint counters.
      *
-     * @deprecated in favor of {@link HighAvailabilityOptions#HA_ZOOKEEPER_CHECKPOINT_COUNTER_PATH}.
+     * @deprecated no longer used.
      */
     @PublicEvolving @Deprecated
     public static final String HA_ZOOKEEPER_CHECKPOINT_COUNTER_PATH =
@@ -1707,21 +1691,19 @@ public final class ConfigConstants {
     /** @deprecated in favor of {@link HighAvailabilityOptions#HA_CLUSTER_ID}. */
     @Deprecated public static final String DEFAULT_ZOOKEEPER_NAMESPACE_KEY = "/default";
 
-    /** @deprecated in favor of {@link HighAvailabilityOptions#HA_ZOOKEEPER_LATCH_PATH}. */
+    /** @deprecated no longer used. */
     @Deprecated public static final String DEFAULT_ZOOKEEPER_LATCH_PATH = "/leaderlatch";
 
-    /** @deprecated in favor of {@link HighAvailabilityOptions#HA_ZOOKEEPER_LEADER_PATH}. */
+    /** @deprecated no longer used. */
     @Deprecated public static final String DEFAULT_ZOOKEEPER_LEADER_PATH = "/leader";
 
     /** @deprecated in favor of {@link HighAvailabilityOptions#HA_ZOOKEEPER_JOBGRAPHS_PATH}. */
     @Deprecated public static final String DEFAULT_ZOOKEEPER_JOBGRAPHS_PATH = "/jobgraphs";
 
-    /** @deprecated in favor of {@link HighAvailabilityOptions#HA_ZOOKEEPER_CHECKPOINTS_PATH}. */
+    /** @deprecated no longer used. */
     @Deprecated public static final String DEFAULT_ZOOKEEPER_CHECKPOINTS_PATH = "/checkpoints";
 
-    /**
-     * @deprecated in favor of {@link HighAvailabilityOptions#HA_ZOOKEEPER_CHECKPOINT_COUNTER_PATH}
-     */
+    /** @deprecated no longer used. */
     @Deprecated
     public static final String DEFAULT_ZOOKEEPER_CHECKPOINT_COUNTER_PATH = "/checkpoint-counter";
 

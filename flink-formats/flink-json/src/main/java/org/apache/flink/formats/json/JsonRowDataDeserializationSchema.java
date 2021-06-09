@@ -21,6 +21,7 @@ package org.apache.flink.formats.json;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.formats.common.TimestampFormat;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.RowType;
@@ -102,8 +103,7 @@ public class JsonRowDataDeserializationSchema implements DeserializationSchema<R
             return null;
         }
         try {
-            final JsonNode root = objectMapper.readTree(message);
-            return (RowData) runtimeConverter.convert(root);
+            return convertToRowData(deserializeToJsonNode(message));
         } catch (Throwable t) {
             if (ignoreParseErrors) {
                 return null;
@@ -111,6 +111,14 @@ public class JsonRowDataDeserializationSchema implements DeserializationSchema<R
             throw new IOException(
                     format("Failed to deserialize JSON '%s'.", new String(message)), t);
         }
+    }
+
+    public JsonNode deserializeToJsonNode(byte[] message) throws IOException {
+        return objectMapper.readTree(message);
+    }
+
+    public RowData convertToRowData(JsonNode message) {
+        return (RowData) runtimeConverter.convert(message);
     }
 
     @Override
