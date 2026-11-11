@@ -18,10 +18,14 @@
 import sys
 from functools import wraps
 
-if sys.version_info < (3, 5):
+__path__ = __import__("pkgutil").extend_path(__path__, __name__)  # type: ignore
+
+if sys.version_info < (3, 6):
     raise RuntimeError(
-        'Python versions prior to 3.5 are not supported for PyFlink [' +
+        'Python versions prior to 3.6 are not supported for PyFlink [' +
         str(sys.version_info) + '].')
+
+from pyflink.version import __version__
 
 
 def keyword(func):
@@ -48,3 +52,7 @@ def add_version_doc(f, version):
     indents = indent_p.findall(original_doc)
     indent = ' ' * (min(len(indent) for indent in indents) if indents else 0)
     f.__doc__ = original_doc.rstrip() + "\n\n%s.. versionadded:: %s" % (indent, version)
+
+__all__ = [
+    "__version__",
+]

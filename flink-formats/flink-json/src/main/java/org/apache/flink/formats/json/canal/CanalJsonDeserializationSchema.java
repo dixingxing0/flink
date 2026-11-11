@@ -21,8 +21,8 @@ package org.apache.flink.formats.json.canal;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.formats.common.TimestampFormat;
 import org.apache.flink.formats.json.JsonRowDataDeserializationSchema;
-import org.apache.flink.formats.json.TimestampFormat;
 import org.apache.flink.formats.json.canal.CanalJsonDecodingFormat.ReadableMetadata;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.data.ArrayData;
@@ -34,12 +34,19 @@ import org.apache.flink.table.types.utils.DataTypeUtils;
 import org.apache.flink.types.RowKind;
 import org.apache.flink.util.Collector;
 
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static java.lang.String.format;
@@ -58,6 +65,9 @@ import static java.lang.String.format;
 public final class CanalJsonDeserializationSchema implements DeserializationSchema<RowData> {
     private static final long serialVersionUID = 1L;
 
+    private static final Logger LOG = LoggerFactory.getLogger(CanalJsonDeserializationSchema.class);
+
+    private static final String FIELD_OLD = "old";
     private static final String OP_INSERT = "INSERT";
     private static final String OP_UPDATE = "UPDATE";
     private static final String OP_DELETE = "DELETE";
@@ -84,8 +94,20 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
     /** Flag indicating whether to ignore invalid fields/rows (default: throw an exception). */
     private final boolean ignoreParseErrors;
 
+    /** Names of fields. */
+    private final List<String> fieldNames;
+
     /** Number of fields. */
     private final int fieldCount;
+
+    /** Pattern of the specific database. */
+    private final Pattern databasePattern;
+
+    /** Pattern of the specific table. */
+    private final Pattern tablePattern;
+
+    /** List of data to be processed. */
+    private transient List<GenericRowData> genericRowDataList;
 
     private CanalJsonDeserializationSchema(
             DataType physicalDataType,
@@ -112,7 +134,11 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
         this.database = database;
         this.table = table;
         this.ignoreParseErrors = ignoreParseErrors;
-        this.fieldCount = ((RowType) physicalDataType.getLogicalType()).getFieldCount();
+        final RowType physicalRowType = ((RowType) physicalDataType.getLogicalType());
+        this.fieldNames = physicalRowType.getFieldNames();
+        this.fieldCount = physicalRowType.getFieldCount();
+        this.databasePattern = database == null ? null : Pattern.compile(database);
+        this.tablePattern = table == null ? null : Pattern.compile(table);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -182,6 +208,12 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
     // ------------------------------------------------------------------------------------------
 
     @Override
+    public void open(InitializationContext context) throws Exception {
+        genericRowDataList = new ArrayList<>();
+        jsonDeserializer.open(context);
+    }
+
+    @Override
     public RowData deserialize(byte[] message) throws IOException {
         throw new RuntimeException(
                 "Please invoke DeserializationSchema#deserialize(byte[], Collector<RowData>) instead.");
@@ -192,20 +224,24 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
         if (message == null || message.length == 0) {
             return;
         }
+        genericRowDataList.clear();
         try {
-            GenericRowData row = (GenericRowData) jsonDeserializer.deserialize(message);
+            final JsonNode root = jsonDeserializer.deserializeToJsonNode(message);
             if (database != null) {
-                String currentDatabase = row.getString(3).toString();
-                if (!database.equals(currentDatabase)) {
+                if (!databasePattern
+                        .matcher(root.get(ReadableMetadata.DATABASE.key).asText())
+                        .matches()) {
                     return;
                 }
             }
             if (table != null) {
-                String currentTable = row.getString(4).toString();
-                if (!table.equals(currentTable)) {
+                if (!tablePattern
+                        .matcher(root.get(ReadableMetadata.TABLE.key).asText())
+                        .matches()) {
                     return;
                 }
             }
+            final GenericRowData row = (GenericRowData) jsonDeserializer.convertToRowData(root);
             String type = row.getString(2).toString(); // "type" field
             if (OP_INSERT.equals(type)) {
                 // "data" field is an array of row, contains inserted rows
@@ -213,7 +249,7 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
                 for (int i = 0; i < data.size(); i++) {
                     GenericRowData insert = (GenericRowData) data.getRow(i, fieldCount);
                     insert.setRowKind(RowKind.INSERT);
-                    emitRow(row, insert, out);
+                    genericRowDataList.add(handleRow(row, insert));
                 }
             } else if (OP_UPDATE.equals(type)) {
                 // "data" field is an array of row, contains new rows
@@ -224,18 +260,19 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
                     // the underlying JSON deserialization schema always produce GenericRowData.
                     GenericRowData after = (GenericRowData) data.getRow(i, fieldCount);
                     GenericRowData before = (GenericRowData) old.getRow(i, fieldCount);
+                    final JsonNode oldField = root.get(FIELD_OLD);
                     for (int f = 0; f < fieldCount; f++) {
-                        if (before.isNullAt(f)) {
-                            // not null fields in "old" (before) means the fields are changed
-                            // null/empty fields in "old" (before) means the fields are not changed
+                        if (before.isNullAt(f) && oldField.findValue(fieldNames.get(f)) == null) {
+                            // fields in "old" (before) means the fields are changed
+                            // fields not in "old" (before) means the fields are not changed
                             // so we just copy the not changed fields into before
                             before.setField(f, after.getField(f));
                         }
                     }
                     before.setRowKind(RowKind.UPDATE_BEFORE);
                     after.setRowKind(RowKind.UPDATE_AFTER);
-                    emitRow(row, before, out);
-                    emitRow(row, after, out);
+                    genericRowDataList.add(handleRow(row, before));
+                    genericRowDataList.add(handleRow(row, after));
                 }
             } else if (OP_DELETE.equals(type)) {
                 // "data" field is an array of row, contains deleted rows
@@ -243,7 +280,7 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
                 for (int i = 0; i < data.size(); i++) {
                     GenericRowData insert = (GenericRowData) data.getRow(i, fieldCount);
                     insert.setRowKind(RowKind.DELETE);
-                    emitRow(row, insert, out);
+                    genericRowDataList.add(handleRow(row, insert));
                 }
             } else if (OP_CREATE.equals(type)) {
                 // "data" field is null and "type" is "CREATE" which means
@@ -256,6 +293,12 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
                                     "Unknown \"type\" value \"%s\". The Canal JSON message is '%s'",
                                     type, new String(message)));
                 }
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "Unknown \"type\" value '{}'. The Canal JSON message is '{}'.",
+                            type,
+                            new String(message));
+                }
             }
         } catch (Throwable t) {
             // a big try catch to protect the processing.
@@ -263,15 +306,19 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
                 throw new IOException(
                         format("Corrupt Canal JSON message '%s'.", new String(message)), t);
             }
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Corrupt Canal JSON message '{}'.", new String(message), t);
+            }
+        }
+        for (GenericRowData genericRowData : genericRowDataList) {
+            out.collect(genericRowData);
         }
     }
 
-    private void emitRow(
-            GenericRowData rootRow, GenericRowData physicalRow, Collector<RowData> out) {
+    private GenericRowData handleRow(GenericRowData rootRow, GenericRowData physicalRow) {
         // shortcut in case no output projection is required
         if (!hasMetadata) {
-            out.collect(physicalRow);
-            return;
+            return physicalRow;
         }
         final int physicalArity = physicalRow.getArity();
         final int metadataArity = metadataConverters.length;
@@ -284,7 +331,7 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
             producedRow.setField(
                     physicalArity + metadataPos, metadataConverters[metadataPos].convert(rootRow));
         }
-        out.collect(producedRow);
+        return producedRow;
     }
 
     @Override

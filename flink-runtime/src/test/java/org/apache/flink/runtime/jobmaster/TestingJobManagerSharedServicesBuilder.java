@@ -22,37 +22,29 @@ import org.apache.flink.runtime.blob.BlobWriter;
 import org.apache.flink.runtime.blob.VoidBlobWriter;
 import org.apache.flink.runtime.execution.librarycache.ContextClassLoaderLibraryCacheManager;
 import org.apache.flink.runtime.execution.librarycache.LibraryCacheManager;
-import org.apache.flink.runtime.rest.handler.legacy.backpressure.BackPressureRequestCoordinator;
-import org.apache.flink.runtime.rest.handler.legacy.backpressure.BackPressureStatsTracker;
-import org.apache.flink.runtime.rest.handler.legacy.backpressure.VoidBackPressureStatsTracker;
-import org.apache.flink.runtime.testingUtils.TestingUtils;
+import org.apache.flink.runtime.shuffle.ShuffleMaster;
+import org.apache.flink.runtime.shuffle.ShuffleTestUtils;
 
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 
 /** Builder for the {@link JobManagerSharedServices}. */
 public class TestingJobManagerSharedServicesBuilder {
 
-    private ScheduledExecutorService scheduledExecutorService;
-
     private LibraryCacheManager libraryCacheManager;
 
-    private BackPressureRequestCoordinator backPressureSampleCoordinator;
-
-    private BackPressureStatsTracker backPressureStatsTracker;
+    private ShuffleMaster<?> shuffleMaster;
 
     private BlobWriter blobWriter;
 
     public TestingJobManagerSharedServicesBuilder() {
-        scheduledExecutorService = TestingUtils.defaultExecutor();
         libraryCacheManager = ContextClassLoaderLibraryCacheManager.INSTANCE;
-        backPressureSampleCoordinator = new BackPressureRequestCoordinator(Runnable::run, 10000);
-        backPressureStatsTracker = VoidBackPressureStatsTracker.INSTANCE;
+        shuffleMaster = ShuffleTestUtils.DEFAULT_SHUFFLE_MASTER;
         blobWriter = VoidBlobWriter.getInstance();
     }
 
-    public TestingJobManagerSharedServicesBuilder setScheduledExecutorService(
-            ScheduledExecutorService scheduledExecutorService) {
-        this.scheduledExecutorService = scheduledExecutorService;
+    public TestingJobManagerSharedServicesBuilder setShuffleMaster(ShuffleMaster<?> shuffleMaster) {
+        this.shuffleMaster = shuffleMaster;
         return this;
     }
 
@@ -62,28 +54,15 @@ public class TestingJobManagerSharedServicesBuilder {
         return this;
     }
 
-    public TestingJobManagerSharedServicesBuilder setBackPressureSampleCoordinator(
-            BackPressureRequestCoordinator backPressureSampleCoordinator) {
-        this.backPressureSampleCoordinator = backPressureSampleCoordinator;
-        return this;
-    }
-
-    public TestingJobManagerSharedServicesBuilder setBackPressureStatsTracker(
-            BackPressureStatsTracker backPressureStatsTracker) {
-        this.backPressureStatsTracker = backPressureStatsTracker;
-        return this;
-    }
-
     public void setBlobWriter(BlobWriter blobWriter) {
         this.blobWriter = blobWriter;
     }
 
     public JobManagerSharedServices build() {
+        final ScheduledExecutorService executorService =
+                Executors.newSingleThreadScheduledExecutor();
+
         return new JobManagerSharedServices(
-                scheduledExecutorService,
-                libraryCacheManager,
-                backPressureSampleCoordinator,
-                backPressureStatsTracker,
-                blobWriter);
+                executorService, executorService, libraryCacheManager, shuffleMaster, blobWriter);
     }
 }

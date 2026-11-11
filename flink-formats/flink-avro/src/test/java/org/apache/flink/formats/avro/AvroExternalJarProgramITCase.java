@@ -23,20 +23,19 @@ import org.apache.flink.core.fs.Path;
 import org.apache.flink.formats.avro.testjar.AvroExternalJarProgram;
 import org.apache.flink.runtime.minicluster.MiniCluster;
 import org.apache.flink.runtime.minicluster.MiniClusterConfiguration;
-import org.apache.flink.test.util.TestEnvironment;
+import org.apache.flink.streaming.util.TestStreamEnvironment;
 import org.apache.flink.util.JarUtils;
-import org.apache.flink.util.TestLogger;
 
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.Collections;
 
 /** IT case for the {@link AvroExternalJarProgram}. */
-public class AvroExternalJarProgramITCase extends TestLogger {
+class AvroExternalJarProgramITCase {
 
     private static final String JAR_FILE = "maven-test-jar.jar";
 
@@ -47,23 +46,24 @@ public class AvroExternalJarProgramITCase extends TestLogger {
     private static final MiniCluster MINI_CLUSTER =
             new MiniCluster(
                     new MiniClusterConfiguration.Builder()
+                            .withRandomPorts()
                             .setNumTaskManagers(1)
                             .setNumSlotsPerTaskManager(PARALLELISM)
                             .build());
 
-    @BeforeClass
-    public static void setUp() throws Exception {
+    @BeforeAll
+    static void setUp() throws Exception {
         MINI_CLUSTER.start();
     }
 
-    @AfterClass
-    public static void tearDown() {
-        TestEnvironment.unsetAsContext();
+    @AfterAll
+    static void tearDown() {
+        TestStreamEnvironment.unsetAsContext();
         MINI_CLUSTER.closeAsync();
     }
 
     @Test
-    public void testExternalProgram() throws Exception {
+    void testExternalProgram() throws Exception {
 
         String jarFile = JAR_FILE;
         try {
@@ -72,7 +72,7 @@ public class AvroExternalJarProgramITCase extends TestLogger {
             jarFile = "target/".concat(jarFile);
         }
 
-        TestEnvironment.setAsContext(
+        TestStreamEnvironment.setAsContext(
                 MINI_CLUSTER,
                 PARALLELISM,
                 Collections.singleton(new Path(jarFile)),

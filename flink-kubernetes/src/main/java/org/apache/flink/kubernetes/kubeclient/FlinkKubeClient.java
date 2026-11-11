@@ -24,7 +24,9 @@ import org.apache.flink.kubernetes.kubeclient.resources.KubernetesLeaderElector;
 import org.apache.flink.kubernetes.kubeclient.resources.KubernetesPod;
 import org.apache.flink.kubernetes.kubeclient.resources.KubernetesService;
 import org.apache.flink.kubernetes.kubeclient.resources.KubernetesWatch;
+import org.apache.flink.runtime.persistence.PossibleInconsistentStateException;
 
+import java.io.File;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -72,12 +74,12 @@ public interface FlinkKubeClient extends AutoCloseable {
     void stopAndCleanupCluster(String clusterId);
 
     /**
-     * Get the kubernetes rest service of the given flink clusterId.
+     * Get the kubernetes service of the given flink clusterId.
      *
-     * @param clusterId cluster id
-     * @return Return the optional rest service of the specified cluster id.
+     * @param serviceName the name of the service
+     * @return Return the optional kubernetes service of the specified name.
      */
-    Optional<KubernetesService> getRestService(String clusterId);
+    Optional<KubernetesService> getService(String serviceName);
 
     /**
      * Get the rest endpoint for access outside cluster.
@@ -96,9 +98,6 @@ public interface FlinkKubeClient extends AutoCloseable {
      */
     List<KubernetesPod> getPodsWithLabels(Map<String, String> labels);
 
-    /** Log exceptions. */
-    void handleException(Exception e);
-
     /**
      * Watch the pods selected by labels and do the {@link WatchCallbackHandler}.
      *
@@ -106,8 +105,9 @@ public interface FlinkKubeClient extends AutoCloseable {
      * @param podCallbackHandler podCallbackHandler which reacts to pod events
      * @return Return a watch for pods. It needs to be closed after use.
      */
-    KubernetesWatch watchPodsAndDoCallback(
-            Map<String, String> labels, WatchCallbackHandler<KubernetesPod> podCallbackHandler);
+    CompletableFuture<KubernetesWatch> watchPodsAndDoCallback(
+            Map<String, String> labels, WatchCallbackHandler<KubernetesPod> podCallbackHandler)
+            throws Exception;
 
     /**
      * Create a leader elector service based on Kubernetes api.
@@ -153,30 +153,16 @@ public interface FlinkKubeClient extends AutoCloseable {
      *     one. If the returned optional is empty, we will not do the update.
      * @return Return the ConfigMap update future. The boolean result indicates whether the
      *     ConfigMap is updated. The returned future will be completed exceptionally if the
-     *     ConfigMap does not exist.
+     *     ConfigMap does not exist. A failure during the update operation will result in the future
+     *     failing with a {@link PossibleInconsistentStateException} indicating that no clear
+     *     decision can be made on whether the update was successful or not. The {@code
+     *     PossibleInconsistentStateException} not being present indicates that the failure happened
+     *     before writing the updated ConfigMap to Kubernetes. For the latter case, it can be
+     *     assumed that the ConfigMap was not updated.
      */
     CompletableFuture<Boolean> checkAndUpdateConfigMap(
             String configMapName,
             Function<KubernetesConfigMap, Optional<KubernetesConfigMap>> updateFunction);
-
-    /**
-     * Watch the ConfigMaps with specified name and do the {@link WatchCallbackHandler}.
-     *
-     * @param name name to filter the ConfigMaps to watch
-     * @param callbackHandler callbackHandler which reacts to ConfigMap events
-     * @return Return a watch for ConfigMaps. It needs to be closed after use.
-     */
-    KubernetesWatch watchConfigMaps(
-            String name, WatchCallbackHandler<KubernetesConfigMap> callbackHandler);
-
-    /**
-     * Delete the Kubernetes ConfigMaps by labels. This will be used by {@link
-     * org.apache.flink.kubernetes.highavailability.KubernetesHaServices} to clean up all data.
-     *
-     * @param labels labels to filter the resources. e.g. type: high-availability
-     * @return Return the delete future.
-     */
-    CompletableFuture<Void> deleteConfigMapsByLabels(Map<String, String> labels);
 
     /**
      * Delete a Kubernetes ConfigMap by name.
@@ -186,8 +172,35 @@ public interface FlinkKubeClient extends AutoCloseable {
      */
     CompletableFuture<Void> deleteConfigMap(String configMapName);
 
+    /**
+     * Create a shared watcher for ConfigMaps with specified name.
+     *
+     * @param name name of the ConfigMap to watch.
+     * @return Return a shared watcher.
+     */
+    KubernetesConfigMapSharedWatcher createConfigMapSharedWatcher(String name);
+
     /** Close the Kubernetes client with no exception. */
     void close();
+
+    /**
+     * Load pod from template file.
+     *
+     * @param podTemplateFile The pod template file.
+     * @return Return a Kubernetes pod loaded from the template.
+     */
+    KubernetesPod loadPodFromTemplateFile(File podTemplateFile);
+
+    /**
+     * Update the target ports of the given Kubernetes service.
+     *
+     * @param serviceName The name of the service which needs to be updated
+     * @param portName The port name which needs to be updated
+     * @param targetPort The updated target port
+     * @return Return the update service target port future
+     */
+    CompletableFuture<Void> updateServiceTargetPort(
+            String serviceName, String portName, int targetPort);
 
     /** Callback handler for kubernetes resources. */
     interface WatchCallbackHandler<T> {
@@ -200,6 +213,6 @@ public interface FlinkKubeClient extends AutoCloseable {
 
         void onError(List<T> resources);
 
-        void handleFatalError(Throwable throwable);
+        void handleError(Throwable throwable);
     }
 }

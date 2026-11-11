@@ -20,12 +20,16 @@ package org.apache.flink.runtime.taskexecutor.rpc;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.runtime.checkpoint.CheckpointCoordinatorGateway;
+import org.apache.flink.runtime.checkpoint.CheckpointException;
 import org.apache.flink.runtime.checkpoint.CheckpointMetrics;
+import org.apache.flink.runtime.checkpoint.SubTaskInitializationMetrics;
 import org.apache.flink.runtime.checkpoint.TaskStateSnapshot;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.messages.checkpoint.DeclineCheckpoint;
 import org.apache.flink.runtime.taskmanager.CheckpointResponder;
 import org.apache.flink.util.Preconditions;
+
+import static org.apache.flink.runtime.checkpoint.TaskStateSnapshot.serializeTaskStateSnapshot;
 
 public class RpcCheckpointResponder implements CheckpointResponder {
 
@@ -43,9 +47,24 @@ public class RpcCheckpointResponder implements CheckpointResponder {
             long checkpointId,
             CheckpointMetrics checkpointMetrics,
             TaskStateSnapshot subtaskState) {
+        checkpointCoordinatorGateway
+                .acknowledgeCheckpoint(
+                        jobID,
+                        executionAttemptID,
+                        checkpointId,
+                        checkpointMetrics,
+                        serializeTaskStateSnapshot(subtaskState))
+                .join();
+    }
 
-        checkpointCoordinatorGateway.acknowledgeCheckpoint(
-                jobID, executionAttemptID, checkpointId, checkpointMetrics, subtaskState);
+    @Override
+    public void reportCheckpointMetrics(
+            JobID jobID,
+            ExecutionAttemptID executionAttemptID,
+            long checkpointId,
+            CheckpointMetrics checkpointMetrics) {
+        checkpointCoordinatorGateway.reportCheckpointMetrics(
+                jobID, executionAttemptID, checkpointId, checkpointMetrics);
     }
 
     @Override
@@ -53,9 +72,19 @@ public class RpcCheckpointResponder implements CheckpointResponder {
             JobID jobID,
             ExecutionAttemptID executionAttemptID,
             long checkpointId,
-            Throwable cause) {
+            CheckpointException checkpointException) {
 
         checkpointCoordinatorGateway.declineCheckpoint(
-                new DeclineCheckpoint(jobID, executionAttemptID, checkpointId, cause));
+                new DeclineCheckpoint(
+                        jobID, executionAttemptID, checkpointId, checkpointException));
+    }
+
+    @Override
+    public void reportInitializationMetrics(
+            JobID jobId,
+            ExecutionAttemptID executionAttemptId,
+            SubTaskInitializationMetrics initializationMetrics) {
+        checkpointCoordinatorGateway.reportInitializationMetrics(
+                jobId, executionAttemptId, initializationMetrics);
     }
 }

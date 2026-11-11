@@ -17,8 +17,8 @@
 
 package org.apache.flink.formats.parquet.vector.reader;
 
-import org.apache.flink.table.data.vector.writable.WritableBytesVector;
-import org.apache.flink.table.data.vector.writable.WritableIntVector;
+import org.apache.flink.table.data.columnar.vector.writable.WritableBytesVector;
+import org.apache.flink.table.data.columnar.vector.writable.WritableIntVector;
 
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.page.PageReader;
@@ -74,7 +74,7 @@ public class BytesColumnReader extends AbstractColumnReader<WritableBytesVector>
             int rowId, int num, WritableBytesVector column, WritableIntVector dictionaryIds) {
         for (int i = rowId; i < rowId + num; ++i) {
             if (!column.isNullAt(i)) {
-                byte[] bytes = dictionary.decodeToBinary(dictionaryIds.getInt(i)).getBytes();
+                byte[] bytes = dictionary.decodeToBinary(dictionaryIds.getInt(i)).getBytesUnsafe();
                 column.appendBytes(i, bytes, 0, bytes.length);
             }
         }

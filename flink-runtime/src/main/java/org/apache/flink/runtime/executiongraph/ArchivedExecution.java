@@ -15,16 +15,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.flink.runtime.executiongraph;
 
 import org.apache.flink.runtime.accumulators.StringifiedAccumulatorResult;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
-import org.apache.flink.util.ExceptionUtils;
+
+import javax.annotation.Nullable;
 
 import java.io.Serializable;
+import java.util.Optional;
 
+/** {@code ArchivedExecution} is a readonly representation of {@link Execution}. */
 public class ArchivedExecution implements AccessExecution, Serializable {
     private static final long serialVersionUID = 4817108757483345173L;
     // --------------------------------------------------------------------------------------------
@@ -33,11 +37,11 @@ public class ArchivedExecution implements AccessExecution, Serializable {
 
     private final long[] stateTimestamps;
 
-    private final int attemptNumber;
+    private final long[] stateEndTimestamps;
 
     private final ExecutionState state;
 
-    private final String failureCause; // once assigned, never changes
+    @Nullable private final ErrorInfo failureInfo; // once assigned, never changes
 
     private final TaskManagerLocation assignedResourceLocation; // for the archived execution
 
@@ -46,8 +50,6 @@ public class ArchivedExecution implements AccessExecution, Serializable {
     /* Continuously updated map of user-defined accumulators */
     private final StringifiedAccumulatorResult[] userAccumulators;
 
-    private final int parallelSubtaskIndex;
-
     private final IOMetrics ioMetrics;
 
     public ArchivedExecution(Execution execution) {
@@ -55,35 +57,32 @@ public class ArchivedExecution implements AccessExecution, Serializable {
                 execution.getUserAccumulatorsStringified(),
                 execution.getIOMetrics(),
                 execution.getAttemptId(),
-                execution.getAttemptNumber(),
                 execution.getState(),
-                ExceptionUtils.stringifyException(execution.getFailureCause()),
+                execution.getFailureInfo().orElse(null),
                 execution.getAssignedResourceLocation(),
                 execution.getAssignedAllocationID(),
-                execution.getVertex().getParallelSubtaskIndex(),
-                execution.getStateTimestamps());
+                execution.getStateTimestamps(),
+                execution.getStateEndTimestamps());
     }
 
     public ArchivedExecution(
             StringifiedAccumulatorResult[] userAccumulators,
             IOMetrics ioMetrics,
             ExecutionAttemptID attemptId,
-            int attemptNumber,
             ExecutionState state,
-            String failureCause,
+            @Nullable ErrorInfo failureCause,
             TaskManagerLocation assignedResourceLocation,
             AllocationID assignedAllocationID,
-            int parallelSubtaskIndex,
-            long[] stateTimestamps) {
+            long[] stateTimestamps,
+            long[] stateEndTimestamps) {
         this.userAccumulators = userAccumulators;
         this.ioMetrics = ioMetrics;
-        this.failureCause = failureCause;
+        this.failureInfo = failureCause;
         this.assignedResourceLocation = assignedResourceLocation;
-        this.attemptNumber = attemptNumber;
         this.attemptId = attemptId;
         this.state = state;
         this.stateTimestamps = stateTimestamps;
-        this.parallelSubtaskIndex = parallelSubtaskIndex;
+        this.stateEndTimestamps = stateEndTimestamps;
         this.assignedAllocationID = assignedAllocationID;
     }
 
@@ -98,12 +97,17 @@ public class ArchivedExecution implements AccessExecution, Serializable {
 
     @Override
     public int getAttemptNumber() {
-        return attemptNumber;
+        return attemptId.getAttemptNumber();
     }
 
     @Override
     public long[] getStateTimestamps() {
         return stateTimestamps;
+    }
+
+    @Override
+    public long[] getStateEndTimestamps() {
+        return stateEndTimestamps;
     }
 
     @Override
@@ -121,13 +125,18 @@ public class ArchivedExecution implements AccessExecution, Serializable {
     }
 
     @Override
-    public String getFailureCauseAsString() {
-        return failureCause;
+    public Optional<ErrorInfo> getFailureInfo() {
+        return Optional.ofNullable(failureInfo);
     }
 
     @Override
     public long getStateTimestamp(ExecutionState state) {
         return this.stateTimestamps[state.ordinal()];
+    }
+
+    @Override
+    public long getStateEndTimestamp(ExecutionState state) {
+        return this.stateEndTimestamps[state.ordinal()];
     }
 
     @Override
@@ -137,7 +146,7 @@ public class ArchivedExecution implements AccessExecution, Serializable {
 
     @Override
     public int getParallelSubtaskIndex() {
-        return parallelSubtaskIndex;
+        return attemptId.getSubtaskIndex();
     }
 
     @Override

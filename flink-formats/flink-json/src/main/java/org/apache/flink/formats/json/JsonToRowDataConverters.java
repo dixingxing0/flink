@@ -19,6 +19,7 @@
 package org.apache.flink.formats.json;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.formats.common.TimestampFormat;
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.data.DecimalData;
 import org.apache.flink.table.data.GenericArrayData;
@@ -35,8 +36,9 @@ import org.apache.flink.table.types.logical.LogicalTypeFamily;
 import org.apache.flink.table.types.logical.MapType;
 import org.apache.flink.table.types.logical.MultisetType;
 import org.apache.flink.table.types.logical.RowType;
-import org.apache.flink.table.types.logical.utils.LogicalTypeChecks;
 import org.apache.flink.table.types.logical.utils.LogicalTypeUtils;
+import org.apache.flink.types.variant.BinaryVariant;
+import org.apache.flink.types.variant.BinaryVariantInternalBuilder;
 
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.node.ArrayNode;
@@ -58,11 +60,11 @@ import java.util.Iterator;
 import java.util.Map;
 
 import static java.time.format.DateTimeFormatter.ISO_LOCAL_DATE;
-import static org.apache.flink.formats.json.TimeFormats.ISO8601_TIMESTAMP_FORMAT;
-import static org.apache.flink.formats.json.TimeFormats.ISO8601_TIMESTAMP_WITH_LOCAL_TIMEZONE_FORMAT;
-import static org.apache.flink.formats.json.TimeFormats.SQL_TIMESTAMP_FORMAT;
-import static org.apache.flink.formats.json.TimeFormats.SQL_TIMESTAMP_WITH_LOCAL_TIMEZONE_FORMAT;
-import static org.apache.flink.formats.json.TimeFormats.SQL_TIME_FORMAT;
+import static org.apache.flink.formats.common.TimeFormats.ISO8601_TIMESTAMP_FORMAT;
+import static org.apache.flink.formats.common.TimeFormats.ISO8601_TIMESTAMP_WITH_LOCAL_TIMEZONE_FORMAT;
+import static org.apache.flink.formats.common.TimeFormats.SQL_TIMESTAMP_FORMAT;
+import static org.apache.flink.formats.common.TimeFormats.SQL_TIMESTAMP_WITH_LOCAL_TIMEZONE_FORMAT;
+import static org.apache.flink.formats.common.TimeFormats.SQL_TIME_FORMAT;
 
 /** Tool class used to convert from {@link JsonNode} to {@link RowData}. * */
 @Internal
@@ -137,6 +139,8 @@ public class JsonToRowDataConverters implements Serializable {
             case BINARY:
             case VARBINARY:
                 return this::convertToBytes;
+            case VARIANT:
+                return this::convertToVariant;
             case DECIMAL:
                 return createDecimalConverter((DecimalType) type);
             case ARRAY:
@@ -214,7 +218,7 @@ public class JsonToRowDataConverters implements Serializable {
         LocalTime localTime = parsedTime.query(TemporalQueries.localTime());
 
         // get number of milliseconds of the day
-        return localTime.toSecondOfDay() * 1000;
+        return (int) (localTime.toNanoOfDay() / 1000_000);
     }
 
     private TimestampData convertToTimestamp(JsonNode jsonNode) {
@@ -270,6 +274,14 @@ public class JsonToRowDataConverters implements Serializable {
         }
     }
 
+    private BinaryVariant convertToVariant(JsonNode jsonNode) {
+        try {
+            return BinaryVariantInternalBuilder.parseJson(jsonNode.toString(), false);
+        } catch (IOException e) {
+            throw new JsonParseException("Unable to deserialize VARIANT value.", e);
+        }
+    }
+
     private byte[] convertToBytes(JsonNode jsonNode) {
         try {
             return jsonNode.binaryValue();
@@ -309,7 +321,7 @@ public class JsonToRowDataConverters implements Serializable {
 
     private JsonToRowDataConverter createMapConverter(
             String typeSummary, LogicalType keyType, LogicalType valueType) {
-        if (!LogicalTypeChecks.hasFamily(keyType, LogicalTypeFamily.CHARACTER_STRING)) {
+        if (!keyType.is(LogicalTypeFamily.CHARACTER_STRING)) {
             throw new UnsupportedOperationException(
                     "JSON format doesn't support non-string as key type of map. "
                             + "The type is: "
@@ -346,8 +358,13 @@ public class JsonToRowDataConverters implements Serializable {
             for (int i = 0; i < arity; i++) {
                 String fieldName = fieldNames[i];
                 JsonNode field = node.get(fieldName);
-                Object convertedField = convertField(fieldConverters[i], fieldName, field);
-                row.setField(i, convertedField);
+                try {
+                    Object convertedField = convertField(fieldConverters[i], fieldName, field);
+                    row.setField(i, convertedField);
+                } catch (Throwable t) {
+                    throw new JsonParseException(
+                            String.format("Fail to deserialize at field: %s.", fieldName), t);
+                }
             }
             return row;
         };
@@ -380,18 +397,5 @@ public class JsonToRowDataConverters implements Serializable {
                 return null;
             }
         };
-    }
-
-    /** Exception which refers to parse errors in converters. */
-    private static final class JsonParseException extends RuntimeException {
-        private static final long serialVersionUID = 1L;
-
-        public JsonParseException(String message) {
-            super(message);
-        }
-
-        public JsonParseException(String message, Throwable cause) {
-            super(message, cause);
-        }
     }
 }

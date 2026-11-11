@@ -21,85 +21,95 @@ package org.apache.flink.runtime.io.network.partition.consumer;
 import org.apache.flink.metrics.SimpleCounter;
 import org.apache.flink.runtime.event.TaskEvent;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
+import org.apache.flink.runtime.io.network.partition.ResultSubpartitionIndexSet;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 
 /** Tests for {@link InputChannel}. */
-public class InputChannelTest {
+class InputChannelTest {
 
     @Test
-    public void testExponentialBackoff() throws Exception {
+    void testExponentialBackoff() {
         InputChannel ch = createInputChannel(500, 4000);
 
-        assertEquals(0, ch.getCurrentBackoff());
+        assertThat(ch.getCurrentBackoff()).isZero();
 
-        assertTrue(ch.increaseBackoff());
-        assertEquals(500, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isTrue();
+        assertThat(ch.getCurrentBackoff()).isEqualTo(500);
 
-        assertTrue(ch.increaseBackoff());
-        assertEquals(1000, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isTrue();
+        assertThat(ch.getCurrentBackoff()).isEqualTo(1000);
 
-        assertTrue(ch.increaseBackoff());
-        assertEquals(2000, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isTrue();
+        assertThat(ch.getCurrentBackoff()).isEqualTo(2000);
 
-        assertTrue(ch.increaseBackoff());
-        assertEquals(4000, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isTrue();
+        assertThat(ch.getCurrentBackoff()).isEqualTo(4000);
 
-        assertFalse(ch.increaseBackoff());
-        assertEquals(4000, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isFalse();
+        assertThat(ch.getCurrentBackoff()).isEqualTo(4000);
     }
 
     @Test
-    public void testExponentialBackoffCappedAtMax() throws Exception {
+    void testExponentialBackoffCappedAtMax() {
         InputChannel ch = createInputChannel(500, 3000);
 
-        assertEquals(0, ch.getCurrentBackoff());
+        assertThat(ch.getCurrentBackoff()).isZero();
 
-        assertTrue(ch.increaseBackoff());
-        assertEquals(500, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isTrue();
+        assertThat(ch.getCurrentBackoff()).isEqualTo(500);
 
-        assertTrue(ch.increaseBackoff());
-        assertEquals(1000, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isTrue();
+        assertThat(ch.getCurrentBackoff()).isEqualTo(1000);
 
-        assertTrue(ch.increaseBackoff());
-        assertEquals(2000, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isTrue();
+        assertThat(ch.getCurrentBackoff()).isEqualTo(2000);
 
-        assertTrue(ch.increaseBackoff());
-        assertEquals(3000, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isTrue();
+        assertThat(ch.getCurrentBackoff()).isEqualTo(3000);
 
-        assertFalse(ch.increaseBackoff());
-        assertEquals(3000, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isFalse();
+        assertThat(ch.getCurrentBackoff()).isEqualTo(3000);
     }
 
     @Test
-    public void testExponentialBackoffSingle() throws Exception {
+    void testExponentialBackoffSingle() {
         InputChannel ch = createInputChannel(500, 500);
 
-        assertEquals(0, ch.getCurrentBackoff());
+        assertThat(ch.getCurrentBackoff()).isZero();
 
-        assertTrue(ch.increaseBackoff());
-        assertEquals(500, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isTrue();
+        assertThat(ch.getCurrentBackoff()).isEqualTo(500);
 
-        assertFalse(ch.increaseBackoff());
-        assertEquals(500, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isFalse();
+        assertThat(ch.getCurrentBackoff()).isEqualTo(500);
     }
 
     @Test
-    public void testExponentialNoBackoff() throws Exception {
+    void testExponentialNoBackoff() {
         InputChannel ch = createInputChannel(0, 0);
 
-        assertEquals(0, ch.getCurrentBackoff());
+        assertThat(ch.getCurrentBackoff()).isZero();
 
-        assertFalse(ch.increaseBackoff());
-        assertEquals(0, ch.getCurrentBackoff());
+        assertThat(ch.increaseBackoff()).isFalse();
+        assertThat(ch.getCurrentBackoff()).isZero();
+    }
+
+    @Test
+    void testHasError() {
+        InputChannel ch = createInputChannel(0, 0);
+
+        assertThat(ch.hasError()).isFalse();
+
+        ch.setError(new RuntimeException("test error"));
+        assertThat(ch.hasError()).isTrue();
     }
 
     private InputChannel createInputChannel(int initialBackoff, int maxBackoff) {
@@ -126,6 +136,7 @@ public class InputChannelTest {
                     inputGate,
                     channelIndex,
                     partitionId,
+                    new ResultSubpartitionIndexSet(0),
                     initialBackoff,
                     maxBackoff,
                     new SimpleCounter(),
@@ -136,10 +147,24 @@ public class InputChannelTest {
         public void resumeConsumption() {}
 
         @Override
-        void requestSubpartition(int subpartitionIndex) throws IOException, InterruptedException {}
+        public CompletableFuture<Void> getStateConsumedFuture() {
+            return CompletableFuture.completedFuture(null);
+        }
 
         @Override
-        Optional<BufferAndAvailability> getNextBuffer() throws IOException, InterruptedException {
+        public void acknowledgeAllRecordsProcessed() throws IOException {}
+
+        @Override
+        void requestSubpartitions() throws IOException, InterruptedException {}
+
+        @Override
+        protected int peekNextBufferSubpartitionIdInternal() throws IOException {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Optional<BufferAndAvailability> getNextBuffer()
+                throws IOException, InterruptedException {
             return Optional.empty();
         }
 
@@ -153,5 +178,13 @@ public class InputChannelTest {
 
         @Override
         void releaseAllResources() throws IOException {}
+
+        @Override
+        void announceBufferSize(int newBufferSize) {}
+
+        @Override
+        int getBuffersInUseCount() {
+            return 0;
+        }
     }
 }

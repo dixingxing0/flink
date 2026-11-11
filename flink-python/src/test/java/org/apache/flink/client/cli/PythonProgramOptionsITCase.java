@@ -19,11 +19,10 @@
 package org.apache.flink.client.cli;
 
 import org.apache.flink.client.program.PackagedProgram;
-import org.apache.flink.client.program.ProgramInvocationException;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.python.PythonOptions;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.io.IOException;
@@ -36,11 +35,10 @@ import java.nio.file.attribute.BasicFileAttributes;
 
 import static org.apache.flink.python.PythonOptions.PYTHON_EXECUTABLE;
 import static org.apache.flink.python.PythonOptions.PYTHON_REQUIREMENTS;
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** ITCases for {@link PythonProgramOptions}. */
-public class PythonProgramOptionsITCase {
+class PythonProgramOptionsITCase {
 
     /**
      * It requires setting a job jar to build a {@link PackagedProgram}, and the dummy job jar used
@@ -48,9 +46,7 @@ public class PythonProgramOptionsITCase {
      * ITCase.
      */
     @Test
-    public void testConfigurePythonExecution()
-            throws IllegalAccessException, NoSuchFieldException, CliArgsException,
-                    ProgramInvocationException, IOException {
+    void testConfigurePythonExecution() throws Exception {
         final String[] args = {
             "--python", "xxx.py",
             "--pyModule", "xxx",
@@ -63,13 +59,14 @@ public class PythonProgramOptionsITCase {
 
         final File[] dummyJobJar = {null};
         Files.walkFileTree(
-                FileSystems.getDefault().getPath(System.getProperty("user.dir") + "/dummy-job-jar"),
+                FileSystems.getDefault()
+                        .getPath(System.getProperty("user.dir") + "/target/artifacts"),
                 new SimpleFileVisitor<Path>() {
                     @Override
                     public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
                             throws IOException {
                         FileVisitResult result = super.visitFile(file, attrs);
-                        if (file.getFileName().toString().startsWith("flink-python")) {
+                        if (file.getFileName().toString().startsWith("dummy")) {
                             dummyJobJar[0] = file.toFile();
                         }
                         return result;
@@ -82,15 +79,13 @@ public class PythonProgramOptionsITCase {
         Configuration configuration = new Configuration();
         ProgramOptionsUtils.configurePythonExecution(configuration, packagedProgram);
 
-        assertEquals(
-                "/absolute/a.py,relative/b.py,relative/c.py",
-                configuration.get(PythonOptions.PYTHON_FILES));
-        assertEquals("d.txt#e_dir", configuration.get(PYTHON_REQUIREMENTS));
-        assertEquals(
-                "g.zip,h.zip#data,h.zip#data2", configuration.get(PythonOptions.PYTHON_ARCHIVES));
-        assertEquals("/usr/bin/python", configuration.get(PYTHON_EXECUTABLE));
-        assertArrayEquals(
-                new String[] {"--python", "xxx.py", "--pyModule", "xxx", "userarg1", "userarg2"},
-                packagedProgram.getArguments());
+        assertThat(configuration.get(PythonOptions.PYTHON_FILES))
+                .isEqualTo("/absolute/a.py,relative/b.py,relative/c.py");
+        assertThat(configuration.get(PYTHON_REQUIREMENTS)).isEqualTo("d.txt#e_dir");
+        assertThat(configuration.get(PythonOptions.PYTHON_ARCHIVES))
+                .isEqualTo("g.zip,h.zip#data,h.zip#data2");
+        assertThat(configuration.get(PYTHON_EXECUTABLE)).isEqualTo("/usr/bin/python");
+        assertThat(packagedProgram.getArguments())
+                .containsExactly("--python", "xxx.py", "--pyModule", "xxx", "userarg1", "userarg2");
     }
 }

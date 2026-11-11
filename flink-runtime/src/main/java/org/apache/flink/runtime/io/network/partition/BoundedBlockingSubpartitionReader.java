@@ -122,7 +122,7 @@ final class BoundedBlockingSubpartitionReader implements ResultSubpartitionView 
 
             // next buffer is null indicates the end of partition
             if (nextBuffer != null) {
-                availabilityListener.notifyDataAvailable();
+                availabilityListener.notifyDataAvailable(this);
             }
         }
     }
@@ -155,12 +155,20 @@ final class BoundedBlockingSubpartitionReader implements ResultSubpartitionView 
     }
 
     @Override
-    public boolean isAvailable(int numCreditsAvailable) {
-        if (numCreditsAvailable > 0) {
-            return nextBuffer != null;
-        }
+    public void acknowledgeAllDataProcessed() {
+        // in case of bounded partitions there is no upstream to acknowledge, we simply ignore
+        // the ack, as there are no checkpoints
+    }
 
-        return nextBuffer != null && !nextBuffer.isBuffer();
+    @Override
+    public AvailabilityWithBacklog getAvailabilityAndBacklog(boolean isCreditAvailable) {
+        boolean isAvailable;
+        if (isCreditAvailable) {
+            isAvailable = nextBuffer != null;
+        } else {
+            isAvailable = nextBuffer != null && !nextBuffer.isBuffer();
+        }
+        return new AvailabilityWithBacklog(isAvailable, dataBufferBacklog);
     }
 
     @Override
@@ -172,6 +180,21 @@ final class BoundedBlockingSubpartitionReader implements ResultSubpartitionView 
     @Override
     public int unsynchronizedGetNumberOfQueuedBuffers() {
         return parent.unsynchronizedGetNumberOfQueuedBuffers();
+    }
+
+    @Override
+    public int getNumberOfQueuedBuffers() {
+        return parent.getNumberOfQueuedBuffers();
+    }
+
+    @Override
+    public void notifyNewBufferSize(int newBufferSize) {
+        parent.bufferSize(newBufferSize);
+    }
+
+    @Override
+    public int peekNextBufferSubpartitionId() {
+        throw new UnsupportedOperationException();
     }
 
     @Override

@@ -30,12 +30,15 @@ import org.apache.flink.api.java.typeutils.ObjectArrayTypeInfo;
 import org.apache.flink.api.java.typeutils.PojoField;
 import org.apache.flink.api.java.typeutils.PojoTypeInfo;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
+import org.apache.flink.api.java.typeutils.SetTypeInfo;
 import org.apache.flink.api.java.typeutils.TupleTypeInfo;
 import org.apache.flink.api.java.typeutils.TypeExtractor;
 import org.apache.flink.api.java.typeutils.ValueTypeInfo;
 import org.apache.flink.types.Either;
 import org.apache.flink.types.Row;
 import org.apache.flink.types.Value;
+import org.apache.flink.types.bitmap.Bitmap;
+import org.apache.flink.types.variant.Variant;
 
 import java.lang.reflect.Field;
 import java.math.BigDecimal;
@@ -49,8 +52,11 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 
 /**
  * This class gives access to the type information of the most common types for which Flink has
@@ -152,6 +158,17 @@ public class Types {
 
     /** Returns type information for {@link java.time.Instant}. Supports a null value. */
     public static final TypeInformation<Instant> INSTANT = BasicTypeInfo.INSTANT_TYPE_INFO;
+
+    /** Returns type information for {@link java.util.UUID}. */
+    public static final TypeInformation<UUID> UUID = BasicTypeInfo.UUID_TYPE_INFO;
+
+    public static final TypeInformation<Variant> VARIANT = VariantTypeInfo.INSTANCE;
+
+    /**
+     * Returns type information for {@link org.apache.flink.types.bitmap.Bitmap}. Does not support a
+     * null value.
+     */
+    public static final TypeInformation<Bitmap> BITMAP = BitmapTypeInfo.INSTANCE;
 
     // CHECKSTYLE.OFF: MethodName
 
@@ -269,6 +286,10 @@ public class Types {
      *
      * <p>The generic types for all fields of the POJO can be defined in a hierarchy of subclasses.
      *
+     * <p>Java Record classes can also be used as valid POJOs (even though they don't fulfill some
+     * of the above criteria). In this case Flink will use the record canonical constructor to
+     * create the objects.
+     *
      * <p>If Flink's type analyzer is unable to extract a valid POJO type information with type
      * information for all fields, an {@link
      * org.apache.flink.api.common.functions.InvalidTypesException} is thrown. Alternatively, you
@@ -288,13 +309,17 @@ public class Types {
      * Returns type information for a POJO (Plain Old Java Object) and allows to specify all fields
      * manually.
      *
-     * <p>A POJO class is public and standalone (no non-static inner class). It has a public
-     * no-argument constructor. All non-static, non-transient fields in the class (and all
-     * superclasses) are either public (and non-final) or have a public getter and a setter method
-     * that follows the Java beans naming conventions for getters and setters.
+     * <p>A type is considered a FLink POJO type, if it fulfills the conditions below.
      *
-     * <p>A POJO is a fixed-length, null-aware composite type with non-deterministic field order.
-     * Every field can be null independent of the field's type.
+     * <ul>
+     *   <li>It is a public class, and standalone (not a non-static inner class)
+     *   <li>It has a public no-argument constructor.
+     *   <li>All non-static, non-transient fields in the class (and all superclasses) are either
+     *       public (and non-final) or have a public getter and a setter method that follows the
+     *       Java beans naming conventions for getters and setters.
+     *   <li>It is a fixed-length, null-aware composite type with non-deterministic field order.
+     *       Every field can be null independent of the field's type.
+     * </ul>
      *
      * <p>The generic types for all fields of the POJO can be defined in a hierarchy of subclasses.
      *
@@ -315,7 +340,7 @@ public class Types {
             final Field f = TypeExtractor.getDeclaredField(pojoClass, field.getKey());
             if (f == null) {
                 throw new InvalidTypesException(
-                        "Field '" + field.getKey() + "'could not be accessed.");
+                        "Field '" + field.getKey() + "' could not be accessed.");
             }
             pojoFields.add(new PojoField(f, field.getValue()));
         }
@@ -433,6 +458,22 @@ public class Types {
      */
     public static <E> TypeInformation<List<E>> LIST(TypeInformation<E> elementType) {
         return new ListTypeInfo<>(elementType);
+    }
+
+    /**
+     * Returns type information for a Java {@link java.util.Set}. A set must not be null. Null
+     * values in elements are not supported.
+     *
+     * <p>By default, sets are untyped and treated as a generic type in Flink; therefore, it is
+     * useful to pass type information whenever a set is used.
+     *
+     * <p><strong>Note:</strong> Flink does not preserve the concrete {@link Set} type. It converts
+     * a list into {@link HashSet} when copying or deserializing.
+     *
+     * @param elementType type information for the set's elements
+     */
+    public static <E> TypeInformation<Set<E>> SET(TypeInformation<E> elementType) {
+        return new SetTypeInfo<>(elementType);
     }
 
     /**

@@ -18,38 +18,38 @@
 
 package org.apache.flink.runtime.taskmanager;
 
-import org.apache.flink.api.common.JobID;
 import org.apache.flink.core.testutils.CommonTestUtils;
 import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.io.PrintStream;
 import java.io.PrintWriter;
 
-import static org.junit.Assert.*;
+import static org.apache.flink.runtime.executiongraph.ExecutionGraphTestUtils.createExecutionAttemptId;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.fail;
 
 /**
  * Correctness tests for hash/equals and serialization for the {@link
  * org.apache.flink.runtime.taskmanager.TaskExecutionState}.
  */
-public class TaskExecutionStateTest {
+class TaskExecutionStateTest {
 
     @Test
-    public void testEqualsHashCode() {
+    void testEqualsHashCode() {
         try {
-            final JobID jid = new JobID();
-            final ExecutionAttemptID executionId = new ExecutionAttemptID();
+            final ExecutionAttemptID executionId = createExecutionAttemptId();
             final ExecutionState state = ExecutionState.RUNNING;
             final Throwable error = new RuntimeException("some test error message");
 
-            TaskExecutionState s1 = new TaskExecutionState(jid, executionId, state, error);
-            TaskExecutionState s2 = new TaskExecutionState(jid, executionId, state, error);
+            TaskExecutionState s1 = new TaskExecutionState(executionId, state, error);
+            TaskExecutionState s2 = new TaskExecutionState(executionId, state, error);
 
-            assertEquals(s1.hashCode(), s2.hashCode());
-            assertEquals(s1, s2);
+            assertThat(s1).hasSameHashCodeAs(s2);
+            assertThat(s1).isEqualTo(s2);
         } catch (Exception e) {
             e.printStackTrace();
             fail(e.getMessage());
@@ -57,29 +57,28 @@ public class TaskExecutionStateTest {
     }
 
     @Test
-    public void testSerialization() {
+    void testSerialization() {
         try {
-            final JobID jid = new JobID();
-            final ExecutionAttemptID executionId = new ExecutionAttemptID();
+            final ExecutionAttemptID executionId = createExecutionAttemptId();
             final ExecutionState state = ExecutionState.DEPLOYING;
             final Throwable error = new IOException("fubar");
 
-            TaskExecutionState original1 = new TaskExecutionState(jid, executionId, state, error);
-            TaskExecutionState original2 = new TaskExecutionState(jid, executionId, state);
+            TaskExecutionState original1 = new TaskExecutionState(executionId, state, error);
+            TaskExecutionState original2 = new TaskExecutionState(executionId, state);
 
             TaskExecutionState javaSerCopy1 = CommonTestUtils.createCopySerializable(original1);
             TaskExecutionState javaSerCopy2 = CommonTestUtils.createCopySerializable(original2);
 
             // equalities
-            assertEquals(original1, javaSerCopy1);
-            assertEquals(javaSerCopy1, original1);
+            assertThat(javaSerCopy1).isEqualTo(original1);
+            assertThat(original1).isEqualTo(javaSerCopy1);
 
-            assertEquals(original2, javaSerCopy2);
-            assertEquals(javaSerCopy2, original2);
+            assertThat(javaSerCopy2).isEqualTo(original2);
+            assertThat(original2).isEqualTo(javaSerCopy2);
 
             // hash codes
-            assertEquals(original1.hashCode(), javaSerCopy1.hashCode());
-            assertEquals(original2.hashCode(), javaSerCopy2.hashCode());
+            assertThat(javaSerCopy1).hasSameHashCodeAs(original1);
+            assertThat(javaSerCopy2).hasSameHashCodeAs(original2);
         } catch (Exception e) {
             e.printStackTrace();
             fail(e.getMessage());
@@ -87,7 +86,7 @@ public class TaskExecutionStateTest {
     }
 
     @Test
-    public void handleNonSerializableException() {
+    void handleNonSerializableException() {
         try {
             @SuppressWarnings({"ThrowableInstanceNeverThrown", "serial"})
             Exception hostile =
@@ -110,8 +109,7 @@ public class TaskExecutionStateTest {
                         }
                     };
 
-            new TaskExecutionState(
-                    new JobID(), new ExecutionAttemptID(), ExecutionState.FAILED, hostile);
+            new TaskExecutionState(createExecutionAttemptId(), ExecutionState.FAILED, hostile);
         } catch (Exception e) {
             e.printStackTrace();
             fail(e.getMessage());

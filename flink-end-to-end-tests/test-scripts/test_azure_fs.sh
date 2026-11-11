@@ -25,21 +25,21 @@
 
 source "$(dirname "$0")"/common.sh
 
-if [[ -z "$IT_CASE_AZURE_ACCOUNT" ]]; then
+if [[ -z "${IT_CASE_AZURE_ACCOUNT:-}" ]]; then
     echo "Did not find Azure storage account environment variable, NOT running the e2e test."
     exit 0
 else
     echo "Found Azure storage account $IT_CASE_AZURE_ACCOUNT, running the e2e test."
 fi
 
-if [[ -z "$IT_CASE_AZURE_ACCESS_KEY" ]]; then
+if [[ -z "${IT_CASE_AZURE_ACCESS_KEY:-}" ]]; then
     echo "Did not find Azure storage access key environment variable, NOT running the e2e test."
     exit 0
 else
     echo "Found Azure storage access key $IT_CASE_AZURE_ACCESS_KEY, running the e2e test."
 fi
 
-if [[ -z "$IT_CASE_AZURE_CONTAINER" ]]; then
+if [[ -z "${IT_CASE_AZURE_CONTAINER:-}" ]]; then
     echo "Did not find Azure storage container environment variable, NOT running the e2e test."
     exit 0
 else
@@ -70,6 +70,6 @@ azure_setup
 echo "Starting Flink cluster.."
 start_cluster
 
-$FLINK_DIR/bin/flink run -p 1 $FLINK_DIR/examples/batch/WordCount.jar --input $AZURE_TEST_DATA_WORDS_URI --output $TEST_DATA_DIR/out/wc_out
-
-check_result_hash "WordCountWithAzureFS" $TEST_DATA_DIR/out/wc_out "72a690412be8928ba239c2da967328a5"
+$FLINK_DIR/bin/flink run -p 1 $FLINK_DIR/examples/streaming/WordCount.jar --input $AZURE_TEST_DATA_WORDS_URI --output $TEST_DATA_DIR/out/wc_out --execution-mode BATCH
+OUTPUT_FILES=$(find "$TEST_DATA_DIR/out/wc_out" -type f)
+check_result_hash "WordCountWithAzureFS" "${OUTPUT_FILES}" "5a9945c9ab08890b2a0f6b31a4437d57"

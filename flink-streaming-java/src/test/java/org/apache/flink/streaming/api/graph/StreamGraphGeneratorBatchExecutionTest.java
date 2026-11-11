@@ -18,17 +18,16 @@
 
 package org.apache.flink.streaming.api.graph;
 
+import org.apache.flink.api.common.BatchShuffleMode;
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.RuntimeExecutionMode;
-import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
-import org.apache.flink.api.common.typeinfo.IntegerTypeInfo;
-import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.connector.source.Boundedness;
-import org.apache.flink.api.connector.source.mocks.MockSource;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ExecutionOptions;
+import org.apache.flink.configuration.MemorySize;
+import org.apache.flink.core.memory.ManagedMemoryUseCase;
+import org.apache.flink.runtime.jobgraph.JobType;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.datastream.MultipleConnectedStreams;
@@ -37,7 +36,7 @@ import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.streaming.api.functions.co.KeyedCoProcessFunction;
-import org.apache.flink.streaming.api.functions.sink.DiscardingSink;
+import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperatorFactory;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperatorV2;
@@ -50,276 +49,297 @@ import org.apache.flink.streaming.api.operators.StreamOperator;
 import org.apache.flink.streaming.api.operators.StreamOperatorParameters;
 import org.apache.flink.streaming.api.operators.TwoInputStreamOperator;
 import org.apache.flink.streaming.api.operators.sorted.state.BatchExecutionStateBackend;
-import org.apache.flink.streaming.api.transformations.CoFeedbackTransformation;
-import org.apache.flink.streaming.api.transformations.FeedbackTransformation;
 import org.apache.flink.streaming.api.transformations.KeyedMultipleInputTransformation;
-import org.apache.flink.streaming.api.transformations.SourceTransformation;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.util.Collector;
-import org.apache.flink.util.TestLogger;
 
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.ExpectedException;
+import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
-import static org.hamcrest.CoreMatchers.equalTo;
-import static org.hamcrest.CoreMatchers.instanceOf;
-import static org.hamcrest.CoreMatchers.notNullValue;
-import static org.hamcrest.CoreMatchers.nullValue;
-import static org.junit.Assert.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests for generating correct properties for sorting inputs in {@link RuntimeExecutionMode#BATCH}
  * runtime mode.
  */
-public class StreamGraphGeneratorBatchExecutionTest extends TestLogger {
-
-    @Rule public ExpectedException expectedException = ExpectedException.none();
+class StreamGraphGeneratorBatchExecutionTest {
 
     @Test
-    public void testOneInputTransformation() {
+    void testShuffleMode() {
+        testGlobalStreamExchangeMode(
+                RuntimeExecutionMode.AUTOMATIC,
+                BatchShuffleMode.ALL_EXCHANGES_BLOCKING,
+                GlobalStreamExchangeMode.ALL_EDGES_BLOCKING);
+
+        testGlobalStreamExchangeMode(
+                RuntimeExecutionMode.STREAMING,
+                BatchShuffleMode.ALL_EXCHANGES_BLOCKING,
+                GlobalStreamExchangeMode.ALL_EDGES_PIPELINED);
+
+        testGlobalStreamExchangeMode(
+                RuntimeExecutionMode.BATCH,
+                BatchShuffleMode.ALL_EXCHANGES_PIPELINED,
+                GlobalStreamExchangeMode.ALL_EDGES_PIPELINED);
+
+        testGlobalStreamExchangeMode(
+                RuntimeExecutionMode.BATCH,
+                BatchShuffleMode.ALL_EXCHANGES_HYBRID_FULL,
+                GlobalStreamExchangeMode.ALL_EDGES_HYBRID_FULL);
+
+        testGlobalStreamExchangeMode(
+                RuntimeExecutionMode.BATCH,
+                BatchShuffleMode.ALL_EXCHANGES_HYBRID_SELECTIVE,
+                GlobalStreamExchangeMode.ALL_EDGES_HYBRID_SELECTIVE);
+    }
+
+    @Test
+    void testBatchJobType() {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        DataStreamSink<Integer> sink = addDummyPipeline(env);
+
+        StreamGraph graph = getStreamGraphInBatchMode(sink);
+
+        assertThat(graph.getJobType()).isEqualTo(JobType.BATCH);
+    }
+
+    @Test
+    void testManagedMemoryWeights() {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        SingleOutputStreamOperator<Integer> process =
+                env.fromData(1, 2).keyBy(Integer::intValue).process(DUMMY_PROCESS_FUNCTION);
+        DataStreamSink<Integer> sink = process.sinkTo(new DiscardingSink<>());
+
+        StreamGraph graph = getStreamGraphInBatchMode(sink);
+        StreamNode processNode = graph.getStreamNode(process.getId());
+
+        final Map<ManagedMemoryUseCase, Integer> expectedOperatorWeights = new HashMap<>();
+        expectedOperatorWeights.put(
+                ManagedMemoryUseCase.OPERATOR,
+                ExecutionOptions.SORTED_INPUTS_MEMORY.defaultValue().getMebiBytes());
+        assertThat(processNode.getManagedMemoryOperatorScopeUseCaseWeights())
+                .isEqualTo(expectedOperatorWeights);
+        assertThat(processNode.getManagedMemorySlotScopeUseCases())
+                .containsOnly(ManagedMemoryUseCase.STATE_BACKEND);
+    }
+
+    @Test
+    void testCustomManagedMemoryWeights() {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         SingleOutputStreamOperator<Integer> process =
-                env.fromElements(1, 2).keyBy(Integer::intValue).process(DUMMY_PROCESS_FUNCTION);
-        DataStreamSink<Integer> sink = process.addSink(new DiscardingSink<>());
+                env.fromData(1, 2).keyBy(Integer::intValue).process(DUMMY_PROCESS_FUNCTION);
+        DataStreamSink<Integer> sink = process.sinkTo(new DiscardingSink<>());
 
-        StreamGraphGenerator graphGenerator =
-                new StreamGraphGenerator(
-                        Collections.singletonList(sink.getTransformation()),
-                        env.getConfig(),
-                        env.getCheckpointConfig());
-        graphGenerator.setRuntimeExecutionMode(RuntimeExecutionMode.BATCH);
+        final Configuration configuration = new Configuration();
+        configuration.set(ExecutionOptions.SORTED_INPUTS_MEMORY, MemorySize.ofMebiBytes(42));
 
-        StreamGraph graph = graphGenerator.generate();
+        StreamGraph graph = getStreamGraphInBatchMode(sink, configuration);
         StreamNode processNode = graph.getStreamNode(process.getId());
-        assertThat(
-                processNode.getInputRequirements().get(0),
-                equalTo(StreamConfig.InputRequirement.SORTED));
-        assertThat(
-                processNode.getOperatorFactory().getChainingStrategy(),
-                equalTo(ChainingStrategy.HEAD));
-        assertThat(graph.getStateBackend(), instanceOf(BatchExecutionStateBackend.class));
+
+        final Map<ManagedMemoryUseCase, Integer> expectedOperatorWeights = new HashMap<>();
+        expectedOperatorWeights.put(ManagedMemoryUseCase.OPERATOR, 42);
+        assertThat(processNode.getManagedMemoryOperatorScopeUseCaseWeights())
+                .isEqualTo(expectedOperatorWeights);
+        assertThat(processNode.getManagedMemorySlotScopeUseCases())
+                .containsOnly(ManagedMemoryUseCase.STATE_BACKEND);
+    }
+
+    @Test
+    void testOneInputTransformation() {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        SingleOutputStreamOperator<Integer> process =
+                env.fromData(1, 2).keyBy(Integer::intValue).process(DUMMY_PROCESS_FUNCTION);
+        DataStreamSink<Integer> sink = process.sinkTo(new DiscardingSink<>());
+
+        StreamGraph graph = getStreamGraphInBatchMode(sink);
+
+        StreamNode processNode = graph.getStreamNode(process.getId());
+        assertThat(processNode.getInputRequirements().get(0))
+                .isEqualTo(StreamConfig.InputRequirement.SORTED);
+        assertThat(processNode.getOperatorFactory().getChainingStrategy())
+                .isEqualTo(ChainingStrategy.HEAD);
+        assertThat(graph.getStateBackend()).isInstanceOf(BatchExecutionStateBackend.class);
         // the provider is passed as a lambda therefore we cannot assert the class of the provider
-        assertThat(graph.getTimerServiceProvider(), notNullValue());
+        assertThat(graph.getTimerServiceProvider()).isNotNull();
     }
 
     @Test
-    public void testDisablingStateBackendOneInputTransformation() {
+    void testDisablingStateBackendOneInputTransformation() {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
         SingleOutputStreamOperator<Integer> process =
-                env.fromElements(1, 2).keyBy(Integer::intValue).process(DUMMY_PROCESS_FUNCTION);
-        DataStreamSink<Integer> sink = process.addSink(new DiscardingSink<>());
+                env.fromData(1, 2).keyBy(Integer::intValue).process(DUMMY_PROCESS_FUNCTION);
+        DataStreamSink<Integer> sink = process.sinkTo(new DiscardingSink<>());
 
         Configuration configuration = new Configuration();
         configuration.set(ExecutionOptions.USE_BATCH_STATE_BACKEND, false);
-        StreamGraphGenerator graphGenerator =
-                new StreamGraphGenerator(
-                        Collections.singletonList(sink.getTransformation()),
-                        env.getConfig(),
-                        env.getCheckpointConfig(),
-                        configuration);
-        graphGenerator.setRuntimeExecutionMode(RuntimeExecutionMode.BATCH);
 
-        StreamGraph graph = graphGenerator.generate();
+        StreamGraph graph = getStreamGraphInBatchMode(sink, configuration);
+
         StreamNode processNode = graph.getStreamNode(process.getId());
-        assertThat(
-                processNode.getInputRequirements().get(0),
-                equalTo(StreamConfig.InputRequirement.SORTED));
-        assertThat(
-                processNode.getOperatorFactory().getChainingStrategy(),
-                equalTo(ChainingStrategy.HEAD));
-        assertThat(graph.getStateBackend(), nullValue());
-        assertThat(graph.getTimerServiceProvider(), nullValue());
+        assertThat(processNode.getInputRequirements().get(0))
+                .isEqualTo(StreamConfig.InputRequirement.SORTED);
+        assertThat(processNode.getOperatorFactory().getChainingStrategy())
+                .isEqualTo(ChainingStrategy.HEAD);
+        assertThat(graph.getStateBackend()).isNull();
+        assertThat(graph.getTimerServiceProvider()).isNull();
     }
 
     @Test
-    public void testDisablingSortingInputsOneInputTransformation() {
+    void testDisablingSortingInputsOneInputTransformation() {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
         SingleOutputStreamOperator<Integer> process =
-                env.fromElements(1, 2).keyBy(Integer::intValue).process(DUMMY_PROCESS_FUNCTION);
-        DataStreamSink<Integer> sink = process.addSink(new DiscardingSink<>());
+                env.fromData(1, 2).keyBy(Integer::intValue).process(DUMMY_PROCESS_FUNCTION);
+        DataStreamSink<Integer> sink = process.sinkTo(new DiscardingSink<>());
 
         Configuration configuration = new Configuration();
         configuration.set(ExecutionOptions.USE_BATCH_STATE_BACKEND, false);
         configuration.set(ExecutionOptions.SORT_INPUTS, false);
-        StreamGraphGenerator graphGenerator =
-                new StreamGraphGenerator(
-                        Collections.singletonList(sink.getTransformation()),
-                        env.getConfig(),
-                        env.getCheckpointConfig(),
-                        configuration);
-        graphGenerator.setRuntimeExecutionMode(RuntimeExecutionMode.BATCH);
 
-        StreamGraph graph = graphGenerator.generate();
+        StreamGraph graph = getStreamGraphInBatchMode(sink, configuration);
+
         StreamNode processNode = graph.getStreamNode(process.getId());
-        assertThat(processNode.getInputRequirements().get(0), nullValue());
-        assertThat(graph.getStateBackend(), nullValue());
-        assertThat(graph.getTimerServiceProvider(), nullValue());
+        assertThat(processNode.getInputRequirements().get(0)).isNull();
+        assertThat(graph.getStateBackend()).isNull();
+        assertThat(graph.getTimerServiceProvider()).isNull();
     }
 
     @Test
-    public void testDisablingSortingInputsWithoutBatchStateBackendOneInputTransformation() {
+    void testDisablingSortingInputsWithoutBatchStateBackendOneInputTransformation() {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
         SingleOutputStreamOperator<Integer> process =
-                env.fromElements(1, 2).keyBy(Integer::intValue).process(DUMMY_PROCESS_FUNCTION);
-        DataStreamSink<Integer> sink = process.addSink(new DiscardingSink<>());
+                env.fromData(1, 2).keyBy(Integer::intValue).process(DUMMY_PROCESS_FUNCTION);
+        DataStreamSink<Integer> sink = process.sinkTo(new DiscardingSink<>());
 
         Configuration configuration = new Configuration();
         configuration.set(ExecutionOptions.SORT_INPUTS, false);
-        StreamGraphGenerator graphGenerator =
-                new StreamGraphGenerator(
-                        Collections.singletonList(sink.getTransformation()),
-                        env.getConfig(),
-                        env.getCheckpointConfig(),
-                        configuration);
-        graphGenerator.setRuntimeExecutionMode(RuntimeExecutionMode.BATCH);
 
-        expectedException.expect(IllegalStateException.class);
-        expectedException.expectMessage(
-                "Batch state backend requires the sorted inputs to be enabled!");
-        graphGenerator.generate();
+        assertThatThrownBy(() -> getStreamGraphInBatchMode(sink, configuration))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(
+                        "Batch state backend requires the sorted inputs to be enabled!");
     }
 
     @Test
-    public void testTwoInputTransformation() {
+    void testTwoInputTransformation() {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        DataStreamSource<Integer> elements1 = env.fromElements(1, 2);
-        DataStreamSource<Integer> elements2 = env.fromElements(1, 2);
+
+        DataStreamSource<Integer> elements1 = env.fromData(1, 2);
+        DataStreamSource<Integer> elements2 = env.fromData(1, 2);
         SingleOutputStreamOperator<Integer> process =
                 elements1
                         .connect(elements2)
                         .keyBy(Integer::intValue, Integer::intValue)
                         .process(DUMMY_KEYED_CO_PROCESS_FUNCTION);
-        DataStreamSink<Integer> sink = process.addSink(new DiscardingSink<>());
+        DataStreamSink<Integer> sink = process.sinkTo(new DiscardingSink<>());
 
-        StreamGraphGenerator graphGenerator =
-                new StreamGraphGenerator(
-                        Collections.singletonList(sink.getTransformation()),
-                        env.getConfig(),
-                        env.getCheckpointConfig());
-        graphGenerator.setRuntimeExecutionMode(RuntimeExecutionMode.BATCH);
+        StreamGraph graph = getStreamGraphInBatchMode(sink);
 
-        StreamGraph graph = graphGenerator.generate();
         StreamNode processNode = graph.getStreamNode(process.getId());
-        assertThat(
-                processNode.getInputRequirements().get(0),
-                equalTo(StreamConfig.InputRequirement.SORTED));
-        assertThat(
-                processNode.getInputRequirements().get(1),
-                equalTo(StreamConfig.InputRequirement.SORTED));
-        assertThat(
-                processNode.getOperatorFactory().getChainingStrategy(),
-                equalTo(ChainingStrategy.HEAD));
-        assertThat(graph.getStateBackend(), instanceOf(BatchExecutionStateBackend.class));
+        assertThat(processNode.getInputRequirements().get(0))
+                .isEqualTo(StreamConfig.InputRequirement.SORTED);
+        assertThat(processNode.getInputRequirements().get(1))
+                .isEqualTo(StreamConfig.InputRequirement.SORTED);
+        assertThat(processNode.getOperatorFactory().getChainingStrategy())
+                .isEqualTo(ChainingStrategy.HEAD);
+        assertThat(graph.getStateBackend()).isInstanceOf(BatchExecutionStateBackend.class);
         // the provider is passed as a lambda therefore we cannot assert the class of the provider
-        assertThat(graph.getTimerServiceProvider(), notNullValue());
+        assertThat(graph.getTimerServiceProvider()).isNotNull();
     }
 
     @Test
-    public void testDisablingStateBackendTwoInputTransformation() {
+    void testDisablingStateBackendTwoInputTransformation() {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        DataStreamSource<Integer> elements1 = env.fromElements(1, 2);
-        DataStreamSource<Integer> elements2 = env.fromElements(1, 2);
+
+        DataStreamSource<Integer> elements1 = env.fromData(1, 2);
+        DataStreamSource<Integer> elements2 = env.fromData(1, 2);
         SingleOutputStreamOperator<Integer> process =
                 elements1
                         .connect(elements2)
                         .keyBy(Integer::intValue, Integer::intValue)
                         .process(DUMMY_KEYED_CO_PROCESS_FUNCTION);
-        DataStreamSink<Integer> sink = process.addSink(new DiscardingSink<>());
+        DataStreamSink<Integer> sink = process.sinkTo(new DiscardingSink<>());
 
         Configuration configuration = new Configuration();
         configuration.set(ExecutionOptions.USE_BATCH_STATE_BACKEND, false);
-        StreamGraphGenerator graphGenerator =
-                new StreamGraphGenerator(
-                        Collections.singletonList(sink.getTransformation()),
-                        env.getConfig(),
-                        env.getCheckpointConfig(),
-                        configuration);
-        graphGenerator.setRuntimeExecutionMode(RuntimeExecutionMode.BATCH);
 
-        StreamGraph graph = graphGenerator.generate();
+        StreamGraph graph = getStreamGraphInBatchMode(sink, configuration);
+
         StreamNode processNode = graph.getStreamNode(process.getId());
-        assertThat(
-                processNode.getInputRequirements().get(0),
-                equalTo(StreamConfig.InputRequirement.SORTED));
-        assertThat(
-                processNode.getInputRequirements().get(1),
-                equalTo(StreamConfig.InputRequirement.SORTED));
-        assertThat(
-                processNode.getOperatorFactory().getChainingStrategy(),
-                equalTo(ChainingStrategy.HEAD));
-        assertThat(graph.getStateBackend(), nullValue());
-        assertThat(graph.getTimerServiceProvider(), nullValue());
+        assertThat(processNode.getInputRequirements().get(0))
+                .isEqualTo(StreamConfig.InputRequirement.SORTED);
+        assertThat(processNode.getInputRequirements().get(1))
+                .isEqualTo(StreamConfig.InputRequirement.SORTED);
+        assertThat(processNode.getOperatorFactory().getChainingStrategy())
+                .isEqualTo(ChainingStrategy.HEAD);
+        assertThat(graph.getStateBackend()).isNull();
+        assertThat(graph.getTimerServiceProvider()).isNull();
     }
 
     @Test
-    public void testDisablingSortingInputsTwoInputTransformation() {
+    void testDisablingSortingInputsTwoInputTransformation() {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        DataStreamSource<Integer> elements1 = env.fromElements(1, 2);
-        DataStreamSource<Integer> elements2 = env.fromElements(1, 2);
+
+        DataStreamSource<Integer> elements1 = env.fromData(1, 2);
+        DataStreamSource<Integer> elements2 = env.fromData(1, 2);
         SingleOutputStreamOperator<Integer> process =
                 elements1
                         .connect(elements2)
                         .keyBy(Integer::intValue, Integer::intValue)
                         .process(DUMMY_KEYED_CO_PROCESS_FUNCTION);
-        DataStreamSink<Integer> sink = process.addSink(new DiscardingSink<>());
+        DataStreamSink<Integer> sink = process.sinkTo(new DiscardingSink<>());
 
         Configuration configuration = new Configuration();
         configuration.set(ExecutionOptions.USE_BATCH_STATE_BACKEND, false);
         configuration.set(ExecutionOptions.SORT_INPUTS, false);
-        StreamGraphGenerator graphGenerator =
-                new StreamGraphGenerator(
-                        Collections.singletonList(sink.getTransformation()),
-                        env.getConfig(),
-                        env.getCheckpointConfig(),
-                        configuration);
-        graphGenerator.setRuntimeExecutionMode(RuntimeExecutionMode.BATCH);
 
-        StreamGraph graph = graphGenerator.generate();
+        StreamGraph graph = getStreamGraphInBatchMode(sink, configuration);
+
         StreamNode processNode = graph.getStreamNode(process.getId());
-        assertThat(processNode.getInputRequirements().get(0), nullValue());
-        assertThat(processNode.getInputRequirements().get(1), nullValue());
-        assertThat(graph.getStateBackend(), nullValue());
-        assertThat(graph.getTimerServiceProvider(), nullValue());
+        assertThat(processNode.getInputRequirements().get(0)).isNull();
+        assertThat(processNode.getInputRequirements().get(1)).isNull();
+        assertThat(graph.getStateBackend()).isNull();
+        assertThat(graph.getTimerServiceProvider()).isNull();
     }
 
     @Test
-    public void testDisablingSortingInputsWithoutBatchStateBackendTwoInputTransformation() {
+    void testDisablingSortingInputsWithoutBatchStateBackendTwoInputTransformation() {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        DataStreamSource<Integer> elements1 = env.fromElements(1, 2);
-        DataStreamSource<Integer> elements2 = env.fromElements(1, 2);
+
+        DataStreamSource<Integer> elements1 = env.fromData(1, 2);
+        DataStreamSource<Integer> elements2 = env.fromData(1, 2);
         SingleOutputStreamOperator<Integer> process =
                 elements1
                         .connect(elements2)
                         .keyBy(Integer::intValue, Integer::intValue)
                         .process(DUMMY_KEYED_CO_PROCESS_FUNCTION);
-        DataStreamSink<Integer> sink = process.addSink(new DiscardingSink<>());
+        DataStreamSink<Integer> sink = process.sinkTo(new DiscardingSink<>());
 
         Configuration configuration = new Configuration();
         configuration.set(ExecutionOptions.SORT_INPUTS, false);
-        StreamGraphGenerator graphGenerator =
-                new StreamGraphGenerator(
-                        Collections.singletonList(sink.getTransformation()),
-                        env.getConfig(),
-                        env.getCheckpointConfig(),
-                        configuration);
-        graphGenerator.setRuntimeExecutionMode(RuntimeExecutionMode.BATCH);
 
-        expectedException.expect(IllegalStateException.class);
-        expectedException.expectMessage(
-                "Batch state backend requires the sorted inputs to be enabled!");
-        graphGenerator.generate();
+        assertThatThrownBy(() -> getStreamGraphInBatchMode(sink, configuration))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(
+                        "Batch state backend requires the sorted inputs to be enabled!");
     }
 
     @Test
-    public void testInputSelectableTwoInputTransformation() {
+    void testInputSelectableTwoInputTransformation() {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        DataStreamSource<Integer> elements1 = env.fromElements(1, 2);
-        DataStreamSource<Integer> elements2 = env.fromElements(1, 2);
+
+        DataStreamSource<Integer> elements1 = env.fromData(1, 2);
+        DataStreamSource<Integer> elements2 = env.fromData(1, 2);
         SingleOutputStreamOperator<Integer> process =
                 elements1
                         .connect(elements2)
@@ -334,27 +354,21 @@ public class StreamGraphGeneratorBatchExecutionTest extends TestLogger {
                                 BasicTypeInfo.INT_TYPE_INFO,
                                 new InputSelectableTwoInputOperator());
 
-        DataStreamSink<Integer> sink = selectableOperator.addSink(new DiscardingSink<>());
+        DataStreamSink<Integer> sink = selectableOperator.sinkTo(new DiscardingSink<>());
 
-        StreamGraphGenerator graphGenerator =
-                new StreamGraphGenerator(
-                        Collections.singletonList(sink.getTransformation()),
-                        env.getConfig(),
-                        env.getCheckpointConfig());
-        graphGenerator.setRuntimeExecutionMode(RuntimeExecutionMode.BATCH);
-
-        expectedException.expect(IllegalStateException.class);
-        expectedException.expectMessage(
-                "Batch state backend and sorting inputs are not supported in graphs with an InputSelectable operator.");
-        graphGenerator.generate();
+        assertThatThrownBy(() -> getStreamGraphInBatchMode(sink))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(
+                        "Batch state backend and sorting inputs are not supported in graphs with an InputSelectable operator.");
     }
 
     @Test
-    public void testMultiInputTransformation() {
+    void testMultiInputTransformation() {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        DataStreamSource<Integer> elements1 = env.fromElements(1, 2);
-        DataStreamSource<Integer> elements2 = env.fromElements(1, 2);
-        DataStreamSource<Integer> elements3 = env.fromElements(1, 2);
+
+        DataStreamSource<Integer> elements1 = env.fromData(1, 2);
+        DataStreamSource<Integer> elements2 = env.fromData(1, 2);
+        DataStreamSource<Integer> elements3 = env.fromData(1, 2);
 
         MultipleInputOperatorFactory selectableOperator =
                 new MultipleInputOperatorFactory(3, false);
@@ -372,37 +386,29 @@ public class StreamGraphGeneratorBatchExecutionTest extends TestLogger {
         DataStreamSink<Integer> sink =
                 new MultipleConnectedStreams(env)
                         .transform(multipleInputTransformation)
-                        .addSink(new DiscardingSink<>());
+                        .sinkTo(new DiscardingSink<>());
 
-        StreamGraphGenerator graphGenerator =
-                new StreamGraphGenerator(
-                        Collections.singletonList(sink.getTransformation()),
-                        env.getConfig(),
-                        env.getCheckpointConfig());
-        graphGenerator.setRuntimeExecutionMode(RuntimeExecutionMode.BATCH);
+        StreamGraph graph = getStreamGraphInBatchMode(sink);
 
-        StreamGraph graph = graphGenerator.generate();
         StreamNode operatorNode = graph.getStreamNode(multipleInputTransformation.getId());
-        assertThat(
-                operatorNode.getInputRequirements().get(0),
-                equalTo(StreamConfig.InputRequirement.SORTED));
-        assertThat(
-                operatorNode.getInputRequirements().get(1),
-                equalTo(StreamConfig.InputRequirement.SORTED));
-        assertThat(
-                operatorNode.getOperatorFactory().getChainingStrategy(),
-                equalTo(ChainingStrategy.HEAD));
-        assertThat(graph.getStateBackend(), instanceOf(BatchExecutionStateBackend.class));
+        assertThat(operatorNode.getInputRequirements().get(0))
+                .isEqualTo(StreamConfig.InputRequirement.SORTED);
+        assertThat(operatorNode.getInputRequirements().get(1))
+                .isEqualTo(StreamConfig.InputRequirement.SORTED);
+        assertThat(operatorNode.getOperatorFactory().getChainingStrategy())
+                .isEqualTo(ChainingStrategy.HEAD);
+        assertThat(graph.getStateBackend()).isInstanceOf(BatchExecutionStateBackend.class);
         // the provider is passed as a lambda therefore we cannot assert the class of the provider
-        assertThat(graph.getTimerServiceProvider(), notNullValue());
+        assertThat(graph.getTimerServiceProvider()).isNotNull();
     }
 
     @Test
-    public void testInputSelectableMultiInputTransformation() {
+    void testInputSelectableMultiInputTransformation() {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        DataStreamSource<Integer> elements1 = env.fromElements(1, 2);
-        DataStreamSource<Integer> elements2 = env.fromElements(1, 2);
-        DataStreamSource<Integer> elements3 = env.fromElements(1, 2);
+
+        DataStreamSource<Integer> elements1 = env.fromData(1, 2);
+        DataStreamSource<Integer> elements2 = env.fromData(1, 2);
+        DataStreamSource<Integer> elements3 = env.fromData(1, 2);
 
         MultipleInputOperatorFactory selectableOperator = new MultipleInputOperatorFactory(3, true);
         KeyedMultipleInputTransformation<Integer> multipleInputTransformation =
@@ -419,42 +425,12 @@ public class StreamGraphGeneratorBatchExecutionTest extends TestLogger {
         DataStreamSink<Integer> sink =
                 new MultipleConnectedStreams(env)
                         .transform(multipleInputTransformation)
-                        .addSink(new DiscardingSink<>());
+                        .sinkTo(new DiscardingSink<>());
 
-        StreamGraphGenerator graphGenerator =
-                new StreamGraphGenerator(
-                        Collections.singletonList(sink.getTransformation()),
-                        env.getConfig(),
-                        env.getCheckpointConfig());
-        graphGenerator.setRuntimeExecutionMode(RuntimeExecutionMode.BATCH);
-
-        expectedException.expect(IllegalStateException.class);
-        expectedException.expectMessage(
-                "Batch state backend and sorting inputs are not supported in graphs with an InputSelectable operator.");
-        graphGenerator.generate();
-    }
-
-    @Test
-    public void testFeedbackThrowsExceptionInBatch() {
-        final SourceTransformation<Integer, ?, ?> bounded =
-                new SourceTransformation<>(
-                        "Bounded Source",
-                        new MockSource(Boundedness.BOUNDED, 100),
-                        WatermarkStrategy.noWatermarks(),
-                        IntegerTypeInfo.of(Integer.class),
-                        1);
-
-        final FeedbackTransformation<Integer> feedbackTransformation =
-                new FeedbackTransformation<>(bounded, 5L);
-
-        testNoSupportForIterationsInBatchHelper(bounded, feedbackTransformation);
-    }
-
-    @Test
-    public void testCoFeedbackThrowsExceptionInBatch() {
-        final CoFeedbackTransformation<Integer> coFeedbackTransformation =
-                new CoFeedbackTransformation<>(2, TypeInformation.of(Integer.TYPE), 5L);
-        testNoSupportForIterationsInBatchHelper(coFeedbackTransformation);
+        assertThatThrownBy(() -> getStreamGraphInBatchMode(sink))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(
+                        "Batch state backend and sorting inputs are not supported in graphs with an InputSelectable operator.");
     }
 
     private void testNoSupportForIterationsInBatchHelper(
@@ -462,14 +438,72 @@ public class StreamGraphGeneratorBatchExecutionTest extends TestLogger {
         final List<Transformation<?>> registeredTransformations = new ArrayList<>();
         Collections.addAll(registeredTransformations, transformations);
 
+        final Configuration configuration = new Configuration();
+        configuration.set(ExecutionOptions.RUNTIME_MODE, RuntimeExecutionMode.BATCH);
+
         StreamGraphGenerator streamGraphGenerator =
                 new StreamGraphGenerator(
-                        registeredTransformations, new ExecutionConfig(), new CheckpointConfig());
-        streamGraphGenerator.setRuntimeExecutionMode(RuntimeExecutionMode.BATCH);
+                        registeredTransformations,
+                        new ExecutionConfig(),
+                        new CheckpointConfig(),
+                        configuration);
 
-        expectedException.expect(UnsupportedOperationException.class);
-        expectedException.expectMessage("Iterations are not supported in BATCH execution mode.");
-        streamGraphGenerator.generate();
+        assertThatThrownBy(streamGraphGenerator::generate)
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("Iterations are not supported in BATCH execution mode.");
+    }
+
+    private void testGlobalStreamExchangeMode(
+            RuntimeExecutionMode runtimeExecutionMode,
+            BatchShuffleMode shuffleMode,
+            GlobalStreamExchangeMode expectedStreamExchangeMode) {
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        final DataStreamSink<Integer> sink = addDummyPipeline(env);
+
+        final Configuration configuration = new Configuration();
+        configuration.set(ExecutionOptions.RUNTIME_MODE, runtimeExecutionMode);
+        configuration.set(ExecutionOptions.BATCH_SHUFFLE_MODE, shuffleMode);
+
+        StreamGraphGenerator streamGraphGenerator =
+                new StreamGraphGenerator(
+                        Collections.singletonList(sink.getTransformation()),
+                        new ExecutionConfig(),
+                        new CheckpointConfig(),
+                        configuration);
+
+        StreamGraph graph = streamGraphGenerator.generate();
+
+        assertThat(graph.getGlobalStreamExchangeMode()).isEqualTo(expectedStreamExchangeMode);
+    }
+
+    private DataStreamSink<Integer> addDummyPipeline(StreamExecutionEnvironment env) {
+        return env.fromData(1, 2)
+                .keyBy(Integer::intValue)
+                .process(DUMMY_PROCESS_FUNCTION)
+                .sinkTo(new DiscardingSink<>());
+    }
+
+    private StreamGraph getStreamGraphInBatchMode(DataStreamSink<?> sink) {
+        return getStreamGraphInBatchMode(sink, new Configuration());
+    }
+
+    private StreamGraph getStreamGraphInBatchMode(
+            DataStreamSink<?> sink, Configuration configuration) {
+        final ExecutionConfig executionConfig = new ExecutionConfig();
+        executionConfig.configure(configuration, StreamGraphGenerator.class.getClassLoader());
+
+        final CheckpointConfig checkpointConfig = new CheckpointConfig();
+        checkpointConfig.configure(configuration);
+
+        configuration.set(ExecutionOptions.RUNTIME_MODE, RuntimeExecutionMode.BATCH);
+
+        return new StreamGraphGenerator(
+                        Collections.singletonList(sink.getTransformation()),
+                        executionConfig,
+                        checkpointConfig,
+                        configuration)
+                .generate();
     }
 
     private static final KeyedProcessFunction<Integer, Integer, Integer> DUMMY_PROCESS_FUNCTION =

@@ -20,24 +20,22 @@ package org.apache.flink.core.testutils;
 
 import javax.annotation.Nonnull;
 
-import java.util.ArrayDeque;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
-import java.util.Objects;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Delayed;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 /**
@@ -49,7 +47,7 @@ import java.util.stream.Collectors;
  */
 public class ManuallyTriggeredScheduledExecutorService implements ScheduledExecutorService {
 
-    private final ArrayDeque<Runnable> queuedRunnables = new ArrayDeque<>();
+    private final BlockingQueue<Runnable> queuedRunnables = new LinkedBlockingQueue<>();
 
     private final ConcurrentLinkedQueue<ScheduledTask<?>> nonPeriodicScheduledTasks =
             new ConcurrentLinkedQueue<>();
@@ -65,9 +63,7 @@ public class ManuallyTriggeredScheduledExecutorService implements ScheduledExecu
 
     @Override
     public void execute(@Nonnull Runnable command) {
-        synchronized (queuedRunnables) {
-            queuedRunnables.addLast(command);
-        }
+        queuedRunnables.add(command);
     }
 
     @Override
@@ -118,7 +114,7 @@ public class ManuallyTriggeredScheduledExecutorService implements ScheduledExecu
     }
 
     @Override
-    public boolean awaitTermination(long timeout, TimeUnit unit) {
+    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
         return true;
     }
 
@@ -166,6 +162,19 @@ public class ManuallyTriggeredScheduledExecutorService implements ScheduledExecu
     // Execution triggering and access to the queued tasks
     // ------------------------------------------------------------------------
 
+    /**
+     * Executes all runnable and scheduled non-periodic tasks until none are left to run. This is
+     * essentially a combination of {@link #triggerAll()} and {@link
+     * #triggerNonPeriodicScheduledTasks()} that allows making a test agnostic of how exactly a
+     * runnable is passed to the executor.
+     */
+    public void triggerAllNonPeriodicTasks() {
+        while (numQueuedRunnables() > 0 || !nonPeriodicScheduledTasks.isEmpty()) {
+            triggerAll();
+            triggerNonPeriodicScheduledTasks();
+        }
+    }
+
     /** Triggers all {@code queuedRunnables}. */
     public void triggerAll() {
         while (numQueuedRunnables() > 0) {
@@ -174,44 +183,74 @@ public class ManuallyTriggeredScheduledExecutorService implements ScheduledExecu
     }
 
     /**
-     * Triggers the next queued runnable and executes it synchronously. This method throws an
-     * exception if no Runnable is currently queued.
+     * Triggers the next task that was submitted for execution. The method blocks the given amount
+     * of time if no task is scheduled, yet.
+     *
+     * @param timeout The time to wait for a new task to be scheduled.
+     * @throws IllegalStateException if no task was scheduled in the given amount of time.
+     */
+    public void trigger(Duration timeout) {
+        try {
+            final Runnable task = queuedRunnables.poll(timeout.toMillis(), TimeUnit.MILLISECONDS);
+
+            if (task == null) {
+                throw new IllegalStateException("No task was scheduled.");
+            }
+
+            task.run();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Triggers the next task that was submitted for execution.
+     *
+     * @throws IllegalStateException if no task was scheduled before calling this method.
      */
     public void trigger() {
-        final Runnable next;
-
-        synchronized (queuedRunnables) {
-            next = queuedRunnables.removeFirst();
-        }
-
-        next.run();
+        trigger(Duration.ZERO);
     }
 
     /** Gets the number of Runnables currently queued. */
     public int numQueuedRunnables() {
-        synchronized (queuedRunnables) {
-            return queuedRunnables.size();
-        }
+        return queuedRunnables.size();
     }
 
-    public Collection<ScheduledFuture<?>> getScheduledTasks() {
+    public Collection<ScheduledFuture<?>> getActiveScheduledTasks() {
         final ArrayList<ScheduledFuture<?>> scheduledTasks =
                 new ArrayList<>(nonPeriodicScheduledTasks.size() + periodicScheduledTasks.size());
-        scheduledTasks.addAll(getNonPeriodicScheduledTask());
-        scheduledTasks.addAll(getPeriodicScheduledTask());
+        scheduledTasks.addAll(getActiveNonPeriodicScheduledTask());
+        scheduledTasks.addAll(getActivePeriodicScheduledTask());
         return scheduledTasks;
     }
 
-    public Collection<ScheduledFuture<?>> getPeriodicScheduledTask() {
+    public Collection<ScheduledFuture<?>> getActivePeriodicScheduledTask() {
         return periodicScheduledTasks.stream()
                 .filter(scheduledTask -> !scheduledTask.isCancelled())
                 .collect(Collectors.toList());
     }
 
-    public Collection<ScheduledFuture<?>> getNonPeriodicScheduledTask() {
+    public Collection<ScheduledFuture<?>> getActiveNonPeriodicScheduledTask() {
         return nonPeriodicScheduledTasks.stream()
                 .filter(scheduledTask -> !scheduledTask.isCancelled())
                 .collect(Collectors.toList());
+    }
+
+    public List<ScheduledFuture<?>> getAllScheduledTasks() {
+        final ArrayList<ScheduledFuture<?>> scheduledTasks =
+                new ArrayList<>(nonPeriodicScheduledTasks.size() + periodicScheduledTasks.size());
+        scheduledTasks.addAll(getAllNonPeriodicScheduledTask());
+        scheduledTasks.addAll(getAllPeriodicScheduledTask());
+        return scheduledTasks;
+    }
+
+    public List<ScheduledFuture<?>> getAllPeriodicScheduledTask() {
+        return new ArrayList<>(periodicScheduledTasks);
+    }
+
+    public List<ScheduledFuture<?>> getAllNonPeriodicScheduledTask() {
+        return new ArrayList<>(nonPeriodicScheduledTasks);
     }
 
     /** Triggers all registered tasks. */
@@ -260,6 +299,23 @@ public class ManuallyTriggeredScheduledExecutorService implements ScheduledExecu
         }
     }
 
+    public void triggerNonPeriodicScheduledTasks(Class<?> taskClazz) {
+        int numTasksBeforeTrigger = nonPeriodicScheduledTasks.size();
+        Iterator<ScheduledTask<?>> iterator = nonPeriodicScheduledTasks.iterator();
+
+        for (int i = 0; i < numTasksBeforeTrigger; i++) {
+            final ScheduledTask<?> scheduledTask = iterator.next();
+            Callable<?> callable = scheduledTask.getCallable();
+            if (callable instanceof RunnableCaller
+                    && ((RunnableCaller<?>) callable).command.getClass().equals(taskClazz)) {
+                if (!scheduledTask.isCancelled()) {
+                    scheduledTask.execute();
+                }
+                iterator.remove();
+            }
+        }
+    }
+
     public void triggerPeriodicScheduledTasks() {
         for (ScheduledTask<?> scheduledTask : periodicScheduledTasks) {
             if (!scheduledTask.isCancelled()) {
@@ -286,13 +342,7 @@ public class ManuallyTriggeredScheduledExecutorService implements ScheduledExecu
     }
 
     private ScheduledFuture<?> insertNonPeriodicTask(Runnable command, long delay, TimeUnit unit) {
-        return insertNonPeriodicTask(
-                () -> {
-                    command.run();
-                    return null;
-                },
-                delay,
-                unit);
+        return insertNonPeriodicTask(new RunnableCaller<>(command), delay, unit);
     }
 
     private <V> ScheduledFuture<V> insertNonPeriodicTask(
@@ -300,88 +350,26 @@ public class ManuallyTriggeredScheduledExecutorService implements ScheduledExecu
         final ScheduledTask<V> scheduledTask =
                 new ScheduledTask<>(callable, unit.convert(delay, TimeUnit.MILLISECONDS));
 
+        if (shutdown) {
+            throw new RejectedExecutionException();
+        }
         nonPeriodicScheduledTasks.offer(scheduledTask);
 
         return scheduledTask;
     }
 
-    private static final class ScheduledTask<T> implements ScheduledFuture<T> {
+    /** A {@link Callable} that wraps a {@link Runnable}. */
+    public static class RunnableCaller<T> implements Callable<T> {
+        public final Runnable command;
 
-        private final Callable<T> callable;
-
-        private final long delay;
-
-        private final long period;
-
-        private final CompletableFuture<T> result;
-
-        private ScheduledTask(Callable<T> callable, long delay) {
-            this(callable, delay, 0);
-        }
-
-        private ScheduledTask(Callable<T> callable, long delay, long period) {
-            this.callable = Objects.requireNonNull(callable);
-            this.result = new CompletableFuture<>();
-            this.delay = delay;
-            this.period = period;
-        }
-
-        private boolean isPeriodic() {
-            return period > 0;
-        }
-
-        public void execute() {
-            if (!result.isDone()) {
-                if (!isPeriodic()) {
-                    try {
-                        result.complete(callable.call());
-                    } catch (Exception e) {
-                        result.completeExceptionally(e);
-                    }
-                } else {
-                    try {
-                        callable.call();
-                    } catch (Exception e) {
-                        result.completeExceptionally(e);
-                    }
-                }
-            }
+        private RunnableCaller(Runnable command) {
+            this.command = command;
         }
 
         @Override
-        public long getDelay(TimeUnit unit) {
-            return unit.convert(delay, TimeUnit.MILLISECONDS);
-        }
-
-        @Override
-        public int compareTo(Delayed o) {
-            return Long.compare(getDelay(TimeUnit.MILLISECONDS), o.getDelay(TimeUnit.MILLISECONDS));
-        }
-
-        @Override
-        public boolean cancel(boolean mayInterruptIfRunning) {
-            return result.cancel(mayInterruptIfRunning);
-        }
-
-        @Override
-        public boolean isCancelled() {
-            return result.isCancelled();
-        }
-
-        @Override
-        public boolean isDone() {
-            return result.isDone();
-        }
-
-        @Override
-        public T get() throws InterruptedException, ExecutionException {
-            return result.get();
-        }
-
-        @Override
-        public T get(long timeout, @Nonnull TimeUnit unit)
-                throws InterruptedException, ExecutionException, TimeoutException {
-            return result.get(timeout, unit);
+        public T call() {
+            command.run();
+            return null;
         }
     }
 }

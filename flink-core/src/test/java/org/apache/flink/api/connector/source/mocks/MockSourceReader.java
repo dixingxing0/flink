@@ -26,35 +26,64 @@ import org.apache.flink.core.io.InputStatus;
 import javax.annotation.concurrent.GuardedBy;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 /** A mock {@link SourceReader} for unit tests. */
 public class MockSourceReader implements SourceReader<Integer, MockSourceSplit> {
+    private final Set<String> pausedSplits = new HashSet<>();
     private final List<MockSourceSplit> assignedSplits = new ArrayList<>();
     private final List<SourceEvent> receivedSourceEvents = new ArrayList<>();
     private final List<Long> completedCheckpoints = new ArrayList<>();
     private final List<Long> abortedCheckpoints = new ArrayList<>();
     private final boolean markIdleOnNoSplits;
-
+    private final boolean usePerSplitOutputs;
     private int currentSplitIndex = 0;
     private boolean started;
     private int timesClosed;
-    private boolean waitingForMoreSplits;
+    private final WaitingForSplits waitingForSplitsBehaviour;
+    private SplitsAssignmentState splitsAssignmentState = SplitsAssignmentState.NO_SPLITS_ASSIGNED;
+    private boolean idle = false;
+
+    /** Controls when the source finishes in respect to assigned splits. */
+    public enum WaitingForSplits {
+        WAIT_FOR_INITIAL,
+        WAIT_UNTIL_ALL_SPLITS_ASSIGNED,
+        DO_NOT_WAIT_FOR_SPLITS
+    }
+
+    private enum SplitsAssignmentState {
+        NO_SPLITS_ASSIGNED,
+        INITIAL_SPLITS_ASSIGNED,
+        NO_MORE_SPLITS
+    }
 
     @GuardedBy("this")
     private CompletableFuture<Void> availableFuture;
 
     public MockSourceReader() {
-        this(false, false);
+        this(WaitingForSplits.DO_NOT_WAIT_FOR_SPLITS, false);
     }
 
-    public MockSourceReader(boolean waitingForMoreSplits, boolean markIdleOnNoSplits) {
+    public MockSourceReader(
+            WaitingForSplits waitingForSplitsBehaviour, boolean markIdleOnNoSplits) {
+        this(waitingForSplitsBehaviour, markIdleOnNoSplits, false);
+    }
+
+    public MockSourceReader(
+            WaitingForSplits waitingForSplitsBehaviour,
+            boolean markIdleOnNoSplits,
+            boolean usePerSplitOutputs) {
         this.started = false;
         this.timesClosed = 0;
         this.availableFuture = CompletableFuture.completedFuture(null);
-        this.waitingForMoreSplits = waitingForMoreSplits;
+        this.waitingForSplitsBehaviour = waitingForSplitsBehaviour;
         this.markIdleOnNoSplits = markIdleOnNoSplits;
+        this.usePerSplitOutputs = usePerSplitOutputs;
     }
 
     @Override
@@ -64,17 +93,41 @@ public class MockSourceReader implements SourceReader<Integer, MockSourceSplit> 
 
     @Override
     public InputStatus pollNext(ReaderOutput<Integer> sourceOutput) throws Exception {
-        boolean finished = !waitingForMoreSplits;
+        releaseFinishedSplits(sourceOutput);
+
+        if (waitingForSplitsBehaviour == WaitingForSplits.WAIT_FOR_INITIAL
+                && splitsAssignmentState == SplitsAssignmentState.NO_SPLITS_ASSIGNED) {
+            markUnavailable();
+            return InputStatus.NOTHING_AVAILABLE;
+        }
+
+        boolean finished =
+                splitsAssignmentState == SplitsAssignmentState.NO_MORE_SPLITS
+                        || waitingForSplitsBehaviour == WaitingForSplits.DO_NOT_WAIT_FOR_SPLITS;
         currentSplitIndex = 0;
         // Find first splits with available records.
-        while (currentSplitIndex < assignedSplits.size()
-                && !assignedSplits.get(currentSplitIndex).isAvailable()) {
-            finished &= assignedSplits.get(currentSplitIndex).isFinished();
+        for (MockSourceSplit assignedSplit : assignedSplits) {
+            finished &= assignedSplit.isFinished();
+            if (!pausedSplits.contains(assignedSplit.splitId())) {
+                if (assignedSplit.isAvailable()) {
+                    break;
+                }
+            }
             currentSplitIndex++;
         }
+
         // Read from the split with available record.
         if (currentSplitIndex < assignedSplits.size()) {
-            sourceOutput.collect(assignedSplits.get(currentSplitIndex).getNext(false)[0]);
+            if (idle) {
+                sourceOutput.markActive();
+            }
+            final MockSourceSplit sourceSplit = assignedSplits.get(currentSplitIndex);
+            final int record = sourceSplit.getNext(false)[0];
+            if (usePerSplitOutputs) {
+                sourceOutput.createOutputForSplit(sourceSplit.splitId()).collect(record);
+            } else {
+                sourceOutput.collect(record);
+            }
             return InputStatus.MORE_AVAILABLE;
         } else if (finished) {
             // In case no split has available record, return depending on whether all the splits has
@@ -82,10 +135,23 @@ public class MockSourceReader implements SourceReader<Integer, MockSourceSplit> 
             return InputStatus.END_OF_INPUT;
         } else {
             if (markIdleOnNoSplits) {
+                idle = true;
                 sourceOutput.markIdle();
             }
             markUnavailable();
             return InputStatus.NOTHING_AVAILABLE;
+        }
+    }
+
+    private void releaseFinishedSplits(ReaderOutput<Integer> sourceOutput) {
+        Iterator<MockSourceSplit> assignedSplitsIterator = assignedSplits.iterator();
+        while (assignedSplitsIterator.hasNext()) {
+            MockSourceSplit assignedSplit = assignedSplitsIterator.next();
+            if (assignedSplit.isFinished()) {
+                sourceOutput.releaseOutputForSplit(assignedSplit.splitId());
+                assignedSplitsIterator.remove();
+                pausedSplits.remove(assignedSplit.splitId());
+            }
         }
     }
 
@@ -101,13 +167,22 @@ public class MockSourceReader implements SourceReader<Integer, MockSourceSplit> 
 
     @Override
     public void addSplits(List<MockSourceSplit> splits) {
+        if (splitsAssignmentState == SplitsAssignmentState.NO_SPLITS_ASSIGNED) {
+            splitsAssignmentState = SplitsAssignmentState.INITIAL_SPLITS_ASSIGNED;
+        }
         assignedSplits.addAll(splits);
         markAvailable();
     }
 
+    public void pauseOrResumeSplits(
+            Collection<String> splitsToPause, Collection<String> splitsToResume) {
+        pausedSplits.removeAll(splitsToResume);
+        pausedSplits.addAll(splitsToPause);
+    }
+
     @Override
     public void notifyNoMoreSplits() {
-        waitingForMoreSplits = false;
+        splitsAssignmentState = SplitsAssignmentState.NO_MORE_SPLITS;
         markAvailable();
     }
 
@@ -177,5 +252,9 @@ public class MockSourceReader implements SourceReader<Integer, MockSourceSplit> 
 
     public List<Long> getAbortedCheckpoints() {
         return abortedCheckpoints;
+    }
+
+    public Set<String> getPausedSplits() {
+        return pausedSplits;
     }
 }

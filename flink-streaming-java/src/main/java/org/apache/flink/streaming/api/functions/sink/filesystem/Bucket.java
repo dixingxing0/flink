@@ -21,6 +21,7 @@ package org.apache.flink.streaming.api.functions.sink.filesystem;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.core.fs.Path;
+import org.apache.flink.streaming.api.functions.sink.filesystem.legacy.StreamingFileSink;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -142,6 +143,7 @@ public class Bucket<IN, BucketID> {
                             bucketId,
                             inProgressFileRecoverable,
                             state.getInProgressFileCreationTime());
+            inProgressFileRecoverablesPerCheckpoint.put(Long.MIN_VALUE, inProgressFileRecoverable);
         } else {
             // if the writer does not support resume, then we close the
             // in-progress part and commit it, as done in the case of pending files.
@@ -256,7 +258,7 @@ public class Bucket<IN, BucketID> {
                         + outputFileConfig.getPartSuffix());
     }
 
-    private InProgressFileWriter.PendingFileRecoverable closePartFile() throws IOException {
+    InProgressFileWriter.PendingFileRecoverable closePartFile() throws IOException {
         InProgressFileWriter.PendingFileRecoverable pendingFileRecoverable = null;
         if (inProgressPart != null) {
             pendingFileRecoverable = inProgressPart.closeForCommit();

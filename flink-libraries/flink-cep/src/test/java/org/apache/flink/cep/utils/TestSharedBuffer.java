@@ -30,9 +30,10 @@ import org.apache.flink.api.common.state.ReducingStateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.cep.configuration.SharedBufferCacheConfig;
 import org.apache.flink.cep.nfa.sharedbuffer.SharedBuffer;
 
-import org.apache.flink.shaded.guava18.com.google.common.collect.Iterators;
+import javax.annotation.Nonnull;
 
 import java.io.IOException;
 import java.util.Collections;
@@ -50,6 +51,14 @@ public class TestSharedBuffer<V> extends SharedBuffer<V> {
 
     private TestSharedBuffer(MockKeyedStateStore stateStore, TypeSerializer<V> valueSerializer) {
         super(stateStore, valueSerializer);
+        this.keyedStateStore = stateStore;
+    }
+
+    private TestSharedBuffer(
+            MockKeyedStateStore stateStore,
+            TypeSerializer<V> valueSerializer,
+            SharedBufferCacheConfig sharedBufferCacheConfig) {
+        super(stateStore, valueSerializer, sharedBufferCacheConfig);
         this.keyedStateStore = stateStore;
     }
 
@@ -74,6 +83,12 @@ public class TestSharedBuffer<V> extends SharedBuffer<V> {
      */
     public static <T> TestSharedBuffer<T> createTestBuffer(TypeSerializer<T> typeSerializer) {
         return new TestSharedBuffer<>(new MockKeyedStateStore(), typeSerializer);
+    }
+
+    public static <T> TestSharedBuffer<T> createTestBuffer(
+            TypeSerializer<T> typeSerializer, SharedBufferCacheConfig sharedBufferCacheConfig) {
+        return new TestSharedBuffer<>(
+                new MockKeyedStateStore(), typeSerializer, sharedBufferCacheConfig);
     }
 
     private static class MockKeyedStateStore implements KeyedStateStore {
@@ -207,7 +222,7 @@ public class TestSharedBuffer<V> extends SharedBuffer<V> {
                 @Override
                 public Iterator<Map.Entry<UK, UV>> iterator() throws Exception {
                     if (values == null) {
-                        return Iterators.emptyIterator();
+                        return Collections.emptyIterator();
                     }
 
                     return new CountingIterator<>(values.entrySet().iterator());
@@ -228,6 +243,53 @@ public class TestSharedBuffer<V> extends SharedBuffer<V> {
                     this.values = null;
                 }
             };
+        }
+
+        @Override
+        public <T> org.apache.flink.api.common.state.v2.ValueState<T> getValueState(
+                @Nonnull
+                        org.apache.flink.api.common.state.v2.ValueStateDescriptor<T>
+                                stateProperties) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public <T> org.apache.flink.api.common.state.v2.ListState<T> getListState(
+                @Nonnull
+                        org.apache.flink.api.common.state.v2.ListStateDescriptor<T>
+                                stateProperties) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public <UK, UV> org.apache.flink.api.common.state.v2.MapState<UK, UV> getMapState(
+                @Nonnull
+                        org.apache.flink.api.common.state.v2.MapStateDescriptor<UK, UV>
+                                stateProperties) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public <T> org.apache.flink.api.common.state.v2.ReducingState<T> getReducingState(
+                @Nonnull
+                        org.apache.flink.api.common.state.v2.ReducingStateDescriptor<T>
+                                stateProperties) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public <IN, ACC, OUT>
+                org.apache.flink.api.common.state.v2.AggregatingState<IN, OUT> getAggregatingState(
+                        @Nonnull
+                                org.apache.flink.api.common.state.v2.AggregatingStateDescriptor<
+                                                IN, ACC, OUT>
+                                        stateProperties) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public String getBackendTypeIdentifier() {
+            return "mock";
         }
 
         private class CountingIterator<T> implements Iterator<T> {

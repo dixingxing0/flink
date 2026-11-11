@@ -19,19 +19,22 @@
 package org.apache.flink.runtime.operators.coordination;
 
 import org.apache.flink.runtime.jobgraph.OperatorID;
-import org.apache.flink.runtime.util.SerializableFunction;
+import org.apache.flink.util.function.SerializableFunction;
 
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.function.BiConsumer;
 
 /** A simple testing implementation of the {@link OperatorCoordinator}. */
-class TestingOperatorCoordinator implements OperatorCoordinator {
+public class TestingOperatorCoordinator implements OperatorCoordinator {
 
     public static final byte[] NULL_RESTORE_VALUE = new byte[0];
 
@@ -45,11 +48,19 @@ class TestingOperatorCoordinator implements OperatorCoordinator {
     @Nullable private byte[] lastRestoredCheckpointState;
     private long lastRestoredCheckpointId;
 
-    private BlockingQueue<CompletableFuture<byte[]>> triggeredCheckpoints;
+    private long lastTriggeredCheckpointId;
 
-    private BlockingQueue<Long> lastCheckpointComplete;
+    private final BlockingQueue<CompletableFuture<byte[]>> triggeredCheckpoints;
 
-    private BlockingQueue<OperatorEvent> receivedOperatorEvents;
+    private final BlockingQueue<Long> lastCheckpointComplete;
+
+    private final BlockingQueue<Long> lastCheckpointAborted;
+
+    private final BlockingQueue<OperatorEvent> receivedOperatorEvents;
+
+    private final Map<Integer, SubtaskGateway> subtaskGateways;
+
+    private BiConsumer<Long, byte[]> resetToCheckpointConsumer;
 
     private boolean started;
     private boolean closed;
@@ -63,8 +74,10 @@ class TestingOperatorCoordinator implements OperatorCoordinator {
         this.context = context;
         this.triggeredCheckpoints = new LinkedBlockingQueue<>();
         this.lastCheckpointComplete = new LinkedBlockingQueue<>();
+        this.lastCheckpointAborted = new LinkedBlockingQueue<>();
         this.receivedOperatorEvents = new LinkedBlockingQueue<>();
         this.blockOnCloseLatch = blockOnCloseLatch;
+        this.subtaskGateways = new HashMap<>();
     }
 
     // ------------------------------------------------------------------------
@@ -83,13 +96,14 @@ class TestingOperatorCoordinator implements OperatorCoordinator {
     }
 
     @Override
-    public void handleEventFromOperator(int subtask, OperatorEvent event) {
+    public void handleEventFromOperator(int subtask, int attemptNumber, OperatorEvent event) {
         receivedOperatorEvents.add(event);
     }
 
     @Override
-    public void subtaskFailed(int subtask, @Nullable Throwable reason) {
+    public void executionAttemptFailed(int subtask, int attemptNumber, @Nullable Throwable reason) {
         failedTasks.add(subtask);
+        subtaskGateways.remove(subtask);
     }
 
     @Override
@@ -98,7 +112,13 @@ class TestingOperatorCoordinator implements OperatorCoordinator {
     }
 
     @Override
+    public void executionAttemptReady(int subtask, int attemptNumber, SubtaskGateway gateway) {
+        subtaskGateways.put(subtask, gateway);
+    }
+
+    @Override
     public void checkpointCoordinator(long checkpointId, CompletableFuture<byte[]> result) {
+        lastTriggeredCheckpointId = checkpointId;
         boolean added = triggeredCheckpoints.offer(result);
         assert added; // guard the test assumptions
     }
@@ -109,7 +129,15 @@ class TestingOperatorCoordinator implements OperatorCoordinator {
     }
 
     @Override
+    public void notifyCheckpointAborted(long checkpointId) {
+        lastCheckpointAborted.offer(checkpointId);
+    }
+
+    @Override
     public void resetToCheckpoint(long checkpointId, @Nullable byte[] checkpointData) {
+        if (resetToCheckpointConsumer != null) {
+            resetToCheckpointConsumer.accept(checkpointId, checkpointData);
+        }
         lastRestoredCheckpointId = checkpointId;
         lastRestoredCheckpointState = checkpointData == null ? NULL_RESTORE_VALUE : checkpointData;
     }
@@ -118,6 +146,10 @@ class TestingOperatorCoordinator implements OperatorCoordinator {
 
     public OperatorCoordinator.Context getContext() {
         return context;
+    }
+
+    public SubtaskGateway getSubtaskGateway(int subtask) {
+        return subtaskGateways.get(subtask);
     }
 
     public boolean isStarted() {
@@ -149,12 +181,20 @@ class TestingOperatorCoordinator implements OperatorCoordinator {
         return triggeredCheckpoints.take();
     }
 
+    public long getLastTriggeredCheckpointId() {
+        return lastTriggeredCheckpointId;
+    }
+
     public boolean hasTriggeredCheckpoint() {
         return !triggeredCheckpoints.isEmpty();
     }
 
     public long getLastCheckpointComplete() throws InterruptedException {
         return lastCheckpointComplete.take();
+    }
+
+    public long getLastCheckpointAborted() throws InterruptedException {
+        return lastCheckpointAborted.take();
     }
 
     @Nullable
@@ -164,6 +204,10 @@ class TestingOperatorCoordinator implements OperatorCoordinator {
 
     public boolean hasCompleteCheckpoint() throws InterruptedException {
         return !lastCheckpointComplete.isEmpty();
+    }
+
+    public void setResetToCheckpointConsumer(BiConsumer<Long, byte[]> resetToCheckpointConsumer) {
+        this.resetToCheckpointConsumer = resetToCheckpointConsumer;
     }
 
     // ------------------------------------------------------------------------

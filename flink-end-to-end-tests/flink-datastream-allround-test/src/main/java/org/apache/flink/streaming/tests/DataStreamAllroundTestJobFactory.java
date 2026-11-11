@@ -18,10 +18,10 @@
 
 package org.apache.flink.streaming.tests;
 
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.JoinFunction;
 import org.apache.flink.api.common.functions.MapFunction;
-import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
@@ -29,31 +29,32 @@ import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
-import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigOptions;
-import org.apache.flink.contrib.streaming.state.RocksDBStateBackend;
-import org.apache.flink.runtime.state.StateBackend;
-import org.apache.flink.runtime.state.filesystem.FsStateBackend;
-import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.ExternalizedCheckpointRetention;
+import org.apache.flink.configuration.RestartStrategyOptions;
+import org.apache.flink.configuration.StateBackendOptions;
+import org.apache.flink.core.execution.CheckpointingMode;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.KeyedStream;
 import org.apache.flink.streaming.api.datastream.WindowedStream;
-import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.streaming.api.functions.source.legacy.SourceFunction;
 import org.apache.flink.streaming.api.functions.timestamps.BoundedOutOfOrdernessTimestampExtractor;
 import org.apache.flink.streaming.api.windowing.assigners.SlidingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
-import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.tests.artificialstate.ArtificalOperatorStateMapper;
 import org.apache.flink.streaming.tests.artificialstate.ArtificialKeyedStateMapper;
 import org.apache.flink.streaming.tests.artificialstate.builder.ArtificialListStateBuilder;
 import org.apache.flink.streaming.tests.artificialstate.builder.ArtificialStateBuilder;
 import org.apache.flink.streaming.tests.artificialstate.builder.ArtificialValueStateBuilder;
+import org.apache.flink.util.ParameterTool;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -135,18 +136,21 @@ import static org.apache.flink.streaming.tests.TestOperatorEnum.RESULT_TYPE_QUER
 public class DataStreamAllroundTestJobFactory {
     private static final ConfigOption<String> TEST_SEMANTICS =
             ConfigOptions.key("test.semantics")
+                    .stringType()
                     .defaultValue("exactly-once")
                     .withDescription(
                             "This configures the semantics to test. Can be 'exactly-once' or 'at-least-once'");
 
     private static final ConfigOption<Boolean> TEST_SIMULATE_FAILURE =
             ConfigOptions.key("test.simulate_failure")
+                    .booleanType()
                     .defaultValue(false)
                     .withDescription(
                             "This configures whether or not to simulate failures by throwing exceptions within the job.");
 
     private static final ConfigOption<Long> TEST_SIMULATE_FAILURE_NUM_RECORDS =
             ConfigOptions.key("test.simulate_failure.num_records")
+                    .longType()
                     .defaultValue(100L)
                     .withDescription(
                             "The number of records to process before throwing an exception, per job execution attempt."
@@ -154,6 +158,7 @@ public class DataStreamAllroundTestJobFactory {
 
     private static final ConfigOption<Long> TEST_SIMULATE_FAILURE_NUM_CHECKPOINTS =
             ConfigOptions.key("test.simulate_failure.num_checkpoints")
+                    .longType()
                     .defaultValue(1L)
                     .withDescription(
                             "The number of complete checkpoints before throwing an exception, per job execution attempt."
@@ -161,6 +166,7 @@ public class DataStreamAllroundTestJobFactory {
 
     private static final ConfigOption<Integer> TEST_SIMULATE_FAILURE_MAX_FAILURES =
             ConfigOptions.key("test.simulate_failure.max_failures")
+                    .intType()
                     .defaultValue(1)
                     .withDescription(
                             "The maximum number of times to fail the job. This also takes into account failures that were not triggered"
@@ -168,91 +174,113 @@ public class DataStreamAllroundTestJobFactory {
                                     + " Only relevant if configured to simulate failures.");
 
     private static final ConfigOption<Long> ENVIRONMENT_CHECKPOINT_INTERVAL =
-            ConfigOptions.key("environment.checkpoint_interval").defaultValue(1000L);
+            ConfigOptions.key("environment.checkpoint_interval").longType().defaultValue(1000L);
 
     private static final ConfigOption<Boolean> ENVIRONMENT_EXTERNALIZE_CHECKPOINT =
-            ConfigOptions.key("environment.externalize_checkpoint").defaultValue(false);
+            ConfigOptions.key("environment.externalize_checkpoint")
+                    .booleanType()
+                    .defaultValue(false);
 
     private static final ConfigOption<String> ENVIRONMENT_EXTERNALIZE_CHECKPOINT_CLEANUP =
-            ConfigOptions.key("environment.externalize_checkpoint.cleanup").defaultValue("retain");
+            ConfigOptions.key("environment.externalize_checkpoint.cleanup")
+                    .stringType()
+                    .defaultValue("retain");
 
     private static final ConfigOption<Integer> ENVIRONMENT_TOLERABLE_DECLINED_CHECKPOINT_NUMBER =
-            ConfigOptions.key("environment.tolerable_declined_checkpoint_number ").defaultValue(0);
+            ConfigOptions.key("environment.tolerable_declined_checkpoint_number ")
+                    .intType()
+                    .defaultValue(0);
 
     private static final ConfigOption<Integer> ENVIRONMENT_PARALLELISM =
-            ConfigOptions.key("environment.parallelism").defaultValue(1);
+            ConfigOptions.key("environment.parallelism").intType().defaultValue(1);
 
     private static final ConfigOption<Integer> ENVIRONMENT_MAX_PARALLELISM =
-            ConfigOptions.key("environment.max_parallelism").defaultValue(128);
+            ConfigOptions.key("environment.max_parallelism").intType().defaultValue(128);
 
     private static final ConfigOption<String> ENVIRONMENT_RESTART_STRATEGY =
-            ConfigOptions.key("environment.restart_strategy").defaultValue("fixed_delay");
+            ConfigOptions.key("environment.restart_strategy")
+                    .stringType()
+                    .defaultValue("fixed_delay");
 
     private static final ConfigOption<Integer> ENVIRONMENT_RESTART_STRATEGY_FIXED_ATTEMPTS =
             ConfigOptions.key("environment.restart_strategy.fixed_delay.attempts")
+                    .intType()
                     .defaultValue(Integer.MAX_VALUE);
 
     private static final ConfigOption<Long> ENVIRONMENT_RESTART_STRATEGY_FIXED_DELAY =
-            ConfigOptions.key("environment.restart_strategy.fixed.delay").defaultValue(0L);
+            ConfigOptions.key("environment.restart_strategy.fixed.delay")
+                    .longType()
+                    .defaultValue(0L);
 
     private static final ConfigOption<String> STATE_BACKEND =
             ConfigOptions.key("state_backend")
-                    .defaultValue("file")
+                    .stringType()
+                    .defaultValue("hashmap")
                     .withDescription(
-                            "Supported values are 'file' for FsStateBackend and 'rocks' for RocksDBStateBackend.");
+                            "Supported values are 'hashmap' for HashMapStateBackend and 'rocks' "
+                                    + "for EmbeddedRocksDBStateBackend.");
 
     private static final ConfigOption<String> STATE_BACKEND_CHECKPOINT_DIR =
             ConfigOptions.key("state_backend.checkpoint_directory")
+                    .stringType()
                     .noDefaultValue()
                     .withDescription("The checkpoint directory.");
 
-    private static final ConfigOption<Boolean> STATE_BACKEND_ROCKS_INCREMENTAL =
+    static final ConfigOption<Boolean> STATE_BACKEND_ROCKS_INCREMENTAL =
             ConfigOptions.key("state_backend.rocks.incremental")
+                    .booleanType()
                     .defaultValue(false)
                     .withDescription(
                             "Activate or deactivate incremental snapshots if RocksDBStateBackend is selected.");
 
-    private static final ConfigOption<Boolean> STATE_BACKEND_FILE_ASYNC =
-            ConfigOptions.key("state_backend.file.async")
-                    .defaultValue(true)
-                    .withDescription(
-                            "Activate or deactivate asynchronous snapshots if FileStateBackend is selected.");
-
     private static final ConfigOption<Integer> SEQUENCE_GENERATOR_SRC_KEYSPACE =
-            ConfigOptions.key("sequence_generator_source.keyspace").defaultValue(200);
+            ConfigOptions.key("sequence_generator_source.keyspace").intType().defaultValue(200);
 
     private static final ConfigOption<Integer> SEQUENCE_GENERATOR_SRC_PAYLOAD_SIZE =
-            ConfigOptions.key("sequence_generator_source.payload_size").defaultValue(20);
+            ConfigOptions.key("sequence_generator_source.payload_size").intType().defaultValue(20);
 
     private static final ConfigOption<Long> SEQUENCE_GENERATOR_SRC_SLEEP_TIME =
-            ConfigOptions.key("sequence_generator_source.sleep_time").defaultValue(0L);
+            ConfigOptions.key("sequence_generator_source.sleep_time").longType().defaultValue(0L);
 
     private static final ConfigOption<Long> SEQUENCE_GENERATOR_SRC_SLEEP_AFTER_ELEMENTS =
-            ConfigOptions.key("sequence_generator_source.sleep_after_elements").defaultValue(0L);
+            ConfigOptions.key("sequence_generator_source.sleep_after_elements")
+                    .longType()
+                    .defaultValue(0L);
 
     private static final ConfigOption<Long> SEQUENCE_GENERATOR_SRC_EVENT_TIME_MAX_OUT_OF_ORDERNESS =
             ConfigOptions.key("sequence_generator_source.event_time.max_out_of_order")
+                    .longType()
                     .defaultValue(0L);
 
     private static final ConfigOption<Long> SEQUENCE_GENERATOR_SRC_EVENT_TIME_CLOCK_PROGRESS =
             ConfigOptions.key("sequence_generator_source.event_time.clock_progress")
+                    .longType()
                     .defaultValue(100L);
 
     private static final ConfigOption<Long> TUMBLING_WINDOW_OPERATOR_NUM_EVENTS =
-            ConfigOptions.key("tumbling_window_operator.num_events").defaultValue(20L);
+            ConfigOptions.key("tumbling_window_operator.num_events").longType().defaultValue(20L);
 
     private static final ConfigOption<Integer> TEST_SLIDE_FACTOR =
-            ConfigOptions.key("test_slide_factor").defaultValue(3);
+            ConfigOptions.key("test_slide_factor").intType().defaultValue(3);
 
     private static final ConfigOption<Long> TEST_SLIDE_SIZE =
-            ConfigOptions.key("test_slide_size").defaultValue(250L);
+            ConfigOptions.key("test_slide_size").longType().defaultValue(250L);
 
     public static void setupEnvironment(StreamExecutionEnvironment env, ParameterTool pt)
+            throws Exception {
+        setupEnvironment(env, pt, true);
+    }
+
+    public static void setupEnvironment(
+            StreamExecutionEnvironment env, ParameterTool pt, boolean setupStateBackend)
             throws Exception {
         setupCheckpointing(env, pt);
         setupParallelism(env, pt);
         setupRestartStrategy(env, pt);
-        setupStateBackend(env, pt);
+
+        if (setupStateBackend) {
+            setupStateBackend(env, pt);
+        }
 
         // make parameters available in the web interface
         env.getConfig().setGlobalJobParameters(pt);
@@ -272,6 +300,11 @@ public class DataStreamAllroundTestJobFactory {
 
         env.enableCheckpointing(checkpointInterval, checkpointingMode);
 
+        final String checkpointDir = pt.getRequired(STATE_BACKEND_CHECKPOINT_DIR.key());
+        Configuration configuration = new Configuration();
+        configuration.set(CheckpointingOptions.CHECKPOINTS_DIRECTORY, checkpointDir);
+        env.configure(configuration);
+
         boolean enableExternalizedCheckpoints =
                 pt.getBoolean(
                         ENVIRONMENT_EXTERNALIZE_CHECKPOINT.key(),
@@ -283,22 +316,20 @@ public class DataStreamAllroundTestJobFactory {
                             ENVIRONMENT_EXTERNALIZE_CHECKPOINT_CLEANUP.key(),
                             ENVIRONMENT_EXTERNALIZE_CHECKPOINT_CLEANUP.defaultValue());
 
-            CheckpointConfig.ExternalizedCheckpointCleanup cleanupMode;
+            ExternalizedCheckpointRetention cleanupMode;
             switch (cleanupModeConfig) {
                 case "retain":
-                    cleanupMode =
-                            CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION;
+                    cleanupMode = ExternalizedCheckpointRetention.RETAIN_ON_CANCELLATION;
                     break;
                 case "delete":
-                    cleanupMode =
-                            CheckpointConfig.ExternalizedCheckpointCleanup.DELETE_ON_CANCELLATION;
+                    cleanupMode = ExternalizedCheckpointRetention.DELETE_ON_CANCELLATION;
                     break;
                 default:
                     throw new IllegalArgumentException(
                             "Unknown clean up mode for externalized checkpoints: "
                                     + cleanupModeConfig);
             }
-            env.getCheckpointConfig().enableExternalizedCheckpoints(cleanupMode);
+            env.getCheckpointConfig().setExternalizedCheckpointRetention(cleanupMode);
 
             final int tolerableDeclinedCheckpointNumber =
                     pt.getInt(
@@ -323,28 +354,34 @@ public class DataStreamAllroundTestJobFactory {
             final StreamExecutionEnvironment env, final ParameterTool pt) {
         String restartStrategyConfig = pt.get(ENVIRONMENT_RESTART_STRATEGY.key());
         if (restartStrategyConfig != null) {
-            RestartStrategies.RestartStrategyConfiguration restartStrategy;
             switch (restartStrategyConfig) {
                 case "fixed_delay":
-                    restartStrategy =
-                            RestartStrategies.fixedDelayRestart(
-                                    pt.getInt(
-                                            ENVIRONMENT_RESTART_STRATEGY_FIXED_ATTEMPTS.key(),
-                                            ENVIRONMENT_RESTART_STRATEGY_FIXED_ATTEMPTS
-                                                    .defaultValue()),
+                    Configuration configuration = new Configuration();
+                    configuration.set(RestartStrategyOptions.RESTART_STRATEGY, "fixed-delay");
+                    configuration.set(
+                            RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_ATTEMPTS,
+                            pt.getInt(
+                                    ENVIRONMENT_RESTART_STRATEGY_FIXED_ATTEMPTS.key(),
+                                    ENVIRONMENT_RESTART_STRATEGY_FIXED_ATTEMPTS.defaultValue()));
+                    configuration.set(
+                            RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_DELAY,
+                            Duration.ofMillis(
                                     pt.getLong(
                                             ENVIRONMENT_RESTART_STRATEGY_FIXED_DELAY.key(),
                                             ENVIRONMENT_RESTART_STRATEGY_FIXED_DELAY
-                                                    .defaultValue()));
+                                                    .defaultValue())));
+
+                    env.configure(configuration);
                     break;
                 case "no_restart":
-                    restartStrategy = RestartStrategies.noRestart();
+                    env.configure(
+                            new Configuration()
+                                    .set(RestartStrategyOptions.RESTART_STRATEGY, "none"));
                     break;
                 default:
                     throw new IllegalArgumentException(
                             "Unknown restart strategy: " + restartStrategyConfig);
             }
-            env.setRestartStrategy(restartStrategy);
         }
     }
 
@@ -352,23 +389,20 @@ public class DataStreamAllroundTestJobFactory {
             final StreamExecutionEnvironment env, final ParameterTool pt) throws IOException {
         final String stateBackend = pt.get(STATE_BACKEND.key(), STATE_BACKEND.defaultValue());
 
-        final String checkpointDir = pt.getRequired(STATE_BACKEND_CHECKPOINT_DIR.key());
-
-        if ("file".equalsIgnoreCase(stateBackend)) {
-            boolean asyncCheckpoints =
-                    pt.getBoolean(
-                            STATE_BACKEND_FILE_ASYNC.key(),
-                            STATE_BACKEND_FILE_ASYNC.defaultValue());
-
-            env.setStateBackend((StateBackend) new FsStateBackend(checkpointDir, asyncCheckpoints));
+        if ("hashmap".equalsIgnoreCase(stateBackend)) {
+            env.configure(new Configuration().set(StateBackendOptions.STATE_BACKEND, "hashmap"));
         } else if ("rocks".equalsIgnoreCase(stateBackend)) {
             boolean incrementalCheckpoints =
                     pt.getBoolean(
                             STATE_BACKEND_ROCKS_INCREMENTAL.key(),
                             STATE_BACKEND_ROCKS_INCREMENTAL.defaultValue());
 
-            env.setStateBackend(
-                    (StateBackend) new RocksDBStateBackend(checkpointDir, incrementalCheckpoints));
+            env.configure(
+                    new Configuration()
+                            .set(StateBackendOptions.STATE_BACKEND, "rocksdb")
+                            .set(
+                                    CheckpointingOptions.INCREMENTAL_CHECKPOINTS,
+                                    incrementalCheckpoints));
         } else {
             throw new IllegalArgumentException("Unknown backend requested: " + stateBackend);
         }
@@ -396,10 +430,9 @@ public class DataStreamAllroundTestJobFactory {
                         SEQUENCE_GENERATOR_SRC_SLEEP_AFTER_ELEMENTS.defaultValue()));
     }
 
-    static BoundedOutOfOrdernessTimestampExtractor<Event> createTimestampExtractor(
-            ParameterTool pt) {
+    static WatermarkStrategy<Event> createWatermarkStrategy(ParameterTool pt) {
         return new BoundedOutOfOrdernessTimestampExtractor<Event>(
-                Time.milliseconds(
+                Duration.ofMillis(
                         pt.getLong(
                                 SEQUENCE_GENERATOR_SRC_EVENT_TIME_MAX_OUT_OF_ORDERNESS.key(),
                                 SEQUENCE_GENERATOR_SRC_EVENT_TIME_MAX_OUT_OF_ORDERNESS
@@ -424,7 +457,7 @@ public class DataStreamAllroundTestJobFactory {
 
         return keyedStream.window(
                 TumblingEventTimeWindows.of(
-                        Time.milliseconds(
+                        Duration.ofMillis(
                                 pt.getLong(
                                                 TUMBLING_WINDOW_OPERATOR_NUM_EVENTS.key(),
                                                 TUMBLING_WINDOW_OPERATOR_NUM_EVENTS.defaultValue())
@@ -546,7 +579,7 @@ public class DataStreamAllroundTestJobFactory {
         long slideFactor = pt.getInt(TEST_SLIDE_FACTOR.key(), TEST_SLIDE_FACTOR.defaultValue());
 
         return SlidingEventTimeWindows.of(
-                Time.milliseconds(slideSize * slideFactor), Time.milliseconds(slideSize));
+                Duration.ofMillis(slideSize * slideFactor), Duration.ofMillis(slideSize));
     }
 
     static FlatMapFunction<Tuple2<Integer, List<Event>>, String> createSlidingWindowCheckMapper(

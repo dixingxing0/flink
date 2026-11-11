@@ -18,12 +18,17 @@
 
 package org.apache.flink.client.program;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.ProgramDescription;
 import org.apache.flink.client.ClientUtils;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.core.security.FlinkSecurityManager;
 import org.apache.flink.runtime.jobgraph.SavepointRestoreSettings;
 import org.apache.flink.util.InstantiationUtil;
 import org.apache.flink.util.JarUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
@@ -39,6 +44,8 @@ import java.lang.reflect.Modifier;
 import java.net.MalformedURLException;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -57,7 +64,9 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * This class encapsulates represents a program, packaged in a jar file. It supplies functionality
  * to extract nested libraries, search for the program entry point, and extract a program plan.
  */
-public class PackagedProgram {
+public class PackagedProgram implements AutoCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(PackagedProgram.class);
 
     /**
      * Property name of the entry in JAR manifest file that describes the Flink specific entry
@@ -83,12 +92,15 @@ public class PackagedProgram {
 
     private final List<URL> classpaths;
 
-    private final ClassLoader userCodeClassLoader;
+    private final URLClassLoader userCodeClassLoader;
 
     private final SavepointRestoreSettings savepointSettings;
 
     /** Flag indicating whether the job is a Python job. */
     private final boolean isPython;
+
+    /** Serializable descriptor to reconstruct the PackagedProgram. */
+    private final PackagedProgramDescriptor descriptor;
 
     /**
      * Creates an instance that wraps the plan defined in the jar file using the given arguments.
@@ -155,6 +167,19 @@ public class PackagedProgram {
             throw new ProgramInvocationException(
                     "The given program class does not have a main(String[]) method.");
         }
+
+        this.descriptor =
+                new PackagedProgramDescriptor(
+                        jarFile,
+                        classpaths,
+                        configuration,
+                        savepointRestoreSettings,
+                        args,
+                        getMainClassName());
+    }
+
+    public PackagedProgramDescriptor getDescriptor() {
+        return descriptor;
     }
 
     public SavepointRestoreSettings getSavepointSettings() {
@@ -210,7 +235,12 @@ public class PackagedProgram {
      * local execution by default.
      */
     public void invokeInteractiveModeForExecution() throws ProgramInvocationException {
-        callMainMethod(mainClass, args);
+        FlinkSecurityManager.monitorUserSystemExitForCurrentThread();
+        try {
+            callMainMethod(mainClass, args);
+        } finally {
+            FlinkSecurityManager.unmonitorUserSystemExitForCurrentThread();
+        }
     }
 
     /**
@@ -233,7 +263,12 @@ public class PackagedProgram {
 
     /** Returns all provided libraries needed to run the program. */
     public List<URL> getJobJarAndDependencies() {
-        List<URL> libs = new ArrayList<URL>(extractedTempLibraries.size() + 1);
+        return getJobJarAndDependencies(jarFile, extractedTempLibraries, isPython);
+    }
+
+    private static List<URL> getJobJarAndDependencies(
+            URL jarFile, List<File> extractedTempLibraries, boolean isPython) {
+        List<URL> libs = new ArrayList<>(extractedTempLibraries.size() + 2);
 
         if (jarFile != null) {
             libs.add(jarFile);
@@ -245,11 +280,9 @@ public class PackagedProgram {
                 throw new RuntimeException("URL is invalid. This should not happen.", e);
             }
         }
-
         if (isPython) {
             libs.add(PackagedProgramUtils.getPythonJar());
         }
-
         return libs;
     }
 
@@ -263,28 +296,12 @@ public class PackagedProgram {
                         ? Collections.emptyList()
                         : extractContainedLibraries(jarFileUrl);
 
-        List<URL> libs = new ArrayList<URL>(extractedTempLibraries.size() + 1);
-
-        if (jarFileUrl != null) {
-            libs.add(jarFileUrl);
-        }
-        for (File tmpLib : extractedTempLibraries) {
-            try {
-                libs.add(tmpLib.getAbsoluteFile().toURI().toURL());
-            } catch (MalformedURLException e) {
-                throw new RuntimeException("URL is invalid. This should not happen.", e);
-            }
-        }
-
-        if (isPython(entryPointClassName)) {
-            libs.add(PackagedProgramUtils.getPythonJar());
-        }
-
-        return libs;
+        return getJobJarAndDependencies(
+                jarFileUrl, extractedTempLibraries, isPython(entryPointClassName));
     }
 
     /** Deletes all temporary files created for contained packaged libraries. */
-    public void deleteExtractedLibraries() {
+    private void deleteExtractedLibraries() {
         deleteExtractedLibraries(this.extractedTempLibraries);
         this.extractedTempLibraries.clear();
     }
@@ -568,7 +585,8 @@ public class PackagedProgram {
     private static File createTempFile(Random rnd, JarEntry entry, String name)
             throws ProgramInvocationException {
         try {
-            final File tempFile = File.createTempFile(rnd.nextInt(Integer.MAX_VALUE) + "_", name);
+            final File tempFile =
+                    Files.createTempFile(rnd.nextInt(Integer.MAX_VALUE) + "_", name).toFile();
             tempFile.deleteOnExit();
             return tempFile;
         } catch (IOException e) {
@@ -608,6 +626,20 @@ public class PackagedProgram {
                     "Cannot access jar file"
                             + (t.getMessage() == null ? "." : ": " + t.getMessage()),
                     t);
+        }
+    }
+
+    @Override
+    public void close() {
+        try {
+            userCodeClassLoader.close();
+        } catch (IOException e) {
+            LOG.debug("Error while closing user-code classloader.", e);
+        }
+        try {
+            deleteExtractedLibraries();
+        } catch (Exception e) {
+            LOG.debug("Error while deleting jars extracted from user-jar.", e);
         }
     }
 
@@ -655,6 +687,11 @@ public class PackagedProgram {
                 SavepointRestoreSettings savepointRestoreSettings) {
             this.savepointRestoreSettings = savepointRestoreSettings;
             return this;
+        }
+
+        @VisibleForTesting
+        public List<URL> getUserClassPaths() {
+            return userClassPaths;
         }
 
         public PackagedProgram build() throws ProgramInvocationException {

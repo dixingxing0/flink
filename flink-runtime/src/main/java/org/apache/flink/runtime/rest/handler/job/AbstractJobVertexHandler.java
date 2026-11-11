@@ -18,7 +18,6 @@
 
 package org.apache.flink.runtime.rest.handler.job;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.executiongraph.AccessExecutionGraph;
 import org.apache.flink.runtime.executiongraph.AccessExecutionJobVertex;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
@@ -36,6 +35,7 @@ import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 
 import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.HttpResponseStatus;
 
+import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.Executor;
 
@@ -49,7 +49,7 @@ import java.util.concurrent.Executor;
  */
 public abstract class AbstractJobVertexHandler<
                 R extends ResponseBody, M extends JobVertexMessageParameters>
-        extends AbstractExecutionGraphHandler<R, M> {
+        extends AbstractAccessExecutionGraphHandler<R, M> {
 
     /**
      * Instantiates a new Abstract job vertex handler.
@@ -63,7 +63,7 @@ public abstract class AbstractJobVertexHandler<
      */
     protected AbstractJobVertexHandler(
             GatewayRetriever<? extends RestfulGateway> leaderRetriever,
-            Time timeout,
+            Duration timeout,
             Map<String, String> responseHeaders,
             MessageHeaders<EmptyRequestBody, R, M> messageHeaders,
             ExecutionGraphCache executionGraphCache,
@@ -80,7 +80,7 @@ public abstract class AbstractJobVertexHandler<
 
     @Override
     protected R handleRequest(
-            HandlerRequest<EmptyRequestBody, M> request, AccessExecutionGraph executionGraph)
+            HandlerRequest<EmptyRequestBody> request, AccessExecutionGraph executionGraph)
             throws RestHandlerException {
 
         final JobVertexID jobVertexID = request.getPathParameter(JobVertexIdPathParameter.class);
@@ -105,6 +105,6 @@ public abstract class AbstractJobVertexHandler<
      * @throws RestHandlerException if the handler could not process the request
      */
     protected abstract R handleRequest(
-            HandlerRequest<EmptyRequestBody, M> request, AccessExecutionJobVertex jobVertex)
+            HandlerRequest<EmptyRequestBody> request, AccessExecutionJobVertex jobVertex)
             throws RestHandlerException;
 }

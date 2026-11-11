@@ -18,14 +18,24 @@
 
 package org.apache.flink.table.api;
 
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.descriptors.DescriptorProperties;
-import org.apache.flink.table.factories.TableFactory;
+import org.apache.flink.table.legacy.factories.TableFactory;
 
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-/** Exception for finding more than one {@link TableFactory} for the given properties. */
+/**
+ * Exception for finding more than one {@link TableFactory} for the given properties.
+ *
+ * @deprecated This exception is considered internal and has been erroneously placed in the *.api
+ *     package. It is replaced by {@link
+ *     org.apache.flink.table.factories.AmbiguousTableFactoryException} and should not be used
+ *     directly anymore.
+ */
+@Internal
+@Deprecated
 public class AmbiguousTableFactoryException extends RuntimeException {
 
     // factories that match the properties

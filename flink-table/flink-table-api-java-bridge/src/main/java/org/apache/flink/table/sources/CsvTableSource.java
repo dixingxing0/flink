@@ -18,21 +18,24 @@
 
 package org.apache.flink.table.sources;
 
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.java.DataSet;
-import org.apache.flink.api.java.ExecutionEnvironment;
-import org.apache.flink.api.java.io.CsvInputFormat;
-import org.apache.flink.api.java.io.RowCsvInputFormat;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.core.fs.FileInputSplit;
 import org.apache.flink.core.fs.Path;
+import org.apache.flink.legacy.table.sources.InputFormatTableSource;
+import org.apache.flink.legacy.table.sources.StreamTableSource;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.api.DataTypes;
-import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.functions.AsyncTableFunction;
 import org.apache.flink.table.functions.FunctionContext;
 import org.apache.flink.table.functions.TableFunction;
+import org.apache.flink.table.legacy.api.TableSchema;
+import org.apache.flink.table.legacy.sources.LookupableTableSource;
+import org.apache.flink.table.legacy.sources.ProjectableTableSource;
+import org.apache.flink.table.sources.format.CsvInputFormat;
+import org.apache.flink.table.sources.format.RowCsvInputFormat;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.utils.TypeConversions;
 import org.apache.flink.types.Row;
@@ -53,14 +56,15 @@ import java.util.stream.IntStream;
 import static org.apache.flink.table.types.utils.TypeConversions.fromDataTypeToLegacyInfo;
 
 /**
- * A {@link StreamTableSource} and {@link BatchTableSource} for simple CSV files with a (logically)
- * unlimited number of fields.
+ * A {@link StreamTableSource} for simple CSV files with a (logically) unlimited number of fields.
+ *
+ * @deprecated The legacy CSV connector has been replaced by {@code FileSource}. It is kept only to
+ *     support tests for the legacy connector stack.
  */
+@Internal
+@Deprecated
 public class CsvTableSource
-        implements StreamTableSource<Row>,
-                BatchTableSource<Row>,
-                LookupableTableSource<Row>,
-                ProjectableTableSource<Row> {
+        implements StreamTableSource<Row>, LookupableTableSource<Row>, ProjectableTableSource<Row> {
 
     private final CsvInputFormatConfig config;
 
@@ -224,12 +228,6 @@ public class CsvTableSource
     }
 
     @Override
-    public DataSet<Row> getDataSet(ExecutionEnvironment execEnv) {
-        return execEnv.createInput(config.createInputFormat(), getProducedTypeInformation())
-                .name(explainSource());
-    }
-
-    @Override
     public TableFunction<Row> getLookupFunction(String[] lookupKeys) {
         return new CsvLookupFunction(config, lookupKeys);
     }
@@ -268,6 +266,7 @@ public class CsvTableSource
     }
 
     /** A builder for creating CsvTableSource instances. */
+    @Internal
     public static class Builder {
         private LinkedHashMap<String, DataType> schema = new LinkedHashMap<>();
         private Character quoteCharacter;
@@ -430,6 +429,7 @@ public class CsvTableSource
     // ------------------------------------------------------------------------------------
 
     /** LookupFunction to support lookup in CsvTableSource. */
+    @Internal
     public static class CsvLookupFunction extends TableFunction<Row> {
         private static final long serialVersionUID = 1L;
 

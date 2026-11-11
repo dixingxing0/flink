@@ -19,22 +19,25 @@
 package org.apache.flink.connector.file.src;
 
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.api.connector.source.DynamicParallelismInference;
 import org.apache.flink.connector.file.src.assigners.FileSplitAssigner;
 import org.apache.flink.connector.file.src.assigners.LocalityAwareSplitAssigner;
 import org.apache.flink.connector.file.src.enumerate.BlockSplittingRecursiveEnumerator;
 import org.apache.flink.connector.file.src.enumerate.FileEnumerator;
-import org.apache.flink.connector.file.src.impl.FileRecordFormatAdapter;
+import org.apache.flink.connector.file.src.enumerate.NonSplittingRecursiveEnumerator;
 import org.apache.flink.connector.file.src.impl.StreamFormatAdapter;
 import org.apache.flink.connector.file.src.reader.BulkFormat;
-import org.apache.flink.connector.file.src.reader.FileRecordFormat;
 import org.apache.flink.connector.file.src.reader.StreamFormat;
 import org.apache.flink.core.fs.FileSystem;
 import org.apache.flink.core.fs.Path;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
+import org.apache.flink.util.FlinkRuntimeException;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
 import java.time.Duration;
+import java.util.Collection;
 
 import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
@@ -50,7 +53,6 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * <ul>
  *   <li>{@link FileSource#forRecordStreamFormat(StreamFormat, Path...)}
  *   <li>{@link FileSource#forBulkFileFormat(BulkFormat, Path...)}
- *   <li>{@link FileSource#forRecordFileFormat(FileRecordFormat, Path...)}
  * </ul>
  *
  * <p>This creates a {@link FileSource.FileSourceBuilder} on which you can configure all the
@@ -81,8 +83,6 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  *   <li>A {@link BulkFormat} reads batches of records from a file at a time. It is the most "low
  *       level" format to implement, but offers the greatest flexibility to optimize the
  *       implementation.
- *   <li>A {@link FileRecordFormat} is in the middle of the trade-off spectrum between the {@code
- *       StreamFormat} and the {@code BulkFormat}.
  * </ul>
  *
  * <h2>Discovering / Enumerating Files</h2>
@@ -95,7 +95,8 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * @param <T> The type of the events/records produced by this source.
  */
 @PublicEvolving
-public final class FileSource<T> extends AbstractFileSource<T, FileSourceSplit> {
+public final class FileSource<T> extends AbstractFileSource<T, FileSourceSplit>
+        implements DynamicParallelismInference {
 
     private static final long serialVersionUID = 1L;
 
@@ -119,7 +120,7 @@ public final class FileSource<T> extends AbstractFileSource<T, FileSourceSplit> 
      * with '.' or '_').
      */
     public static final FileEnumerator.Provider DEFAULT_NON_SPLITTABLE_FILE_ENUMERATOR =
-            BlockSplittingRecursiveEnumerator::new;
+            NonSplittingRecursiveEnumerator::new;
 
     // ------------------------------------------------------------------------
 
@@ -143,6 +144,24 @@ public final class FileSource<T> extends AbstractFileSource<T, FileSourceSplit> 
         return FileSourceSplitSerializer.INSTANCE;
     }
 
+    @Override
+    public int inferParallelism(Context dynamicParallelismContext) {
+        FileEnumerator fileEnumerator = getEnumeratorFactory().create();
+
+        Collection<FileSourceSplit> splits;
+        try {
+            splits =
+                    fileEnumerator.enumerateSplits(
+                            inputPaths,
+                            dynamicParallelismContext.getParallelismInferenceUpperBound());
+        } catch (IOException e) {
+            throw new FlinkRuntimeException("Could not enumerate file splits", e);
+        }
+
+        return Math.min(
+                splits.size(), dynamicParallelismContext.getParallelismInferenceUpperBound());
+    }
+
     // ------------------------------------------------------------------------
     //  Entry-point Factory Methods
     // ------------------------------------------------------------------------
@@ -160,13 +179,8 @@ public final class FileSource<T> extends AbstractFileSource<T, FileSourceSplit> 
      * (GZip).
      */
     public static <T> FileSourceBuilder<T> forRecordStreamFormat(
-            final StreamFormat<T> reader, final Path... paths) {
-        checkNotNull(reader, "reader");
-        checkNotNull(paths, "paths");
-        checkArgument(paths.length > 0, "paths must not be empty");
-
-        final BulkFormat<T, FileSourceSplit> bulkFormat = new StreamFormatAdapter<>(reader);
-        return new FileSourceBuilder<>(paths, bulkFormat);
+            final StreamFormat<T> streamFormat, final Path... paths) {
+        return forBulkFileFormat(new StreamFormatAdapter<>(streamFormat), paths);
     }
 
     /**
@@ -176,28 +190,11 @@ public final class FileSource<T> extends AbstractFileSource<T, FileSourceSplit> 
      * <p>Examples for bulk readers are compressed and vectorized formats such as ORC or Parquet.
      */
     public static <T> FileSourceBuilder<T> forBulkFileFormat(
-            final BulkFormat<T, FileSourceSplit> reader, final Path... paths) {
-        checkNotNull(reader, "reader");
+            final BulkFormat<T, FileSourceSplit> bulkFormat, final Path... paths) {
+        checkNotNull(bulkFormat, "reader");
         checkNotNull(paths, "paths");
         checkArgument(paths.length > 0, "paths must not be empty");
 
-        return new FileSourceBuilder<>(paths, reader);
-    }
-
-    /**
-     * Builds a new {@code FileSource} using a {@link FileRecordFormat} to read record-by-record
-     * from a a file path.
-     *
-     * <p>A {@code FileRecordFormat} is more general than the {@link StreamFormat}, but also
-     * requires often more careful parametrization.
-     */
-    public static <T> FileSourceBuilder<T> forRecordFileFormat(
-            final FileRecordFormat<T> reader, final Path... paths) {
-        checkNotNull(reader, "reader");
-        checkNotNull(paths, "paths");
-        checkArgument(paths.length > 0, "paths must not be empty");
-
-        final BulkFormat<T, FileSourceSplit> bulkFormat = new FileRecordFormatAdapter<>(reader);
         return new FileSourceBuilder<>(paths, bulkFormat);
     }
 
@@ -213,7 +210,6 @@ public final class FileSource<T> extends AbstractFileSource<T, FileSourceSplit> 
      * <ul>
      *   <li>{@link FileSource#forRecordStreamFormat(StreamFormat, Path...)}
      *   <li>{@link FileSource#forBulkFileFormat(BulkFormat, Path...)}
-     *   <li>{@link FileSource#forRecordFileFormat(FileRecordFormat, Path...)}
      * </ul>
      */
     public static final class FileSourceBuilder<T>

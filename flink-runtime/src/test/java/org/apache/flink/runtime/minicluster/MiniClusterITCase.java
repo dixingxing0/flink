@@ -18,19 +18,20 @@
 
 package org.apache.flink.runtime.minicluster;
 
-import org.apache.flink.api.common.ExecutionConfig;
-import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobSubmissionResult;
-import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
-import org.apache.flink.configuration.RestOptions;
+import org.apache.flink.configuration.ResourceManagerOptions;
+import org.apache.flink.core.testutils.FlinkAssertions;
+import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.runtime.client.JobExecutionException;
+import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
 import org.apache.flink.runtime.jobgraph.DistributionPattern;
 import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobgraph.JobGraphTestUtils;
 import org.apache.flink.runtime.jobgraph.JobVertex;
-import org.apache.flink.runtime.jobgraph.ScheduleMode;
+import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
 import org.apache.flink.runtime.jobmanager.Tasks.AgnosticBinaryReceiver;
 import org.apache.flink.runtime.jobmanager.Tasks.AgnosticReceiver;
 import org.apache.flink.runtime.jobmanager.Tasks.AgnosticTertiaryReceiver;
@@ -43,39 +44,42 @@ import org.apache.flink.runtime.jobmanager.scheduler.SlotSharingGroup;
 import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.jobmaster.TestingAbstractInvokables.Receiver;
 import org.apache.flink.runtime.jobmaster.TestingAbstractInvokables.Sender;
+import org.apache.flink.runtime.metrics.groups.AbstractMetricGroup;
 import org.apache.flink.runtime.testtasks.BlockingNoOpInvokable;
 import org.apache.flink.runtime.testtasks.NoOpInvokable;
 import org.apache.flink.runtime.testtasks.WaitingNoOpInvokable;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.streaming.util.RestartStrategyUtils;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import static org.apache.flink.util.ExceptionUtils.findThrowable;
-import static org.apache.flink.util.ExceptionUtils.findThrowableWithMessage;
-import static org.hamcrest.core.StringStartsWith.startsWith;
-import static org.junit.Assert.assertThat;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.apache.flink.runtime.util.JobVertexConnectionUtils.connectNewDataSetAsInput;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Integration test cases for the {@link MiniCluster}. */
-public class MiniClusterITCase extends TestLogger {
+class MiniClusterITCase {
 
     @Test
-    public void runJobWithSingleRpcService() throws Exception {
+    void runJobWithSingleRpcService() throws Exception {
         final int numOfTMs = 3;
         final int slotsPerTM = 7;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(numOfTMs)
                         .setNumSlotsPerTaskManager(slotsPerTM)
                         .setRpcServiceSharing(RpcServiceSharing.SHARED)
-                        .setConfiguration(getDefaultConfiguration())
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -86,16 +90,16 @@ public class MiniClusterITCase extends TestLogger {
     }
 
     @Test
-    public void runJobWithMultipleRpcServices() throws Exception {
+    void runJobWithMultipleRpcServices() throws Exception {
         final int numOfTMs = 3;
         final int slotsPerTM = 7;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(numOfTMs)
                         .setNumSlotsPerTaskManager(slotsPerTM)
                         .setRpcServiceSharing(RpcServiceSharing.DEDICATED)
-                        .setConfiguration(getDefaultConfiguration())
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -106,46 +110,74 @@ public class MiniClusterITCase extends TestLogger {
     }
 
     @Test
-    public void testHandleStreamingJobsWhenNotEnoughSlot() throws Exception {
-        try {
-            setupAndRunHandleJobsWhenNotEnoughSlots(ScheduleMode.EAGER);
-            fail("Job should fail.");
-        } catch (JobExecutionException e) {
-            assertTrue(findThrowableWithMessage(e, "Job execution failed.").isPresent());
-            assertTrue(findThrowable(e, NoResourceAvailableException.class).isPresent());
-        }
+    void testHandlingNotEnoughSlotsThroughTimeout() throws Exception {
+        final Configuration config = new Configuration();
+
+        // the slot timeout needs to be high enough to avoid causing TimeoutException
+        final Duration slotRequestTimeout = Duration.ofMillis(100);
+
+        // this triggers the failure for the default scheduler
+        config.set(JobManagerOptions.SLOT_REQUEST_TIMEOUT, slotRequestTimeout);
+        // this triggers the failure for the adaptive scheduler
+        config.set(
+                JobManagerOptions.SCHEDULER_SUBMISSION_RESOURCE_WAIT_TIMEOUT, slotRequestTimeout);
+
+        // we have to disable sending the slot-unavailable request to allow for the timeout to kick
+        // in
+        config.set(
+                ResourceManagerOptions.REQUIREMENTS_CHECK_DELAY, Duration.ofNanos(Long.MAX_VALUE));
+
+        tryRunningJobWithoutEnoughSlots(config);
     }
 
     @Test
-    public void testHandleBatchJobsWhenNotEnoughSlot() throws Exception {
-        try {
-            setupAndRunHandleJobsWhenNotEnoughSlots(ScheduleMode.LAZY_FROM_SOURCES);
-            fail("Job should fail.");
-        } catch (JobExecutionException e) {
-            assertTrue(findThrowableWithMessage(e, "Job execution failed.").isPresent());
-            assertTrue(findThrowable(e, NoResourceAvailableException.class).isPresent());
-        }
+    // The AdaptiveScheduler is supposed to work with the resources that are available.
+    // That is why there is no resource allocation abort request supported.
+    @Tag("org.apache.flink.testutils.junit.FailsWithAdaptiveScheduler")
+    void testHandlingNotEnoughSlotsThroughEarlyAbortRequest() throws Exception {
+        final Configuration config = new Configuration();
+
+        // the slot timeout needs to be high enough to avoid causing TimeoutException
+        final Duration slotRequestTimeout = Duration.ofNanos(Long.MAX_VALUE);
+
+        // this triggers the failure for the default scheduler
+        config.set(JobManagerOptions.SLOT_REQUEST_TIMEOUT, slotRequestTimeout);
+        // this triggers the failure for the adaptive scheduler
+        config.set(
+                JobManagerOptions.SCHEDULER_SUBMISSION_RESOURCE_WAIT_TIMEOUT, slotRequestTimeout);
+
+        // overwrite the default check delay to speed up the test execution
+        config.set(ResourceManagerOptions.REQUIREMENTS_CHECK_DELAY, Duration.ofMillis(20));
+
+        // cluster startup relies on SLOT_REQUEST_TIMEOUT as a fallback if the following parameter
+        // is not set which causes the test to take longer
+        config.set(
+                ResourceManagerOptions.STANDALONE_CLUSTER_STARTUP_PERIOD_TIME,
+                Duration.ofMillis(1L));
+
+        tryRunningJobWithoutEnoughSlots(config);
     }
 
-    private void setupAndRunHandleJobsWhenNotEnoughSlots(ScheduleMode scheduleMode)
+    private static void tryRunningJobWithoutEnoughSlots(Configuration configuration)
             throws Exception {
-        final JobVertex vertex = new JobVertex("Test Vertex");
-        vertex.setParallelism(2);
-        vertex.setMaxParallelism(2);
-        vertex.setInvokableClass(BlockingNoOpInvokable.class);
+        final JobVertex vertex1 = new JobVertex("Test Vertex1");
+        vertex1.setParallelism(1);
+        vertex1.setMaxParallelism(1);
+        vertex1.setInvokableClass(BlockingNoOpInvokable.class);
 
-        final JobGraph jobGraph = new JobGraph("Test Job", vertex);
-        jobGraph.setScheduleMode(scheduleMode);
+        final JobVertex vertex2 = new JobVertex("Test Vertex2");
+        vertex2.setParallelism(1);
+        vertex2.setMaxParallelism(1);
+        vertex2.setInvokableClass(BlockingNoOpInvokable.class);
 
-        runHandleJobsWhenNotEnoughSlots(jobGraph);
-    }
+        connectNewDataSetAsInput(
+                vertex2, vertex1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-    private void runHandleJobsWhenNotEnoughSlots(final JobGraph jobGraph) throws Exception {
-        final Configuration configuration = getDefaultConfiguration();
-        configuration.setLong(JobManagerOptions.SLOT_REQUEST_TIMEOUT, 100L);
+        final JobGraph jobGraph = JobGraphTestUtils.streamingJobGraph(vertex1, vertex2);
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
                         .setNumSlotsPerTaskManager(1)
                         .setConfiguration(configuration)
@@ -154,19 +186,72 @@ public class MiniClusterITCase extends TestLogger {
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
             miniCluster.start();
 
-            miniCluster.executeJobBlocking(jobGraph);
+            assertThatThrownBy(() -> miniCluster.executeJobBlocking(jobGraph))
+                    .isInstanceOf(JobExecutionException.class)
+                    .hasMessageContaining("Job execution failed")
+                    .extracting(Throwable::getCause)
+                    .extracting(FlinkAssertions::chainOfCauses, FlinkAssertions.STREAM_THROWABLE)
+                    .anySatisfy(
+                            cause ->
+                                    assertThat(cause)
+                                            .isInstanceOf(NoResourceAvailableException.class));
         }
     }
 
     @Test
-    public void testForwardJob() throws Exception {
+    void slowMetricTeardownStarvesTheNextJob() throws Exception {
+        final Configuration config = new Configuration();
+        final Duration timeout = Duration.ofSeconds(4);
+        config.set(JobManagerOptions.SLOT_REQUEST_TIMEOUT, timeout);
+        config.set(JobManagerOptions.SCHEDULER_SUBMISSION_RESOURCE_WAIT_TIMEOUT, timeout);
+        config.set(ResourceManagerOptions.REQUIREMENTS_CHECK_DELAY, Duration.ofMillis(20));
+        config.set(
+                ResourceManagerOptions.STANDALONE_CLUSTER_STARTUP_PERIOD_TIME,
+                Duration.ofMillis(1L));
+
+        final MiniClusterConfiguration cfg =
+                new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
+                        .setNumTaskManagers(1)
+                        .setNumSlotsPerTaskManager(1)
+                        .setConfiguration(config)
+                        .build();
+
+        // Job A grabs the single slot.
+        final JobVertex slow = new JobVertex("slow-metric-teardown");
+        slow.setParallelism(1);
+        slow.setInvokableClass(SlowMetricTeardownInvokable.class);
+        final JobGraph jobA = JobGraphTestUtils.streamingJobGraph(slow);
+
+        // Job B just needs the slot once A releases it.
+        final JobVertex worker = new JobVertex("worker");
+        worker.setParallelism(1);
+        worker.setInvokableClass(NoOpInvokable.class);
+        final JobGraph jobB = JobGraphTestUtils.streamingJobGraph(worker);
+
+        SlowMetricTeardownInvokable.slotHeld = new CountDownLatch(1);
+
+        try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
+            miniCluster.start();
+
+            miniCluster.submitJob(jobA).get();
+            // Wait until A holds the slot and is entering its teardown.
+            SlowMetricTeardownInvokable.slotHeld.await();
+
+            // Passes only if A releases its slot before the timeout.
+            assertThatCode(() -> miniCluster.executeJobBlocking(jobB)).doesNotThrowAnyException();
+        }
+    }
+
+    @Test
+    void testForwardJob() throws Exception {
         final int parallelism = 31;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
-                        .setNumSlotsPerTaskManager(parallelism)
-                        .setConfiguration(getDefaultConfiguration())
+                        .setNumSlotsPerTaskManager(2 * parallelism)
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -180,24 +265,24 @@ public class MiniClusterITCase extends TestLogger {
             receiver.setInvokableClass(Receiver.class);
             receiver.setParallelism(parallelism);
 
-            receiver.connectNewDataSetAsInput(
-                    sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    receiver, sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            final JobGraph jobGraph = new JobGraph("Pointwise Job", sender, receiver);
+            final JobGraph jobGraph = JobGraphTestUtils.streamingJobGraph(sender, receiver);
 
             miniCluster.executeJobBlocking(jobGraph);
         }
     }
 
     @Test
-    public void testBipartiteJob() throws Exception {
+    void testBipartiteJob() throws Exception {
         final int parallelism = 31;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
-                        .setNumSlotsPerTaskManager(parallelism)
-                        .setConfiguration(getDefaultConfiguration())
+                        .setNumSlotsPerTaskManager(2 * parallelism)
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -211,24 +296,24 @@ public class MiniClusterITCase extends TestLogger {
             receiver.setInvokableClass(AgnosticReceiver.class);
             receiver.setParallelism(parallelism);
 
-            receiver.connectNewDataSetAsInput(
-                    sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    receiver, sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            final JobGraph jobGraph = new JobGraph("Bipartite Job", sender, receiver);
+            final JobGraph jobGraph = JobGraphTestUtils.streamingJobGraph(sender, receiver);
 
             miniCluster.executeJobBlocking(jobGraph);
         }
     }
 
     @Test
-    public void testTwoInputJobFailingEdgeMismatch() throws Exception {
+    void testTwoInputJobFailingEdgeMismatch() throws Exception {
         final int parallelism = 1;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
                         .setNumSlotsPerTaskManager(6 * parallelism)
-                        .setConfiguration(getDefaultConfiguration())
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -246,33 +331,37 @@ public class MiniClusterITCase extends TestLogger {
             receiver.setInvokableClass(AgnosticTertiaryReceiver.class);
             receiver.setParallelism(3 * parallelism);
 
-            receiver.connectNewDataSetAsInput(
-                    sender1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            receiver.connectNewDataSetAsInput(
-                    sender2, DistributionPattern.ALL_TO_ALL, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    receiver,
+                    sender1,
+                    DistributionPattern.POINTWISE,
+                    ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    receiver,
+                    sender2,
+                    DistributionPattern.ALL_TO_ALL,
+                    ResultPartitionType.PIPELINED);
 
-            final JobGraph jobGraph = new JobGraph("Bipartite Job", sender1, receiver, sender2);
+            final JobGraph jobGraph =
+                    JobGraphTestUtils.streamingJobGraph(sender1, receiver, sender2);
 
-            try {
-                miniCluster.executeJobBlocking(jobGraph);
-
-                fail("Job should fail.");
-            } catch (JobExecutionException e) {
-                assertTrue(findThrowable(e, ArrayIndexOutOfBoundsException.class).isPresent());
-                assertTrue(findThrowableWithMessage(e, "2").isPresent());
-            }
+            assertThatThrownBy(() -> miniCluster.executeJobBlocking(jobGraph))
+                    .isInstanceOf(JobExecutionException.class)
+                    .hasRootCauseInstanceOf(ArrayIndexOutOfBoundsException.class)
+                    .rootCause()
+                    .hasMessageContaining("2");
         }
     }
 
     @Test
-    public void testTwoInputJob() throws Exception {
+    void testTwoInputJob() throws Exception {
         final int parallelism = 11;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
                         .setNumSlotsPerTaskManager(6 * parallelism)
-                        .setConfiguration(getDefaultConfiguration())
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -290,26 +379,33 @@ public class MiniClusterITCase extends TestLogger {
             receiver.setInvokableClass(AgnosticBinaryReceiver.class);
             receiver.setParallelism(3 * parallelism);
 
-            receiver.connectNewDataSetAsInput(
-                    sender1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            receiver.connectNewDataSetAsInput(
-                    sender2, DistributionPattern.ALL_TO_ALL, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    receiver,
+                    sender1,
+                    DistributionPattern.POINTWISE,
+                    ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    receiver,
+                    sender2,
+                    DistributionPattern.ALL_TO_ALL,
+                    ResultPartitionType.PIPELINED);
 
-            final JobGraph jobGraph = new JobGraph("Bipartite Job", sender1, receiver, sender2);
+            final JobGraph jobGraph =
+                    JobGraphTestUtils.streamingJobGraph(sender1, receiver, sender2);
 
             miniCluster.executeJobBlocking(jobGraph);
         }
     }
 
     @Test
-    public void testSchedulingAllAtOnce() throws Exception {
+    void testSchedulingAllAtOnce() throws Exception {
         final int parallelism = 11;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
                         .setNumSlotsPerTaskManager(parallelism)
-                        .setConfiguration(getDefaultConfiguration())
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -332,28 +428,33 @@ public class MiniClusterITCase extends TestLogger {
             forwarder.setSlotSharingGroup(sharingGroup);
             receiver.setSlotSharingGroup(sharingGroup);
 
-            forwarder.connectNewDataSetAsInput(
-                    sender, DistributionPattern.ALL_TO_ALL, ResultPartitionType.PIPELINED);
-            receiver.connectNewDataSetAsInput(
-                    forwarder, DistributionPattern.ALL_TO_ALL, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    forwarder,
+                    sender,
+                    DistributionPattern.ALL_TO_ALL,
+                    ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    receiver,
+                    forwarder,
+                    DistributionPattern.ALL_TO_ALL,
+                    ResultPartitionType.PIPELINED);
 
-            final JobGraph jobGraph = new JobGraph("Forwarding Job", sender, forwarder, receiver);
-
-            jobGraph.setScheduleMode(ScheduleMode.EAGER);
+            final JobGraph jobGraph =
+                    JobGraphTestUtils.streamingJobGraph(sender, forwarder, receiver);
 
             miniCluster.executeJobBlocking(jobGraph);
         }
     }
 
     @Test
-    public void testJobWithAFailingSenderVertex() throws Exception {
+    void testJobWithAFailingSenderVertex() throws Exception {
         final int parallelism = 11;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
-                        .setNumSlotsPerTaskManager(parallelism)
-                        .setConfiguration(getDefaultConfiguration())
+                        .setNumSlotsPerTaskManager(2 * parallelism)
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -367,31 +468,28 @@ public class MiniClusterITCase extends TestLogger {
             receiver.setInvokableClass(Receiver.class);
             receiver.setParallelism(parallelism);
 
-            receiver.connectNewDataSetAsInput(
-                    sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    receiver, sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            final JobGraph jobGraph = new JobGraph("Pointwise Job", sender, receiver);
+            final JobGraph jobGraph = JobGraphTestUtils.streamingJobGraph(sender, receiver);
 
-            try {
-                miniCluster.executeJobBlocking(jobGraph);
-
-                fail("Job should fail.");
-            } catch (JobExecutionException e) {
-                assertTrue(findThrowable(e, Exception.class).isPresent());
-                assertTrue(findThrowableWithMessage(e, "Test exception").isPresent());
-            }
+            assertThatThrownBy(() -> miniCluster.executeJobBlocking(jobGraph))
+                    .isInstanceOf(JobExecutionException.class)
+                    .hasRootCauseInstanceOf(Exception.class)
+                    .rootCause()
+                    .hasMessageContaining("Test exception");
         }
     }
 
     @Test
-    public void testJobWithAnOccasionallyFailingSenderVertex() throws Exception {
+    void testJobWithAnOccasionallyFailingSenderVertex() throws Exception {
         final int parallelism = 11;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
                         .setNumSlotsPerTaskManager(parallelism)
-                        .setConfiguration(getDefaultConfiguration())
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -415,31 +513,28 @@ public class MiniClusterITCase extends TestLogger {
             receiver.setParallelism(parallelism);
             receiver.setSlotSharingGroup(group);
 
-            receiver.connectNewDataSetAsInput(
-                    sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    receiver, sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            final JobGraph jobGraph = new JobGraph("Pointwise Job", sender, receiver);
+            final JobGraph jobGraph = JobGraphTestUtils.streamingJobGraph(sender, receiver);
 
-            try {
-                miniCluster.executeJobBlocking(jobGraph);
-
-                fail("Job should fail.");
-            } catch (JobExecutionException e) {
-                assertTrue(findThrowable(e, Exception.class).isPresent());
-                assertTrue(findThrowableWithMessage(e, "Test exception").isPresent());
-            }
+            assertThatThrownBy(() -> miniCluster.executeJobBlocking(jobGraph))
+                    .isInstanceOf(JobExecutionException.class)
+                    .hasRootCauseInstanceOf(Exception.class)
+                    .rootCause()
+                    .hasMessageContaining("Test exception");
         }
     }
 
     @Test
-    public void testJobWithAFailingReceiverVertex() throws Exception {
+    void testJobWithAFailingReceiverVertex() throws Exception {
         final int parallelism = 11;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
-                        .setNumSlotsPerTaskManager(parallelism)
-                        .setConfiguration(getDefaultConfiguration())
+                        .setNumSlotsPerTaskManager(2 * parallelism)
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -453,31 +548,28 @@ public class MiniClusterITCase extends TestLogger {
             receiver.setInvokableClass(ExceptionReceiver.class);
             receiver.setParallelism(parallelism);
 
-            receiver.connectNewDataSetAsInput(
-                    sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    receiver, sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            final JobGraph jobGraph = new JobGraph("Pointwise Job", sender, receiver);
+            final JobGraph jobGraph = JobGraphTestUtils.streamingJobGraph(sender, receiver);
 
-            try {
-                miniCluster.executeJobBlocking(jobGraph);
-
-                fail("Job should fail.");
-            } catch (JobExecutionException e) {
-                assertTrue(findThrowable(e, Exception.class).isPresent());
-                assertTrue(findThrowableWithMessage(e, "Test exception").isPresent());
-            }
+            assertThatThrownBy(() -> miniCluster.executeJobBlocking(jobGraph))
+                    .isInstanceOf(JobExecutionException.class)
+                    .hasRootCauseInstanceOf(Exception.class)
+                    .rootCause()
+                    .hasMessageContaining("Test exception");
         }
     }
 
     @Test
-    public void testJobWithAllVerticesFailingDuringInstantiation() throws Exception {
+    void testJobWithAllVerticesFailingDuringInstantiation() throws Exception {
         final int parallelism = 11;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
-                        .setNumSlotsPerTaskManager(parallelism)
-                        .setConfiguration(getDefaultConfiguration())
+                        .setNumSlotsPerTaskManager(2 * parallelism)
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -491,32 +583,28 @@ public class MiniClusterITCase extends TestLogger {
             receiver.setInvokableClass(Receiver.class);
             receiver.setParallelism(parallelism);
 
-            receiver.connectNewDataSetAsInput(
-                    sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    receiver, sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            final JobGraph jobGraph = new JobGraph("Pointwise Job", sender, receiver);
+            final JobGraph jobGraph = JobGraphTestUtils.streamingJobGraph(sender, receiver);
 
-            try {
-                miniCluster.executeJobBlocking(jobGraph);
-
-                fail("Job should fail.");
-            } catch (JobExecutionException e) {
-                assertTrue(findThrowable(e, Exception.class).isPresent());
-                assertTrue(
-                        findThrowableWithMessage(e, "Test exception in constructor").isPresent());
-            }
+            assertThatThrownBy(() -> miniCluster.executeJobBlocking(jobGraph))
+                    .isInstanceOf(JobExecutionException.class)
+                    .hasRootCauseInstanceOf(Exception.class)
+                    .rootCause()
+                    .hasMessageContaining("Test exception in constructor");
         }
     }
 
     @Test
-    public void testJobWithSomeVerticesFailingDuringInstantiation() throws Exception {
+    void testJobWithSomeVerticesFailingDuringInstantiation() throws Exception {
         final int parallelism = 11;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
                         .setNumSlotsPerTaskManager(parallelism)
-                        .setConfiguration(getDefaultConfiguration())
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -540,32 +628,28 @@ public class MiniClusterITCase extends TestLogger {
             receiver.setParallelism(parallelism);
             receiver.setSlotSharingGroup(group);
 
-            receiver.connectNewDataSetAsInput(
-                    sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    receiver, sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            final JobGraph jobGraph = new JobGraph("Pointwise Job", sender, receiver);
+            final JobGraph jobGraph = JobGraphTestUtils.streamingJobGraph(sender, receiver);
 
-            try {
-                miniCluster.executeJobBlocking(jobGraph);
-
-                fail("Job should fail.");
-            } catch (JobExecutionException e) {
-                assertTrue(findThrowable(e, Exception.class).isPresent());
-                assertTrue(
-                        findThrowableWithMessage(e, "Test exception in constructor").isPresent());
-            }
+            assertThatThrownBy(() -> miniCluster.executeJobBlocking(jobGraph))
+                    .isInstanceOf(JobExecutionException.class)
+                    .hasCauseInstanceOf(Exception.class)
+                    .rootCause()
+                    .hasMessageContaining("Test exception in constructor");
         }
     }
 
     @Test
-    public void testCallFinalizeOnMasterBeforeJobCompletes() throws Exception {
+    void testCallFinalizeOnMasterBeforeJobCompletes() throws Exception {
         final int parallelism = 11;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
-                        .setNumSlotsPerTaskManager(parallelism)
-                        .setConfiguration(getDefaultConfiguration())
+                        .setNumSlotsPerTaskManager(2 * parallelism)
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
@@ -575,15 +659,16 @@ public class MiniClusterITCase extends TestLogger {
             source.setInvokableClass(WaitingNoOpInvokable.class);
             source.setParallelism(parallelism);
 
+            WaitOnFinalizeJobVertex.resetFinalizedOnMaster();
+
             final WaitOnFinalizeJobVertex sink = new WaitOnFinalizeJobVertex("Sink", 20L);
             sink.setInvokableClass(NoOpInvokable.class);
             sink.setParallelism(parallelism);
 
-            sink.connectNewDataSetAsInput(
-                    source, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    sink, source, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            final JobGraph jobGraph =
-                    new JobGraph("SubtaskInFinalStateRaceCondition", source, sink);
+            final JobGraph jobGraph = JobGraphTestUtils.streamingJobGraph(source, sink);
 
             final CompletableFuture<JobSubmissionResult> submissionFuture =
                     miniCluster.submitJob(jobGraph);
@@ -595,37 +680,29 @@ public class MiniClusterITCase extends TestLogger {
 
             jobResultFuture.get().toJobExecutionResult(getClass().getClassLoader());
 
-            assertTrue(sink.finalizedOnMaster.get());
+            assertThat(WaitOnFinalizeJobVertex.finalizedOnMaster).isTrue();
         }
     }
 
     @Test
-    public void testOutOfMemoryErrorMessageEnrichmentInJobVertexFinalization() throws Exception {
+    void testOutOfMemoryErrorMessageEnrichmentInJobVertexFinalization() throws Exception {
         final int parallelism = 1;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
                         .setNumSlotsPerTaskManager(parallelism)
-                        .setConfiguration(getDefaultConfiguration())
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
             miniCluster.start();
 
-            final JobVertex failingJobVertex =
-                    new JobVertex("FailingInFinalization") {
-
-                        @Override
-                        public void finalizeOnMaster(ClassLoader loader) {
-                            throw new OutOfMemoryError("Java heap space");
-                        }
-                    };
+            final JobVertex failingJobVertex = new OutOfMemoryInFinalizationJobVertex();
             failingJobVertex.setInvokableClass(NoOpInvokable.class);
             failingJobVertex.setParallelism(parallelism);
 
-            final JobGraph jobGraph =
-                    new JobGraph("JobGraphWithFailingJobVertex", failingJobVertex);
+            final JobGraph jobGraph = JobGraphTestUtils.streamingJobGraph(failingJobVertex);
 
             final CompletableFuture<JobSubmissionResult> submissionFuture =
                     miniCluster.submitJob(jobGraph);
@@ -635,47 +712,38 @@ public class MiniClusterITCase extends TestLogger {
                             (JobSubmissionResult ignored) ->
                                     miniCluster.requestJobResult(jobGraph.getJobID()));
 
-            try {
-                jobResultFuture.get().toJobExecutionResult(getClass().getClassLoader());
-            } catch (JobExecutionException e) {
-                assertTrue(findThrowable(e, OutOfMemoryError.class).isPresent());
-                assertThat(
-                        findThrowable(e, OutOfMemoryError.class)
-                                .map(OutOfMemoryError::getMessage)
-                                .get(),
-                        startsWith(
-                                "Java heap space. A heap space-related out-of-memory error has occurred."));
-            }
+            assertThatThrownBy(
+                            () ->
+                                    jobResultFuture
+                                            .get()
+                                            .toJobExecutionResult(getClass().getClassLoader()))
+                    .isInstanceOf(JobExecutionException.class)
+                    .hasRootCauseInstanceOf(OutOfMemoryError.class)
+                    .rootCause()
+                    .hasMessageContaining(
+                            "Java heap space. A heap space-related out-of-memory error has occurred.");
         }
     }
 
     @Test
-    public void testOutOfMemoryErrorMessageEnrichmentInJobVertexInitialization() throws Exception {
+    void testOutOfMemoryErrorMessageEnrichmentInJobVertexInitialization() throws Exception {
         final int parallelism = 1;
 
         final MiniClusterConfiguration cfg =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setNumTaskManagers(1)
                         .setNumSlotsPerTaskManager(parallelism)
-                        .setConfiguration(getDefaultConfiguration())
                         .build();
 
         try (final MiniCluster miniCluster = new MiniCluster(cfg)) {
             miniCluster.start();
 
-            final JobVertex failingJobVertex =
-                    new JobVertex("FailingInFinalization") {
-
-                        @Override
-                        public void initializeOnMaster(ClassLoader loader) {
-                            throw new OutOfMemoryError("Java heap space");
-                        }
-                    };
+            final JobVertex failingJobVertex = new OutOfMemoryInInitializationVertex();
             failingJobVertex.setInvokableClass(NoOpInvokable.class);
             failingJobVertex.setParallelism(parallelism);
 
-            final JobGraph jobGraph =
-                    new JobGraph("JobGraphWithFailingJobVertex", failingJobVertex);
+            final JobGraph jobGraph = JobGraphTestUtils.streamingJobGraph(failingJobVertex);
 
             final CompletableFuture<JobSubmissionResult> submissionFuture =
                     miniCluster.submitJob(jobGraph);
@@ -685,17 +753,15 @@ public class MiniClusterITCase extends TestLogger {
                             (JobSubmissionResult ignored) ->
                                     miniCluster.requestJobResult(jobGraph.getJobID()));
 
-            try {
-                jobResultFuture.get();
-            } catch (ExecutionException e) {
-                assertTrue(findThrowable(e, OutOfMemoryError.class).isPresent());
-                assertThat(
-                        findThrowable(e, OutOfMemoryError.class)
-                                .map(OutOfMemoryError::getMessage)
-                                .get(),
-                        startsWith(
-                                "Java heap space. A heap space-related out-of-memory error has occurred."));
-            }
+            assertThatThrownBy(
+                            () ->
+                                    jobResultFuture
+                                            .get()
+                                            .toJobExecutionResult(getClass().getClassLoader()))
+                    .isInstanceOf(JobExecutionException.class)
+                    .hasRootCauseInstanceOf(OutOfMemoryError.class)
+                    .rootCause()
+                    .hasMessageContaining("Java heap space");
         }
     }
 
@@ -703,26 +769,15 @@ public class MiniClusterITCase extends TestLogger {
     //  Utilities
     // ------------------------------------------------------------------------
 
-    private Configuration getDefaultConfiguration() {
-        final Configuration configuration = new Configuration();
-        configuration.setString(RestOptions.BIND_PORT, "0");
-
-        return configuration;
-    }
-
     private static JobGraph getSimpleJob(int parallelism) throws IOException {
         final JobVertex task = new JobVertex("Test task");
         task.setParallelism(parallelism);
         task.setMaxParallelism(parallelism);
         task.setInvokableClass(NoOpInvokable.class);
 
-        final JobGraph jg = new JobGraph(new JobID(), "Test Job", task);
-        jg.setScheduleMode(ScheduleMode.EAGER);
+        final JobGraph jg = JobGraphTestUtils.streamingJobGraph(task);
 
-        final ExecutionConfig executionConfig = new ExecutionConfig();
-        executionConfig.setRestartStrategy(
-                RestartStrategies.fixedDelayRestart(Integer.MAX_VALUE, 1000));
-        jg.setExecutionConfig(executionConfig);
+        RestartStrategyUtils.configureFixedDelayRestartStrategy(jg, Integer.MAX_VALUE, 1000);
 
         return jg;
     }
@@ -731,7 +786,7 @@ public class MiniClusterITCase extends TestLogger {
 
         private static final long serialVersionUID = -1179547322468530299L;
 
-        private final AtomicBoolean finalizedOnMaster = new AtomicBoolean(false);
+        private static final AtomicBoolean finalizedOnMaster = new AtomicBoolean(false);
 
         private final long waitingTime;
 
@@ -742,9 +797,63 @@ public class MiniClusterITCase extends TestLogger {
         }
 
         @Override
-        public void finalizeOnMaster(ClassLoader loader) throws Exception {
+        public void finalizeOnMaster(FinalizeOnMasterContext context) throws Exception {
             Thread.sleep(waitingTime);
             finalizedOnMaster.set(true);
+        }
+
+        static void resetFinalizedOnMaster() {
+            finalizedOnMaster.set(false);
+        }
+    }
+
+    private static class OutOfMemoryInFinalizationJobVertex extends JobVertex {
+
+        private OutOfMemoryInFinalizationJobVertex() {
+            super("FailingInFinalization");
+        }
+
+        @Override
+        public void finalizeOnMaster(FinalizeOnMasterContext context) {
+            throw new OutOfMemoryError("Java heap space");
+        }
+    }
+
+    private static class OutOfMemoryInInitializationVertex extends JobVertex {
+
+        OutOfMemoryInInitializationVertex() {
+            super("FailingInInitialization");
+        }
+
+        @Override
+        public void initializeOnMaster(InitializeOnMasterContext context) {
+            throw new OutOfMemoryError("Java heap space");
+        }
+    }
+
+    public static class SlowMetricTeardownInvokable extends AbstractInvokable {
+
+        public static final int NUM_GROUPS = 50_000;
+
+        /** Counted down once the slot is held and the (slow) teardown is about to start. */
+        public static volatile CountDownLatch slotHeld = new CountDownLatch(1);
+
+        public SlowMetricTeardownInvokable(Environment environment) {
+            super(environment);
+        }
+
+        @Override
+        public void invoke() throws Exception {
+            final MetricGroup parent = getEnvironment().getMetricGroup().addGroup("splits");
+            final List<AbstractMetricGroup<?>> kids = new ArrayList<>(NUM_GROUPS);
+            for (int i = 0; i < NUM_GROUPS; i++) {
+                kids.add((AbstractMetricGroup<?>) parent.addGroup("s" + i));
+            }
+            slotHeld.countDown();
+            // per-split teardown: each close() -> parent.removeChildGroup.
+            for (AbstractMetricGroup<?> kid : kids) {
+                kid.close();
+            }
         }
     }
 }

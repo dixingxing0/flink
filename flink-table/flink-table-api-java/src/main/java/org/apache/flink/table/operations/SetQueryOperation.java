@@ -19,7 +19,8 @@
 package org.apache.flink.table.operations;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.table.catalog.ResolvedSchema;
+import org.apache.flink.table.expressions.SqlFactory;
 
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -38,19 +39,19 @@ public class SetQueryOperation implements QueryOperation {
 
     private final SetQueryOperationType type;
     private final boolean all;
-    private final TableSchema tableSchema;
+    private final ResolvedSchema resolvedSchema;
 
     public SetQueryOperation(
             QueryOperation leftOperation,
             QueryOperation rightOperation,
             SetQueryOperationType type,
             boolean all,
-            TableSchema tableSchema) {
+            ResolvedSchema resolvedSchema) {
         this.leftOperation = leftOperation;
         this.rightOperation = rightOperation;
         this.type = type;
         this.all = all;
-        this.tableSchema = tableSchema;
+        this.resolvedSchema = resolvedSchema;
     }
 
     /**
@@ -63,6 +64,7 @@ public class SetQueryOperation implements QueryOperation {
      *   <li><b>UNION</b> returns records from both relations as a single relation
      * </ul>
      */
+    @Internal
     public enum SetQueryOperationType {
         INTERSECT,
         MINUS,
@@ -70,8 +72,8 @@ public class SetQueryOperation implements QueryOperation {
     }
 
     @Override
-    public TableSchema getTableSchema() {
-        return tableSchema;
+    public ResolvedSchema getResolvedSchema() {
+        return resolvedSchema;
     }
 
     @Override
@@ -81,6 +83,21 @@ public class SetQueryOperation implements QueryOperation {
 
         return OperationUtils.formatWithChildren(
                 typeToString(), args, getChildren(), Operation::asSummaryString);
+    }
+
+    @Override
+    public String asSerializableString(SqlFactory sqlFactory) {
+        return String.format(
+                "SELECT %s FROM (%s\n) %s (%s\n)",
+                OperationUtils.formatSelectColumns(resolvedSchema, null),
+                OperationUtils.indent(leftOperation.asSerializableString(sqlFactory)),
+                asSerializableType(),
+                OperationUtils.indent(rightOperation.asSerializableString(sqlFactory)));
+    }
+
+    private String asSerializableType() {
+        final String keyword = type == SetQueryOperationType.MINUS ? "EXCEPT" : type.toString();
+        return all ? keyword + " ALL" : keyword;
     }
 
     private String typeToString() {

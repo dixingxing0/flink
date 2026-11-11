@@ -23,15 +23,18 @@ import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.jobmanager.slots.TaskManagerGateway;
 import org.apache.flink.runtime.jobmaster.SlotInfo;
+import org.apache.flink.runtime.scheduler.taskexecload.TaskExecutionLoad;
 import org.apache.flink.runtime.slots.ResourceRequirement;
 import org.apache.flink.runtime.taskexecutor.slot.SlotOffer;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
+import org.apache.flink.runtime.util.ResourceCounter;
 import org.apache.flink.util.function.QuadFunction;
 import org.apache.flink.util.function.TriFunction;
 
 import javax.annotation.Nullable;
 
 import java.util.Collection;
+import java.util.Map;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -55,7 +58,17 @@ final class TestingDeclarativeSlotPool implements DeclarativeSlotPool {
                     Collection<SlotOffer>>
             offerSlotsFunction;
 
-    private final Supplier<Collection<SlotInfoWithUtilization>> getFreeSlotsInformationSupplier;
+    private final QuadFunction<
+                    Collection<? extends SlotOffer>,
+                    TaskManagerLocation,
+                    TaskManagerGateway,
+                    Long,
+                    Collection<SlotOffer>>
+            registerSlotsFunction;
+
+    private final Supplier<Collection<PhysicalSlot>> getFreeSlotsInformationSupplier;
+
+    private final Supplier<FreeSlotTracker> getFreeSlotTrackerSupplier;
 
     private final Supplier<Collection<? extends SlotInfo>> getAllSlotsInformationSupplier;
 
@@ -70,7 +83,13 @@ final class TestingDeclarativeSlotPool implements DeclarativeSlotPool {
 
     private final Function<ResourceID, Boolean> containsSlotsFunction;
 
+    private final Function<AllocationID, Boolean> containsFreeSlotFunction;
+
     private final LongConsumer releaseIdleSlotsConsumer;
+
+    private final Consumer<ResourceCounter> setResourceRequirementsConsumer;
+
+    private final Supplier<Map<ResourceID, TaskExecutionLoad>> taskExecutionLoadMapSupplier;
 
     TestingDeclarativeSlotPool(
             Consumer<ResourceCounter> increaseResourceRequirementsByConsumer,
@@ -83,26 +102,47 @@ final class TestingDeclarativeSlotPool implements DeclarativeSlotPool {
                             Long,
                             Collection<SlotOffer>>
                     offerSlotsFunction,
-            Supplier<Collection<SlotInfoWithUtilization>> getFreeSlotsInformationSupplier,
+            QuadFunction<
+                            Collection<? extends SlotOffer>,
+                            TaskManagerLocation,
+                            TaskManagerGateway,
+                            Long,
+                            Collection<SlotOffer>>
+                    registerSlotsFunction,
+            Supplier<Collection<PhysicalSlot>> getFreeSlotsInformationSupplier,
+            Supplier<FreeSlotTracker> getFreeSlotTrackerSupplier,
             Supplier<Collection<? extends SlotInfo>> getAllSlotsInformationSupplier,
             BiFunction<ResourceID, Exception, ResourceCounter> releaseSlotsFunction,
             BiFunction<AllocationID, Exception, ResourceCounter> releaseSlotFunction,
             BiFunction<AllocationID, ResourceProfile, PhysicalSlot> reserveFreeSlotFunction,
             TriFunction<AllocationID, Throwable, Long, ResourceCounter> freeReservedSlotFunction,
             Function<ResourceID, Boolean> containsSlotsFunction,
-            LongConsumer releaseIdleSlotsConsumer) {
+            Function<AllocationID, Boolean> containsFreeSlotFunction,
+            LongConsumer releaseIdleSlotsConsumer,
+            Consumer<ResourceCounter> setResourceRequirementsConsumer,
+            Supplier<Map<ResourceID, TaskExecutionLoad>> taskExecutionLoadMapSupplier) {
         this.increaseResourceRequirementsByConsumer = increaseResourceRequirementsByConsumer;
         this.decreaseResourceRequirementsByConsumer = decreaseResourceRequirementsByConsumer;
         this.getResourceRequirementsSupplier = getResourceRequirementsSupplier;
         this.offerSlotsFunction = offerSlotsFunction;
+        this.registerSlotsFunction = registerSlotsFunction;
         this.getFreeSlotsInformationSupplier = getFreeSlotsInformationSupplier;
+        this.getFreeSlotTrackerSupplier = getFreeSlotTrackerSupplier;
         this.getAllSlotsInformationSupplier = getAllSlotsInformationSupplier;
         this.releaseSlotsFunction = releaseSlotsFunction;
         this.releaseSlotFunction = releaseSlotFunction;
         this.reserveFreeSlotFunction = reserveFreeSlotFunction;
         this.freeReservedSlotFunction = freeReservedSlotFunction;
         this.containsSlotsFunction = containsSlotsFunction;
+        this.containsFreeSlotFunction = containsFreeSlotFunction;
         this.releaseIdleSlotsConsumer = releaseIdleSlotsConsumer;
+        this.setResourceRequirementsConsumer = setResourceRequirementsConsumer;
+        this.taskExecutionLoadMapSupplier = taskExecutionLoadMapSupplier;
+    }
+
+    @Override
+    public boolean isResourceRequestStable() {
+        return true;
     }
 
     @Override
@@ -113,6 +153,11 @@ final class TestingDeclarativeSlotPool implements DeclarativeSlotPool {
     @Override
     public void decreaseResourceRequirementsBy(ResourceCounter decrement) {
         decreaseResourceRequirementsByConsumer.accept(decrement);
+    }
+
+    @Override
+    public void setResourceRequirements(ResourceCounter resourceRequirements) {
+        setResourceRequirementsConsumer.accept(resourceRequirements);
     }
 
     @Override
@@ -131,13 +176,28 @@ final class TestingDeclarativeSlotPool implements DeclarativeSlotPool {
     }
 
     @Override
-    public Collection<SlotInfoWithUtilization> getFreeSlotsInformation() {
-        return getFreeSlotsInformationSupplier.get();
+    public Collection<SlotOffer> registerSlots(
+            Collection<? extends SlotOffer> slots,
+            TaskManagerLocation taskManagerLocation,
+            TaskManagerGateway taskManagerGateway,
+            long currentTime) {
+        return registerSlotsFunction.apply(
+                slots, taskManagerLocation, taskManagerGateway, currentTime);
+    }
+
+    @Override
+    public FreeSlotTracker getFreeSlotTracker() {
+        return getFreeSlotTrackerSupplier.get();
     }
 
     @Override
     public Collection<? extends SlotInfo> getAllSlotsInformation() {
         return getAllSlotsInformationSupplier.get();
+    }
+
+    @Override
+    public boolean containsFreeSlot(AllocationID allocationId) {
+        return containsFreeSlotFunction.apply(allocationId);
     }
 
     @Override
@@ -174,6 +234,11 @@ final class TestingDeclarativeSlotPool implements DeclarativeSlotPool {
 
     @Override
     public void registerNewSlotsListener(NewSlotsListener listener) {
+        // noop
+    }
+
+    @Override
+    public void registerResourceRequestStableListener(ResourceRequestStableListener listener) {
         // noop
     }
 

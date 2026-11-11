@@ -18,6 +18,7 @@
 
 package org.apache.flink.formats.avro.registry.confluent.debezium;
 
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.serialization.SerializationSchema;
 import org.apache.flink.formats.avro.AvroRowDataSerializationSchema;
@@ -31,20 +32,29 @@ import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
 
+import org.apache.avro.Schema;
+import org.apache.avro.Schema.Parser;
+
+import javax.annotation.Nullable;
+
+import java.util.Map;
 import java.util.Objects;
 
 import static java.lang.String.format;
+import static org.apache.flink.formats.avro.registry.confluent.debezium.DebeziumAvroFormatFactory.validateSchemaString;
 import static org.apache.flink.table.types.utils.TypeConversions.fromLogicalToDataType;
 
 /**
  * Serialization schema from Flink Table/SQL internal data structure {@link RowData} to Debezium
  * Avro.
  */
+@Internal
 public class DebeziumAvroSerializationSchema implements SerializationSchema<RowData> {
     private static final long serialVersionUID = 1L;
 
     /** insert operation. */
     private static final StringData OP_INSERT = StringData.fromString("c");
+
     /** delete operation. */
     private static final StringData OP_DELETE = StringData.fromString("d");
 
@@ -54,16 +64,31 @@ public class DebeziumAvroSerializationSchema implements SerializationSchema<RowD
     private transient GenericRowData outputReuse;
 
     public DebeziumAvroSerializationSchema(
-            RowType rowType, String schemaRegistryUrl, String schemaRegistrySubject) {
+            RowType rowType,
+            String schemaRegistryUrl,
+            String schemaRegistrySubject,
+            @Nullable Map<String, ?> registryConfigs) {
+        this(rowType, schemaRegistryUrl, schemaRegistrySubject, null, registryConfigs);
+    }
+
+    public DebeziumAvroSerializationSchema(
+            RowType rowType,
+            String schemaRegistryUrl,
+            String schemaRegistrySubject,
+            @Nullable String schemaString,
+            @Nullable Map<String, ?> registryConfigs) {
         RowType debeziumAvroRowType = createDebeziumAvroRowType(fromLogicalToDataType(rowType));
+        validateSchemaString(schemaString, debeziumAvroRowType);
+        Schema schema =
+                schemaString == null
+                        ? AvroSchemaConverter.convertToSchema(debeziumAvroRowType)
+                        : new Parser().parse(schemaString);
 
         this.avroSerializer =
                 new AvroRowDataSerializationSchema(
                         debeziumAvroRowType,
                         ConfluentRegistryAvroSerializationSchema.forGeneric(
-                                schemaRegistrySubject,
-                                AvroSchemaConverter.convertToSchema(debeziumAvroRowType),
-                                schemaRegistryUrl),
+                                schemaRegistrySubject, schema, schemaRegistryUrl, registryConfigs),
                         RowDataToAvroConverters.createConverter(debeziumAvroRowType));
     }
 

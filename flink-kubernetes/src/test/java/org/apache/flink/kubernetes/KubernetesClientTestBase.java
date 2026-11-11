@@ -20,21 +20,44 @@ package org.apache.flink.kubernetes;
 
 import org.apache.flink.kubernetes.configuration.KubernetesConfigOptions;
 import org.apache.flink.kubernetes.kubeclient.decorators.ExternalServiceDecorator;
+import org.apache.flink.kubernetes.kubeclient.services.HeadlessClusterIPService;
 import org.apache.flink.kubernetes.utils.Constants;
+import org.apache.flink.util.Preconditions;
 
 import io.fabric8.kubernetes.api.model.ConfigMap;
 import io.fabric8.kubernetes.api.model.LoadBalancerIngress;
 import io.fabric8.kubernetes.api.model.LoadBalancerStatus;
+import io.fabric8.kubernetes.api.model.Node;
+import io.fabric8.kubernetes.api.model.NodeAddressBuilder;
+import io.fabric8.kubernetes.api.model.NodeBuilder;
+import io.fabric8.kubernetes.api.model.NodeListBuilder;
+import io.fabric8.kubernetes.api.model.NodeSpecBuilder;
+import io.fabric8.kubernetes.api.model.NodeStatusBuilder;
+import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.api.model.PodBuilder;
+import io.fabric8.kubernetes.api.model.PodList;
 import io.fabric8.kubernetes.api.model.Service;
 import io.fabric8.kubernetes.api.model.ServiceBuilder;
 import io.fabric8.kubernetes.api.model.ServicePort;
 import io.fabric8.kubernetes.api.model.ServicePortBuilder;
 import io.fabric8.kubernetes.api.model.ServiceStatus;
 import io.fabric8.kubernetes.api.model.ServiceStatusBuilder;
+import io.fabric8.kubernetes.api.model.WatchEvent;
+import io.fabric8.mockwebserver.dsl.DelayPathable;
+import io.fabric8.mockwebserver.dsl.HttpMethodable;
+import io.fabric8.mockwebserver.dsl.MockServerExpectation;
+import io.fabric8.mockwebserver.dsl.ReturnOrWebsocketable;
+import io.fabric8.mockwebserver.dsl.TimesOnceableOrHttpHeaderable;
+import org.apache.commons.lang3.StringUtils;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Base class for {@link KubernetesClusterDescriptorTest} and {@link
@@ -44,6 +67,41 @@ public class KubernetesClientTestBase extends KubernetesTestBase {
 
     protected static final int REST_PORT = 9021;
     protected static final int NODE_PORT = 31234;
+    protected static final Long EVENT_WAIT_PERIOD_MS = 10L;
+
+    protected void mockExpectedNodesFromServerSide(List<String> addresses) {
+        final List<Node> nodes = new ArrayList<>();
+        Collections.shuffle(addresses);
+        for (String address : addresses) {
+            final String[] parts = address.split(":");
+            Preconditions.checkState(
+                    parts.length == 3,
+                    "Address should be in format \"<type>:<ip>:<unschedulable>\".");
+            nodes.add(
+                    new NodeBuilder()
+                            .withSpec(
+                                    new NodeSpecBuilder()
+                                            .withUnschedulable(
+                                                    StringUtils.isBlank(parts[2])
+                                                            ? null
+                                                            : Boolean.parseBoolean(parts[2]))
+                                            .build())
+                            .withStatus(
+                                    new NodeStatusBuilder()
+                                            .withAddresses(
+                                                    new NodeAddressBuilder()
+                                                            .withType(parts[0])
+                                                            .withAddress(parts[1])
+                                                            .build())
+                                            .build())
+                            .build());
+        }
+        server.expect()
+                .get()
+                .withPath("/api/v1/nodes")
+                .andReturn(200, new NodeListBuilder().withItems(nodes).build())
+                .always();
+    }
 
     protected void mockExpectedServiceFromServerSide(Service expectedService) {
         final String serviceName = expectedService.getMetadata().getName();
@@ -53,14 +111,93 @@ public class KubernetesClientTestBase extends KubernetesTestBase {
     }
 
     protected void mockCreateConfigMapAlreadyExisting(ConfigMap configMap) {
-        final String path = String.format("/api/v1/namespaces/%s/configmaps", NAMESPACE);
+        final String path =
+                String.format(
+                        "/api/%s/namespaces/%s/configmaps",
+                        configMap.getApiVersion(), configMap.getMetadata().getNamespace());
         server.expect().post().withPath(path).andReturn(500, configMap).always();
     }
 
+    protected void mockGetConfigMapFailed(ConfigMap configMap) {
+        mockConfigMapRequest(configMap, HttpMethodable::get);
+    }
+
     protected void mockReplaceConfigMapFailed(ConfigMap configMap) {
-        final String name = configMap.getMetadata().getName();
-        final String path = String.format("/api/v1/namespaces/%s/configmaps/%s", NAMESPACE, name);
-        server.expect().put().withPath(path).andReturn(500, configMap).always();
+        mockConfigMapRequest(configMap, HttpMethodable::put);
+    }
+
+    private void mockConfigMapRequest(
+            ConfigMap configMap,
+            Function<
+                            MockServerExpectation,
+                            DelayPathable<
+                                    ReturnOrWebsocketable<TimesOnceableOrHttpHeaderable<Void>>>>
+                    methodTypeSetter) {
+        final String path =
+                String.format(
+                        "/api/%s/namespaces/%s/configmaps/%s",
+                        configMap.getApiVersion(),
+                        configMap.getMetadata().getNamespace(),
+                        configMap.getMetadata().getName());
+        methodTypeSetter.apply(server.expect()).withPath(path).andReturn(500, configMap).always();
+    }
+
+    protected void mockGetDeploymentWithError() {
+        final String path =
+                String.format(
+                        "/apis/apps/v1/namespaces/%s/deployments/%s",
+                        NAMESPACE, KubernetesTestBase.CLUSTER_ID);
+        server.expect().get().withPath(path).andReturn(500, "Expected error").always();
+    }
+
+    protected void mockPodEventWithLabels(
+            String namespace, String podName, String resourceVersion, Map<String, String> labels) {
+        final Pod pod =
+                new PodBuilder()
+                        .withNewMetadata()
+                        .withNamespace(namespace)
+                        .withName(podName)
+                        .withLabels(labels)
+                        .withResourceVersion("5668")
+                        .endMetadata()
+                        .build();
+        // mock four kinds of events.
+        String mockPath =
+                String.format(
+                        "/api/v1/namespaces/%s/pods?allowWatchBookmarks=true&labelSelector=%s&resourceVersion=%s&watch=true",
+                        namespace,
+                        labels.entrySet().stream()
+                                .map(entry -> entry.getKey() + "%3D" + entry.getValue())
+                                .collect(Collectors.joining("%2C")),
+                        resourceVersion);
+        server.expect()
+                .withPath(mockPath)
+                .andUpgradeToWebSocket()
+                .open()
+                .waitFor(EVENT_WAIT_PERIOD_MS)
+                .andEmit(new WatchEvent(pod, "ADDED"))
+                .waitFor(EVENT_WAIT_PERIOD_MS)
+                .andEmit(new WatchEvent(pod, "MODIFIED"))
+                .waitFor(EVENT_WAIT_PERIOD_MS)
+                .andEmit(new WatchEvent(pod, "DELETED"))
+                .done()
+                .once();
+    }
+
+    protected void mockWatchPodSuccessAfterFailTwoTimes(
+            String namespace, String resourceVersion, Map<String, String> labels) {
+        // mock four kinds of events.
+        String mockPath =
+                String.format(
+                        "/api/v1/namespaces/%s/pods?labelSelector=%s&resourceVersion=%s&allowWatchBookmarks=true&watch=true",
+                        namespace,
+                        labels.entrySet().stream()
+                                .map(entry -> entry.getKey() + "%3D" + entry.getValue())
+                                .collect(Collectors.joining("%2C")),
+                        resourceVersion);
+        server.expect().get().withPath(mockPath).andReturn(500, "Expected error").times(2);
+        server.expect().get().withPath(mockPath).andReturn(200, new PodList()).always();
+        server.expect().withPath(mockPath).andUpgradeToWebSocket().open().done().once();
     }
 
     protected Service buildExternalServiceWithLoadBalancer(
@@ -76,13 +213,19 @@ public class KubernetesClientTestBase extends KubernetesTestBase {
                         .withLoadBalancer(
                                 new LoadBalancerStatus(
                                         Collections.singletonList(
-                                                new LoadBalancerIngress(hostname, ip))))
+                                                new LoadBalancerIngress()
+                                                        .toBuilder()
+                                                                .withIp(ip)
+                                                                .withHostname(hostname)
+                                                                .addAllToPorts(new ArrayList<>())
+                                                                .build())))
                         .build();
 
         return buildExternalService(
                 KubernetesConfigOptions.ServiceExposedType.LoadBalancer,
                 servicePort,
-                serviceStatus);
+                serviceStatus,
+                false);
     }
 
     protected Service buildExternalServiceWithNodePort() {
@@ -100,7 +243,10 @@ public class KubernetesClientTestBase extends KubernetesTestBase {
                         .build();
 
         return buildExternalService(
-                KubernetesConfigOptions.ServiceExposedType.NodePort, servicePort, serviceStatus);
+                KubernetesConfigOptions.ServiceExposedType.NodePort,
+                servicePort,
+                serviceStatus,
+                false);
     }
 
     protected Service buildExternalServiceWithClusterIP() {
@@ -112,17 +258,31 @@ public class KubernetesClientTestBase extends KubernetesTestBase {
                         .build();
 
         return buildExternalService(
-                KubernetesConfigOptions.ServiceExposedType.ClusterIP, servicePort, null);
+                KubernetesConfigOptions.ServiceExposedType.ClusterIP, servicePort, null, false);
+    }
+
+    protected Service buildExternalServiceWithHeadlessClusterIP() {
+        final ServicePort servicePort =
+                new ServicePortBuilder()
+                        .withName(Constants.REST_PORT_NAME)
+                        .withPort(REST_PORT)
+                        .withNewTargetPort(REST_PORT)
+                        .build();
+
+        return buildExternalService(
+                KubernetesConfigOptions.ServiceExposedType.ClusterIP, servicePort, null, true);
     }
 
     private Service buildExternalService(
             KubernetesConfigOptions.ServiceExposedType serviceExposedType,
             ServicePort servicePort,
-            @Nullable ServiceStatus serviceStatus) {
+            @Nullable ServiceStatus serviceStatus,
+            boolean isHeadlessSvc) {
         final ServiceBuilder serviceBuilder =
                 new ServiceBuilder()
                         .editOrNewMetadata()
                         .withName(ExternalServiceDecorator.getExternalServiceName(CLUSTER_ID))
+                        .withNamespace(NAMESPACE)
                         .endMetadata()
                         .editOrNewSpec()
                         .withType(serviceExposedType.name())
@@ -134,6 +294,12 @@ public class KubernetesClientTestBase extends KubernetesTestBase {
             serviceBuilder.withStatus(serviceStatus);
         }
 
+        if (isHeadlessSvc) {
+            serviceBuilder
+                    .editOrNewSpec()
+                    .withClusterIP(HeadlessClusterIPService.HEADLESS_CLUSTER_IP)
+                    .endSpec();
+        }
         return serviceBuilder.build();
     }
 }

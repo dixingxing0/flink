@@ -20,10 +20,12 @@ package org.apache.flink.table.connector.source;
 
 import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.table.connector.ChangelogMode;
+import org.apache.flink.table.connector.source.abilities.SupportsAggregatePushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsFilterPushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsPartitionPushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsProjectionPushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsReadingMetadata;
+import org.apache.flink.table.connector.source.abilities.SupportsSourceWatermark;
 import org.apache.flink.table.connector.source.abilities.SupportsWatermarkPushDown;
 import org.apache.flink.types.RowKind;
 
@@ -48,7 +50,9 @@ import java.io.Serializable;
  *
  * <ul>
  *   <li>{@link SupportsWatermarkPushDown}
+ *   <li>{@link SupportsSourceWatermark}
  *   <li>{@link SupportsFilterPushDown}
+ *   <li>{@link SupportsAggregatePushDown}
  *   <li>{@link SupportsProjectionPushDown}
  *   <li>{@link SupportsPartitionPushDown}
  *   <li>{@link SupportsReadingMetadata}
@@ -81,8 +85,11 @@ public interface ScanTableSource extends DynamicTableSource {
      * <p>The given {@link ScanContext} offers utilities by the planner for creating runtime
      * implementation with minimal dependencies to internal data structures.
      *
-     * <p>See {@code org.apache.flink.table.connector.source.SourceFunctionProvider} in {@code
-     * flink-table-api-java-bridge}.
+     * <p>{@link SourceProvider} is the recommended core interface. {@code SourceFunctionProvider}
+     * in {@code flink-table-api-java-bridge} and {@link InputFormatProvider} are available for
+     * backwards compatibility.
+     *
+     * @see SourceProvider
      */
     ScanRuntimeProvider getScanRuntimeProvider(ScanContext runtimeProviderContext);
 
@@ -100,6 +107,7 @@ public interface ScanTableSource extends DynamicTableSource {
      * instances are {@link Serializable} and can be directly passed into the runtime implementation
      * class.
      */
+    @PublicEvolving
     interface ScanContext extends DynamicTableSource.Context {
         // may introduce scan specific methods in the future
     }
@@ -111,9 +119,11 @@ public interface ScanTableSource extends DynamicTableSource {
      * ScanRuntimeProvider} serves as the base interface. Concrete {@link ScanRuntimeProvider}
      * interfaces might be located in other Flink modules.
      *
-     * <p>See {@code org.apache.flink.table.connector.source.SourceFunctionProvider} in {@code
-     * flink-table-api-java-bridge}.
+     * <p>{@link SourceProvider} is the recommended core interface. {@code SourceFunctionProvider}
+     * in {@code flink-table-api-java-bridge} and {@link InputFormatProvider} are available for
+     * backwards compatibility.
      */
+    @PublicEvolving
     interface ScanRuntimeProvider {
 
         /** Returns whether the data is bounded or not. */

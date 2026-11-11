@@ -18,10 +18,10 @@
 
 package org.apache.flink.tests.util.cache;
 
+import org.apache.flink.test.parameters.ParameterProperty;
 import org.apache.flink.tests.util.AutoClosableProcess;
 import org.apache.flink.tests.util.CommandLineWrapper;
 import org.apache.flink.tests.util.TestUtils;
-import org.apache.flink.tests.util.parameters.ParameterProperty;
 import org.apache.flink.util.TimeUtils;
 
 import org.apache.commons.io.FileUtils;
@@ -128,7 +128,10 @@ abstract class AbstractDownloadCache implements DownloadCache {
             Files.createDirectories(scopedDownloadDir);
             log.info("Downloading {}.", url);
             AutoClosableProcess.create(
-                            CommandLineWrapper.wget(url).targetDir(scopedDownloadDir).build())
+                            CommandLineWrapper.wget(url)
+                                    .targetDir(scopedDownloadDir)
+                                    .timeoutSecs(downloadAttemptTimeout)
+                                    .build())
                     .runBlockingWithRetry(
                             downloadMaxRetries, downloadAttemptTimeout, downloadGlobalTimeout);
 

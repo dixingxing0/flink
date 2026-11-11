@@ -18,25 +18,25 @@
 ################################################################################
 
 if [[ $S3_SOURCED ]]; then
-  echo "Only source common_s3.sh or common_s3_minio.sh in the same test, previously sourced $S3_SOURCED" && exit 1
+  echo "Only source common_s3.sh or common_s3_seaweedfs.sh in the same test, previously sourced $S3_SOURCED" && exit 1
 fi
 export S3_SOURCED="common_s3.sh"
 
-if [[ -z "$IT_CASE_S3_BUCKET" ]]; then
+if [[ -z "${IT_CASE_S3_BUCKET:-}" ]]; then
     echo "Did not find AWS environment variables, NOT running the e2e test."
     exit 0
 else
     echo "Found AWS bucket $IT_CASE_S3_BUCKET, running the e2e test."
 fi
 
-if [[ -z "$IT_CASE_S3_ACCESS_KEY" ]]; then
+if [[ -z "${IT_CASE_S3_ACCESS_KEY:-}" ]]; then
     echo "Did not find AWS environment variables, NOT running the e2e test."
     exit 0
 else
     echo "Found AWS access key, running the e2e test."
 fi
 
-if [[ -z "$IT_CASE_S3_SECRET_KEY" ]]; then
+if [[ -z "${IT_CASE_S3_SECRET_KEY:-}" ]]; then
     echo "Did not find AWS environment variables, NOT running the e2e test."
     exit 0
 else

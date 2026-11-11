@@ -16,34 +16,62 @@
  * limitations under the License.
  */
 
-export interface TaskManagerListInterface {
-  taskmanagers: TaskmanagersItemInterface[];
+export interface TaskManagerList {
+  taskmanagers: TaskManagersItem[];
 }
 
-export interface TaskManagerDetailInterface {
+export interface TaskManagerDetail {
   id: string;
   path: string;
   dataPort: number;
   timeSinceLastHeartbeat: number;
   slotsNumber: number;
   freeSlots: number;
+  assignedTasks: number;
   hardware: Hardware;
   metrics: Metrics;
   memoryConfiguration: MemoryConfiguration;
+  blocked?: boolean;
+  freeResource: Resources;
+  totalResource: Resources;
+  allocatedSlots: AllocatedSlot[];
 }
 
-export interface TaskManagerLogInterface {
-  logs: { name: string; size: number }[];
+export interface AllocatedSlot {
+  jobId: string;
+  assignedTasks: number;
+  resource: Resources;
 }
 
-export interface TaskmanagersItemInterface {
+export interface Resources {
+  cpuCores: number;
+  taskHeapMemory: number;
+  taskOffHeapMemory: number;
+  managedMemory: number;
+  networkMemory: number;
+}
+
+export interface TaskManagerLogItem {
+  name: string;
+  size: number;
+  mtime: number;
+}
+
+export interface TaskManagerLogDetail {
+  data: string;
+  url: string;
+}
+
+export interface TaskManagersItem {
   id: string;
   path: string;
   dataPort: number;
   timeSinceLastHeartbeat: number;
   slotsNumber: number;
   freeSlots: number;
+  assignedTasks: number;
   hardware: Hardware;
+  blocked?: boolean;
 }
 
 interface Hardware {
@@ -66,8 +94,8 @@ interface Metrics {
   mappedCount: number;
   mappedUsed: number;
   mappedMax: number;
-  memorySegmentsAvailable: number;
-  memorySegmentsTotal: number;
+  nettyShuffleMemorySegmentsAvailable: number;
+  nettyShuffleMemorySegmentsTotal: number;
   garbageCollectors: GarbageCollectorsItem[];
 }
 
@@ -90,11 +118,11 @@ interface GarbageCollectorsItem {
   time: number;
 }
 
-export interface TaskManagerThreadDumpInterface {
-  threadInfos: TaskManagerThreadInfoInterface[];
+export interface TaskManagerThreadDump {
+  threadInfos: TaskManagerThreadInfo[];
 }
 
-interface TaskManagerThreadInfoInterface {
+interface TaskManagerThreadInfo {
   threadName: string;
   stringifiedThreadInfo: string;
 }

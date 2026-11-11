@@ -40,6 +40,7 @@ import java.util.Objects;
  */
 @PublicEvolving
 public final class VarBinaryType extends LogicalType {
+    private static final long serialVersionUID = 1L;
 
     public static final int EMPTY_LITERAL_LENGTH = 0;
 
@@ -48,6 +49,8 @@ public final class VarBinaryType extends LogicalType {
     public static final int MAX_LENGTH = Integer.MAX_VALUE;
 
     public static final int DEFAULT_LENGTH = 1;
+
+    public static final VarBinaryType BYTES_TYPE = new VarBinaryType(MAX_LENGTH);
 
     private static final String FORMAT = "VARBINARY(%d)";
 

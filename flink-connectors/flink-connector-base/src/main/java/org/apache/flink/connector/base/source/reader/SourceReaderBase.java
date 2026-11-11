@@ -18,17 +18,23 @@
 
 package org.apache.flink.connector.base.source.reader;
 
+import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.api.common.eventtime.Watermark;
 import org.apache.flink.api.connector.source.ReaderOutput;
 import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SourceOutput;
 import org.apache.flink.api.connector.source.SourceReader;
 import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.api.connector.source.SourceSplit;
+import org.apache.flink.api.connector.source.util.ratelimit.RateLimiter;
+import org.apache.flink.api.connector.source.util.ratelimit.RateLimiterStrategy;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.source.reader.fetcher.SplitFetcherManager;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitReader;
 import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
 import org.apache.flink.core.io.InputStatus;
+import org.apache.flink.metrics.Counter;
+import org.apache.flink.metrics.groups.OperatorIOMetricGroup;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,18 +42,27 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 import static org.apache.flink.util.Preconditions.checkState;
 
 /**
- * An abstract implementation of {@link SourceReader} which provides some sychronization between the
- * mail box main thread and the SourceReader internal threads. This class allows user to just
+ * An abstract implementation of {@link SourceReader} which provides some synchronization between
+ * the mail box main thread and the SourceReader internal threads. This class allows user to just
  * provide a {@link SplitReader} and snapshot the split state.
+ *
+ * <p>This implementation provides the following metrics out of the box:
+ *
+ * <ul>
+ *   <li>{@link OperatorIOMetricGroup#getNumRecordsInCounter()}
+ * </ul>
  *
  * @param <E> The rich element type that contains information for split state update or timestamp
  *     extraction.
@@ -55,6 +70,7 @@ import static org.apache.flink.util.Preconditions.checkState;
  * @param <SplitT> the immutable split type.
  * @param <SplitStateT> the mutable type of split state.
  */
+@PublicEvolving
 public abstract class SourceReaderBase<E, T, SplitT extends SourceSplit, SplitStateT>
         implements SourceReader<T, SplitT> {
     private static final Logger LOG = LoggerFactory.getLogger(SourceReaderBase.class);
@@ -77,6 +93,8 @@ public abstract class SourceReaderBase<E, T, SplitT extends SourceSplit, SplitSt
     /** The raw configurations that may be used by subclasses. */
     protected final Configuration config;
 
+    private final Counter numRecordsInCounter;
+
     /** The context of this source reader. */
     protected SourceReaderContext context;
 
@@ -89,13 +107,48 @@ public abstract class SourceReaderBase<E, T, SplitT extends SourceSplit, SplitSt
     /** Indicating whether the SourceReader will be assigned more splits or not. */
     private boolean noMoreSplitsAssignment;
 
+    @Nullable protected final RecordEvaluator<T> eofRecordEvaluator;
+
+    /** Indicating whether the SourceReader supports rate limiting or not. */
+    private final boolean rateLimitingEnabled;
+
+    /** The {@link RateLimiter} uses for rate limiting. */
+    @Nullable private final RateLimiter<SplitT> rateLimiter;
+
+    /** Future that tracks the result of acquiring permission from {@link #rateLimiter}. */
+    @Nullable private CompletableFuture<Void> rateLimitPermissionFuture;
+
+    /**
+     * The primary constructor for the source reader.
+     *
+     * <p>The reader will use a handover queue sized as configured via {@link
+     * SourceReaderOptions#ELEMENT_QUEUE_CAPACITY}.
+     */
     public SourceReaderBase(
-            FutureCompletingBlockingQueue<RecordsWithSplitIds<E>> elementsQueue,
             SplitFetcherManager<E, SplitT> splitFetcherManager,
             RecordEmitter<E, T, SplitStateT> recordEmitter,
             Configuration config,
             SourceReaderContext context) {
-        this.elementsQueue = elementsQueue;
+        this(splitFetcherManager, recordEmitter, null, config, context, null);
+    }
+
+    public SourceReaderBase(
+            SplitFetcherManager<E, SplitT> splitFetcherManager,
+            RecordEmitter<E, T, SplitStateT> recordEmitter,
+            @Nullable RecordEvaluator<T> eofRecordEvaluator,
+            Configuration config,
+            SourceReaderContext context) {
+        this(splitFetcherManager, recordEmitter, eofRecordEvaluator, config, context, null);
+    }
+
+    public SourceReaderBase(
+            SplitFetcherManager<E, SplitT> splitFetcherManager,
+            RecordEmitter<E, T, SplitStateT> recordEmitter,
+            @Nullable RecordEvaluator<T> eofRecordEvaluator,
+            Configuration config,
+            SourceReaderContext context,
+            @Nullable RateLimiterStrategy<SplitT> rateLimiterStrategy) {
+        this.elementsQueue = splitFetcherManager.getQueue();
         this.splitFetcherManager = splitFetcherManager;
         this.recordEmitter = recordEmitter;
         this.splitStates = new HashMap<>();
@@ -103,6 +156,18 @@ public abstract class SourceReaderBase<E, T, SplitT extends SourceSplit, SplitSt
         this.config = config;
         this.context = context;
         this.noMoreSplitsAssignment = false;
+        this.eofRecordEvaluator = eofRecordEvaluator;
+        this.rateLimitingEnabled = rateLimiterStrategy != null;
+        numRecordsInCounter = context.metricGroup().getIOMetricGroup().getNumRecordsInCounter();
+
+        rateLimiter =
+                rateLimitingEnabled
+                        ? rateLimiterStrategy.createRateLimiter(context.currentParallelism())
+                        : null;
+        LOG.info(
+                "Rate limiting of SourceReader is {}",
+                rateLimitingEnabled ? "enabled" : "disabled");
+        rateLimitPermissionFuture = CompletableFuture.completedFuture(null);
     }
 
     @Override
@@ -118,15 +183,66 @@ public abstract class SourceReaderBase<E, T, SplitT extends SourceSplit, SplitSt
                 return trace(finishedOrAvailableLater());
             }
         }
+        if (rateLimitingEnabled) {
+            return pollNextWithRateLimiting(recordsWithSplitId, output);
+        } else {
+            return pollNextWithoutRateLimiting(recordsWithSplitId, output);
+        }
+    }
 
-        // we need to loop here, because we may have to go across splits
+    private InputStatus pollNextWithoutRateLimiting(
+            RecordsWithSplitIds<E> recordsWithSplitId, ReaderOutput<T> output) throws Exception {
+        // we need to loop here, in case we may have to go across splits
         while (true) {
             // Process one record.
             final E record = recordsWithSplitId.nextRecordFromSplit();
             if (record != null) {
                 // emit the record.
+                numRecordsInCounter.inc(1);
                 recordEmitter.emitRecord(record, currentSplitOutput, currentSplitContext.state);
                 LOG.trace("Emitted record: {}", record);
+                // We always emit MORE_AVAILABLE here, even though we do not strictly know whether
+                // more is available. If nothing more is available, the next invocation will find
+                // this out and return the correct status.
+                // That means we emit the occasional 'false positive' for availability, but this
+                // saves us doing checks for every record. Ultimately, this is cheaper.
+                return trace(InputStatus.MORE_AVAILABLE);
+            } else if (!moveToNextSplit(recordsWithSplitId, output)) {
+                // The fetch is done and we just discovered that and have not emitted anything, yet.
+                // We need to move to the next fetch. As a shortcut, we call pollNext() here again,
+                // rather than emitting nothing and waiting for the caller to call us again.
+                return pollNext(output);
+            }
+        }
+    }
+
+    private InputStatus pollNextWithRateLimiting(
+            RecordsWithSplitIds<E> recordsWithSplitId, ReaderOutput<T> output) throws Exception {
+        // make sure we have a fetch we are working on, or move to the next
+        while (true) {
+            // Check if the previous record count reached the limit of rateLimiter.
+            if (!rateLimitPermissionFuture.isDone()) {
+                return trace(InputStatus.MORE_AVAILABLE);
+            }
+            // Process one record.
+            final E record = recordsWithSplitId.nextRecordFromSplit();
+            if (record != null) {
+                // emit the record.
+                numRecordsInCounter.inc(1);
+                recordEmitter.emitRecord(record, currentSplitOutput, currentSplitContext.state);
+                LOG.trace("Emitted record: {}", record);
+                RateLimitingSourceOutputWrapper<T> rateLimitingSourceOutputWrapper =
+                        (RateLimitingSourceOutputWrapper<T>) currentSplitOutput;
+                if (rateLimitingSourceOutputWrapper.getRecordsOfCurrentWindow() > 0) {
+                    // Acquire permit from rateLimiter.
+                    rateLimitPermissionFuture =
+                            rateLimiter
+                                    .acquire(
+                                            rateLimitingSourceOutputWrapper
+                                                    .getRecordsOfCurrentWindow())
+                                    .toCompletableFuture();
+                }
+                rateLimitingSourceOutputWrapper.resetWindowRecordCount();
 
                 // We always emit MORE_AVAILABLE here, even though we do not strictly know whether
                 // more is available. If nothing more is available, the next invocation will find
@@ -140,7 +256,6 @@ public abstract class SourceReaderBase<E, T, SplitT extends SourceSplit, SplitSt
                 // rather than emitting nothing and waiting for the caller to call us again.
                 return pollNext(output);
             }
-            // else fall through the loop
         }
     }
 
@@ -196,7 +311,28 @@ public abstract class SourceReaderBase<E, T, SplitT extends SourceSplit, SplitSt
 
         currentSplitContext = splitStates.get(nextSplitId);
         checkState(currentSplitContext != null, "Have records for a split that was not registered");
-        currentSplitOutput = currentSplitContext.getOrCreateSplitOutput(output);
+
+        Function<T, Boolean> eofRecordHandler = null;
+        if (eofRecordEvaluator != null) {
+            eofRecordHandler =
+                    record -> {
+                        if (!eofRecordEvaluator.isEndOfStream(record)) {
+                            return false;
+                        }
+                        SplitT split =
+                                toSplitType(currentSplitContext.splitId, currentSplitContext.state);
+                        splitFetcherManager.removeSplits(Collections.singletonList(split));
+                        return true;
+                    };
+        }
+        if (rateLimitingEnabled) {
+            rateLimiter.notifyAddingSplit(
+                    this.toSplitType(
+                            this.currentSplitContext.splitId, this.currentSplitContext.state));
+        }
+        currentSplitOutput =
+                currentSplitContext.getOrCreateSplitOutput(
+                        output, eofRecordHandler, rateLimitingEnabled);
         LOG.trace("Emitting records from fetch for split {}", nextSplitId);
         return true;
     }
@@ -213,6 +349,16 @@ public abstract class SourceReaderBase<E, T, SplitT extends SourceSplit, SplitSt
         List<SplitT> splits = new ArrayList<>();
         splitStates.forEach((id, context) -> splits.add(toSplitType(id, context.state)));
         return splits;
+    }
+
+    @Override
+    public void notifyCheckpointComplete(long checkpointId) throws Exception {
+        splitStates.forEach(
+                (id, context) -> {
+                    if (rateLimitingEnabled) {
+                        rateLimiter.notifyCheckpointComplete(checkpointId);
+                    }
+                });
     }
 
     @Override
@@ -240,6 +386,12 @@ public abstract class SourceReaderBase<E, T, SplitT extends SourceSplit, SplitSt
     }
 
     @Override
+    public void pauseOrResumeSplits(
+            Collection<String> splitsToPause, Collection<String> splitsToResume) {
+        splitFetcherManager.pauseOrResumeSplits(splitsToPause, splitsToResume);
+    }
+
+    @Override
     public void close() throws Exception {
         LOG.info("Closing Source Reader.");
         splitFetcherManager.close(options.sourceReaderCloseTimeout);
@@ -257,6 +409,7 @@ public abstract class SourceReaderBase<E, T, SplitT extends SourceSplit, SplitSt
     }
 
     // -------------------- Abstract method to allow different implementations ------------------
+
     /** Handles the finished splits to clean the state if needed. */
     protected abstract void onSplitFinished(Map<String, SplitStateT> finishedSplitIds);
 
@@ -300,18 +453,157 @@ public abstract class SourceReaderBase<E, T, SplitT extends SourceSplit, SplitSt
 
         final String splitId;
         final SplitStateT state;
-        SourceOutput<T> sourceOutput;
+        @Nullable SourceOutput<T> sourceOutput;
 
         private SplitContext(String splitId, SplitStateT state) {
             this.state = state;
             this.splitId = splitId;
         }
 
-        SourceOutput<T> getOrCreateSplitOutput(ReaderOutput<T> mainOutput) {
+        SourceOutput<T> getOrCreateSplitOutput(
+                ReaderOutput<T> mainOutput,
+                @Nullable Function<T, Boolean> eofRecordHandler,
+                boolean rateLimitingEnabled) {
             if (sourceOutput == null) {
+                // The split output should have been created when AddSplitsEvent was processed in
+                // SourceOperator. Here we just use this method to get the previously created
+                // output.
                 sourceOutput = mainOutput.createOutputForSplit(splitId);
+                if (eofRecordHandler != null) {
+                    sourceOutput = new SourceOutputWrapper<>(sourceOutput, eofRecordHandler);
+                }
+                if (rateLimitingEnabled) {
+                    sourceOutput = new RateLimitingSourceOutputWrapper<>(sourceOutput);
+                }
             }
             return sourceOutput;
+        }
+    }
+
+    /** This output will stop sending records after receiving the eof record. */
+    private static final class SourceOutputWrapper<T> implements SourceOutput<T> {
+        final SourceOutput<T> sourceOutput;
+        final Function<T, Boolean> eofRecordHandler;
+
+        private boolean isStreamEnd = false;
+
+        public SourceOutputWrapper(
+                SourceOutput<T> sourceOutput, Function<T, Boolean> eofRecordHandler) {
+            this.sourceOutput = sourceOutput;
+            this.eofRecordHandler = eofRecordHandler;
+        }
+
+        @Override
+        public void emitWatermark(Watermark watermark) {
+            sourceOutput.emitWatermark(watermark);
+        }
+
+        @Override
+        public void markIdle() {
+            sourceOutput.markIdle();
+        }
+
+        @Override
+        public void markActive() {
+            sourceOutput.markActive();
+        }
+
+        @Override
+        public void collect(T record) {
+            if (!isEndOfStreamReached(record)) {
+                sourceOutput.collect(record);
+            }
+        }
+
+        @Override
+        public void collect(T record, long timestamp) {
+            if (!isEndOfStreamReached(record)) {
+                sourceOutput.collect(record, timestamp);
+            }
+        }
+
+        /**
+         * Judge and handle the eof record.
+         *
+         * @return whether the record is the eof record.
+         */
+        private boolean isEndOfStreamReached(T record) {
+            if (isStreamEnd) {
+                return true;
+            }
+            if (eofRecordHandler.apply(record)) {
+                isStreamEnd = true;
+            }
+            return isStreamEnd;
+        }
+    }
+
+    /**
+     * A wrapper around {@link SourceOutput} that counts the number of records during the current
+     * rate-limiting window.
+     *
+     * <p>This wrapper is used when rate limiting is enabled to track how many records have been
+     * emitted since the last rate limit check, allowing the reader to properly apply backpressure
+     * when the rate limit is exceeded.
+     *
+     * @param <T> The type of records being emitted
+     */
+    private static final class RateLimitingSourceOutputWrapper<T> implements SourceOutput<T> {
+        /** The underlying source output to delegate to. */
+        final SourceOutput<T> sourceOutput;
+
+        /** Number of records handled during the current rate-limiting window. */
+        private int recordsOfCurrentWindow;
+
+        /**
+         * Creates a new RecordCountingSourceOutputWrapper.
+         *
+         * @param sourceOutput The underlying source output to wrap
+         */
+        public RateLimitingSourceOutputWrapper(SourceOutput<T> sourceOutput) {
+            this.sourceOutput = sourceOutput;
+            this.recordsOfCurrentWindow = 0;
+        }
+
+        @Override
+        public void emitWatermark(Watermark watermark) {
+            sourceOutput.emitWatermark(watermark);
+        }
+
+        @Override
+        public void markIdle() {
+            sourceOutput.markIdle();
+        }
+
+        @Override
+        public void markActive() {
+            sourceOutput.markActive();
+        }
+
+        @Override
+        public void collect(T record) {
+            sourceOutput.collect(record);
+            recordsOfCurrentWindow++;
+        }
+
+        @Override
+        public void collect(T record, long timestamp) {
+            sourceOutput.collect(record, timestamp);
+            recordsOfCurrentWindow++;
+        }
+
+        /**
+         * Gets the recordsOfCurrentWindow.
+         *
+         * @return the number of current window.
+         */
+        public int getRecordsOfCurrentWindow() {
+            return recordsOfCurrentWindow;
+        }
+
+        /** Resets the recordsOfCurrentWindow to 0. */
+        public void resetWindowRecordCount() {
+            recordsOfCurrentWindow = 0;
         }
     }
 }

@@ -18,16 +18,32 @@
 
 package org.apache.flink.api.connector.source;
 
+import org.apache.flink.annotation.Public;
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.api.common.JobInfo;
+import org.apache.flink.api.common.watermark.Watermark;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.groups.SourceReaderMetricGroup;
+import org.apache.flink.util.UserCodeClassLoader;
 
-/** The class that expose some context from runtime to the {@link SourceReader}. */
-@PublicEvolving
+/** The interface that exposes some context from runtime to the {@link SourceReader}. */
+@Public
 public interface SourceReaderContext {
 
-    /** @return The metric group this source belongs to. */
-    MetricGroup metricGroup();
+    /**
+     * Get the meta information of the current job.
+     *
+     * @return the job meta information.
+     */
+    @PublicEvolving
+    default JobInfo getJobInfo() {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * @return The metric group this source belongs to.
+     */
+    SourceReaderMetricGroup metricGroup();
 
     /** Gets the configuration with which Flink was started. */
     Configuration getConfiguration();
@@ -38,7 +54,9 @@ public interface SourceReaderContext {
      */
     String getLocalHostName();
 
-    /** @return The index of this subtask. */
+    /**
+     * @return The index of this subtask.
+     */
     int getIndexOfSubtask();
 
     /**
@@ -54,4 +72,30 @@ public interface SourceReaderContext {
      * @param sourceEvent the source event to coordinator.
      */
     void sendSourceEventToCoordinator(SourceEvent sourceEvent);
+
+    /**
+     * Gets the {@link UserCodeClassLoader} to load classes that are not in system's classpath, but
+     * are part of the jar file of a user job.
+     *
+     * @see UserCodeClassLoader
+     */
+    UserCodeClassLoader getUserCodeClassLoader();
+
+    /**
+     * Get the current parallelism of this Source.
+     *
+     * @return the parallelism of the Source.
+     */
+    default int currentParallelism() {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Send the watermark to source output.
+     *
+     * <p>This should only be used for datastream v2.
+     */
+    default void emitWatermark(Watermark watermark) {
+        throw new UnsupportedOperationException();
+    }
 }

@@ -34,22 +34,26 @@ class StreamExecutionEnvironmentCompletenessTests(PythonAPICompletenessTestCase,
     @classmethod
     def excluded_methods(cls):
         # Exclude these methods for the time being, because current
-        # ExecutionEnvironment/StreamExecutionEnvironment do not apply to the
-        # DataSet/DataStream API, but to the Table API configuration.
+        # StreamExecutionEnvironment do not apply to the
+        # DataStream API, but to the Table API configuration.
         # Currently only the methods for configuration is added.
         # 'isForceCheckpointing', 'getNumberOfExecutionRetries', 'setNumberOfExecutionRetries'
         # is deprecated, exclude them.
         return {'getLastJobExecutionResult', 'getId', 'getIdString',
-                'registerCachedFile', 'createCollectionsEnvironment', 'createLocalEnvironment',
-                'createRemoteEnvironment', 'addOperator', 'fromElements',
+                'createCollectionsEnvironment', 'createLocalEnvironment',
+                'createRemoteEnvironment', 'addOperator', 'fromElements', 'fromData',
                 'resetContextEnvironment', 'getCachedFiles', 'generateSequence',
                 'getNumberOfExecutionRetries', 'getStreamGraph', 'fromParallelCollection',
                 'readFileStream', 'isForceCheckpointing', 'readFile', 'clean',
                 'createInput', 'createLocalEnvironmentWithWebUI', 'fromCollection',
-                'socketTextStream', 'initializeContextEnvironment', 'readTextFile', 'addSource',
-                'setNumberOfExecutionRetries', 'configure', 'executeAsync', 'registerJobListener',
-                'clearJobListeners', 'getJobListeners', "fromSource", "fromSequence",
-                'setRuntimeMode'}
+                'socketTextStream', 'initializeContextEnvironment', 'readTextFile',
+                'setNumberOfExecutionRetries', 'executeAsync', 'registerJobListener',
+                'clearJobListeners', 'getJobListeners', 'fromSequence', 'getConfiguration',
+                'generateStreamGraph', 'getTransformations', 'areExplicitEnvironmentsAllowed',
+                'registerCollectIterator', 'listCompletedClusterDatasets',
+                'invalidateClusterDataset', 'registerCacheTransformation', 'close',
+                'registerType', 'registerTypeWithKryoSerializer', 'setStateBackend',
+                'getStateBackend', 'addDefaultKryoSerializer'}
 
 
 if __name__ == '__main__':

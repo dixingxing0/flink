@@ -18,61 +18,58 @@
 
 package org.apache.flink.runtime.taskexecutor;
 
+import org.apache.flink.configuration.ClusterOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.configuration.TaskManagerOptionsInternal;
 import org.apache.flink.core.plugin.PluginManager;
 import org.apache.flink.core.plugin.PluginUtils;
+import org.apache.flink.runtime.blob.BlobCacheService;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
-import org.apache.flink.runtime.testutils.SystemExitTrackingSecurityManager;
+import org.apache.flink.runtime.entrypoint.ClusterEntrypointUtils;
+import org.apache.flink.runtime.entrypoint.WorkingDirectory;
+import org.apache.flink.runtime.externalresource.ExternalResourceInfoProvider;
+import org.apache.flink.runtime.heartbeat.HeartbeatServices;
+import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
+import org.apache.flink.runtime.metrics.MetricRegistry;
+import org.apache.flink.runtime.rpc.FatalErrorHandler;
+import org.apache.flink.runtime.rpc.RpcService;
+import org.apache.flink.runtime.security.token.DelegationTokenReceiverRepository;
+import org.apache.flink.testutils.junit.utils.TempDirUtils;
 import org.apache.flink.util.FlinkException;
-import org.apache.flink.util.TestLogger;
 import org.apache.flink.util.TimeUtils;
 
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.Timeout;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import javax.annotation.Nonnull;
 
+import java.io.File;
 import java.net.InetAddress;
-import java.time.Duration;
+import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 
-import static org.apache.flink.core.testutils.FlinkMatchers.willNotComplete;
-import static org.hamcrest.Matchers.containsString;
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.notNullValue;
-import static org.junit.Assert.assertThat;
+import static org.apache.flink.core.testutils.FlinkAssertions.assertThatFuture;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for the {@link TaskManagerRunner}. */
-public class TaskManagerRunnerTest extends TestLogger {
+class TaskManagerRunnerTest {
 
-    @Rule public final Timeout timeout = Timeout.seconds(30);
+    @TempDir private Path temporaryFolder;
 
-    private SystemExitTrackingSecurityManager systemExitTrackingSecurityManager;
     private TaskManagerRunner taskManagerRunner;
 
-    @Before
-    public void before() {
-        systemExitTrackingSecurityManager = new SystemExitTrackingSecurityManager();
-        System.setSecurityManager(systemExitTrackingSecurityManager);
-    }
-
-    @After
-    public void after() throws Exception {
-        System.setSecurityManager(null);
+    @AfterEach
+    void after() throws Exception {
         if (taskManagerRunner != null) {
             taskManagerRunner.close();
         }
     }
 
     @Test
-    public void testShouldShutdownOnFatalError() throws Exception {
+    void testShouldShutdownOnFatalError() throws Exception {
         Configuration configuration = createConfiguration();
         // very high timeout, to ensure that we don't fail because of registration timeouts
         configuration.set(TaskManagerOptions.REGISTRATION_TIMEOUT, TimeUtils.parseDuration("42 h"));
@@ -80,85 +77,87 @@ public class TaskManagerRunnerTest extends TestLogger {
 
         taskManagerRunner.onFatalError(new RuntimeException());
 
-        Integer statusCode = systemExitTrackingSecurityManager.getSystemExitFuture().get();
-        assertThat(statusCode, is(equalTo(TaskManagerRunner.RUNTIME_FAILURE_RETURN_CODE)));
+        assertThatFuture(taskManagerRunner.getTerminationFuture())
+                .eventuallySucceeds()
+                .isEqualTo(TaskManagerRunner.Result.FAILURE);
     }
 
     @Test
-    public void testShouldShutdownIfRegistrationWithJobManagerFails() throws Exception {
+    void testShouldShutdownIfRegistrationWithJobManagerFails() throws Exception {
         Configuration configuration = createConfiguration();
         configuration.set(
                 TaskManagerOptions.REGISTRATION_TIMEOUT, TimeUtils.parseDuration("10 ms"));
         taskManagerRunner = createTaskManagerRunner(configuration);
 
-        Integer statusCode = systemExitTrackingSecurityManager.getSystemExitFuture().get();
-        assertThat(statusCode, is(equalTo(TaskManagerRunner.RUNTIME_FAILURE_RETURN_CODE)));
+        assertThatFuture(taskManagerRunner.getTerminationFuture())
+                .eventuallySucceeds()
+                .isEqualTo(TaskManagerRunner.Result.FAILURE);
     }
 
     @Test
-    public void testGenerateTaskManagerResourceIDWithMetaData() throws Exception {
+    void testGenerateTaskManagerResourceIDWithMetaData() throws Exception {
         final Configuration configuration = createConfiguration();
         final String metadata = "test";
         configuration.set(TaskManagerOptionsInternal.TASK_MANAGER_RESOURCE_ID_METADATA, metadata);
         final ResourceID taskManagerResourceID =
-                TaskManagerRunner.getTaskManagerResourceID(configuration, "", -1);
+                TaskManagerRunner.getTaskManagerResourceID(configuration, "", -1).unwrap();
 
-        assertThat(taskManagerResourceID.getMetadata(), equalTo(metadata));
+        assertThat(taskManagerResourceID.getMetadata()).isEqualTo(metadata);
     }
 
     @Test
-    public void testGenerateTaskManagerResourceIDWithoutMetaData() throws Exception {
+    void testGenerateTaskManagerResourceIDWithoutMetaData() throws Exception {
         final Configuration configuration = createConfiguration();
         final String resourceID = "test";
         configuration.set(TaskManagerOptions.TASK_MANAGER_RESOURCE_ID, resourceID);
         final ResourceID taskManagerResourceID =
-                TaskManagerRunner.getTaskManagerResourceID(configuration, "", -1);
+                TaskManagerRunner.getTaskManagerResourceID(configuration, "", -1).unwrap();
 
-        assertThat(taskManagerResourceID.getMetadata(), equalTo(""));
-        assertThat(taskManagerResourceID.getStringWithMetadata(), equalTo("test"));
+        assertThat(taskManagerResourceID.getMetadata()).isEmpty();
+        assertThat(taskManagerResourceID.getStringWithMetadata()).isEqualTo("test");
     }
 
     @Test
-    public void testGenerateTaskManagerResourceIDWithConfig() throws Exception {
+    void testGenerateTaskManagerResourceIDWithConfig() throws Exception {
         final Configuration configuration = createConfiguration();
         final String resourceID = "test";
         configuration.set(TaskManagerOptions.TASK_MANAGER_RESOURCE_ID, resourceID);
         final ResourceID taskManagerResourceID =
-                TaskManagerRunner.getTaskManagerResourceID(configuration, "", -1);
+                TaskManagerRunner.getTaskManagerResourceID(configuration, "", -1).unwrap();
 
-        assertThat(taskManagerResourceID.getResourceIdString(), equalTo(resourceID));
+        assertThat(taskManagerResourceID.getResourceIdString()).isEqualTo(resourceID);
     }
 
     @Test
-    public void testGenerateTaskManagerResourceIDWithRemoteRpcService() throws Exception {
+    void testGenerateTaskManagerResourceIDWithRemoteRpcService() throws Exception {
         final Configuration configuration = createConfiguration();
         final String rpcAddress = "flink";
         final int rpcPort = 9090;
         final ResourceID taskManagerResourceID =
-                TaskManagerRunner.getTaskManagerResourceID(configuration, rpcAddress, rpcPort);
+                TaskManagerRunner.getTaskManagerResourceID(configuration, rpcAddress, rpcPort)
+                        .unwrap();
 
-        assertThat(taskManagerResourceID, notNullValue());
-        assertThat(
-                taskManagerResourceID.getResourceIdString(),
-                containsString(rpcAddress + ":" + rpcPort));
+        assertThat(taskManagerResourceID).isNotNull();
+        assertThat(taskManagerResourceID.getResourceIdString())
+                .contains(rpcAddress + ":" + rpcPort);
     }
 
     @Test
-    public void testGenerateTaskManagerResourceIDWithLocalRpcService() throws Exception {
+    void testGenerateTaskManagerResourceIDWithLocalRpcService() throws Exception {
         final Configuration configuration = createConfiguration();
         final String rpcAddress = "";
         final int rpcPort = -1;
         final ResourceID taskManagerResourceID =
-                TaskManagerRunner.getTaskManagerResourceID(configuration, rpcAddress, rpcPort);
+                TaskManagerRunner.getTaskManagerResourceID(configuration, rpcAddress, rpcPort)
+                        .unwrap();
 
-        assertThat(taskManagerResourceID, notNullValue());
-        assertThat(
-                taskManagerResourceID.getResourceIdString(),
-                containsString(InetAddress.getLocalHost().getHostName()));
+        assertThat(taskManagerResourceID).isNotNull();
+        assertThat(taskManagerResourceID.getResourceIdString())
+                .contains(InetAddress.getLocalHost().getHostName());
     }
 
     @Test
-    public void testUnexpectedTaskManagerTerminationFailsRunnerFatally() throws Exception {
+    void testUnexpectedTaskManagerTerminationFailsRunnerFatally() throws Exception {
         final CompletableFuture<Void> terminationFuture = new CompletableFuture<>();
         final TestingTaskExecutorService taskExecutorService =
                 TestingTaskExecutorService.newBuilder()
@@ -169,15 +168,15 @@ public class TaskManagerRunnerTest extends TestLogger {
                         createConfiguration(),
                         createTaskExecutorServiceFactory(taskExecutorService));
 
-        terminationFuture.completeExceptionally(new FlinkException("Test exception."));
+        terminationFuture.complete(null);
 
-        Integer statusCode = systemExitTrackingSecurityManager.getSystemExitFuture().get();
-        assertThat(statusCode, is(equalTo(TaskManagerRunner.RUNTIME_FAILURE_RETURN_CODE)));
+        assertThatFuture(taskManagerRunner.getTerminationFuture())
+                .eventuallySucceeds()
+                .isEqualTo(TaskManagerRunner.Result.FAILURE);
     }
 
     @Test
-    public void testUnexpectedTaskManagerTerminationAfterRunnerCloseWillBeIgnored()
-            throws Exception {
+    void testUnexpectedTaskManagerTerminationAfterRunnerCloseWillBeIgnored() throws Exception {
         final CompletableFuture<Void> terminationFuture = new CompletableFuture<>();
         final TestingTaskExecutorService taskExecutorService =
                 TestingTaskExecutorService.newBuilder()
@@ -191,11 +190,67 @@ public class TaskManagerRunnerTest extends TestLogger {
 
         taskManagerRunner.closeAsync();
 
-        terminationFuture.completeExceptionally(new FlinkException("Test exception."));
+        terminationFuture.complete(null);
+
+        assertThatFuture(taskManagerRunner.getTerminationFuture())
+                .eventuallySucceeds()
+                .isEqualTo(TaskManagerRunner.Result.SUCCESS);
+    }
+
+    @Test
+    void testWorkingDirIsSetupWhenStartingTaskManagerRunner() throws Exception {
+        final File workingDirBase = TempDirUtils.newFolder(temporaryFolder);
+        final ResourceID taskManagerResourceId = new ResourceID("foobar");
+
+        final Configuration configuration =
+                createConfigurationWithWorkingDirectory(workingDirBase, taskManagerResourceId);
+        final File workingDir =
+                ClusterEntrypointUtils.generateTaskManagerWorkingDirectoryFile(
+                        configuration, taskManagerResourceId);
+        final TaskManagerRunner taskManagerRunner = createTaskManagerRunner(configuration);
+
+        try {
+            assertThat(workingDir).exists();
+        } finally {
+            taskManagerRunner.close();
+        }
+
+        assertThat(workingDir)
+                .withFailMessage(
+                        "The working dir should be cleaned up when stopping the TaskManager process gracefully.")
+                .doesNotExist();
+    }
+
+    @Nonnull
+    private Configuration createConfigurationWithWorkingDirectory(
+            File workingDirBase, ResourceID taskManagerResourceId) {
+        final Configuration configuration = createConfiguration();
+
+        configuration.set(
+                ClusterOptions.PROCESS_WORKING_DIR_BASE, workingDirBase.getAbsolutePath());
+        configuration.set(
+                TaskManagerOptions.TASK_MANAGER_RESOURCE_ID, taskManagerResourceId.toString());
+        return configuration;
+    }
+
+    @Test
+    void testWorkingDirIsNotDeletedInCaseOfFailure() throws Exception {
+        final File workingDirBase = TempDirUtils.newFolder(temporaryFolder);
+        final ResourceID resourceId = ResourceID.generate();
+
+        final Configuration configuration =
+                createConfigurationWithWorkingDirectory(workingDirBase, resourceId);
+
+        final TaskManagerRunner taskManagerRunner =
+                createTaskManagerRunner(
+                        configuration, new TestingFailingTaskExecutorServiceFactory());
+
+        taskManagerRunner.getTerminationFuture().join();
 
         assertThat(
-                systemExitTrackingSecurityManager.getSystemExitFuture(),
-                willNotComplete(Duration.ofMillis(10L)));
+                        ClusterEntrypointUtils.generateTaskManagerWorkingDirectoryFile(
+                                configuration, resourceId))
+                .exists();
     }
 
     @Nonnull
@@ -210,13 +265,15 @@ public class TaskManagerRunnerTest extends TestLogger {
                 blobCacheService,
                 localCommunicationOnly,
                 externalResourceInfoProvider,
-                fatalErrorHandler) -> taskExecutorService;
+                workingDirectory,
+                fatalErrorHandler,
+                delegationTokenReceiverRepository) -> taskExecutorService;
     }
 
     private static Configuration createConfiguration() {
         final Configuration configuration = new Configuration();
-        configuration.setString(JobManagerOptions.ADDRESS, "localhost");
-        configuration.setString(TaskManagerOptions.HOST, "localhost");
+        configuration.set(JobManagerOptions.ADDRESS, "localhost");
+        configuration.set(TaskManagerOptions.HOST, "localhost");
         return TaskExecutorResourceUtils.adjustForLocalExecution(configuration);
     }
 
@@ -235,5 +292,31 @@ public class TaskManagerRunnerTest extends TestLogger {
                 new TaskManagerRunner(configuration, pluginManager, taskExecutorServiceFactory);
         taskManagerRunner.start();
         return taskManagerRunner;
+    }
+
+    private static class TestingFailingTaskExecutorServiceFactory
+            implements TaskManagerRunner.TaskExecutorServiceFactory {
+        @Override
+        public TaskManagerRunner.TaskExecutorService createTaskExecutor(
+                Configuration configuration,
+                ResourceID resourceID,
+                RpcService rpcService,
+                HighAvailabilityServices highAvailabilityServices,
+                HeartbeatServices heartbeatServices,
+                MetricRegistry metricRegistry,
+                BlobCacheService blobCacheService,
+                boolean localCommunicationOnly,
+                ExternalResourceInfoProvider externalResourceInfoProvider,
+                WorkingDirectory workingDirectory,
+                FatalErrorHandler fatalErrorHandler,
+                DelegationTokenReceiverRepository delegationTokenReceiverRepository) {
+            return TestingTaskExecutorService.newBuilder()
+                    .setStartRunnable(
+                            () ->
+                                    fatalErrorHandler.onFatalError(
+                                            new FlinkException(
+                                                    "Cannot instantiate the TaskExecutorService.")))
+                    .build();
+        }
     }
 }

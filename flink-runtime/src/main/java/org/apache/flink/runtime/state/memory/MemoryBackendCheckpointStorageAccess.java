@@ -22,12 +22,15 @@ import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.core.fs.FileSystem;
 import org.apache.flink.core.fs.Path;
+import org.apache.flink.runtime.state.CheckpointStateOutputStream;
+import org.apache.flink.runtime.state.CheckpointStateToolset;
 import org.apache.flink.runtime.state.CheckpointStorageLocation;
 import org.apache.flink.runtime.state.CheckpointStorageLocationReference;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
-import org.apache.flink.runtime.state.CheckpointStreamFactory.CheckpointStateOutputStream;
+import org.apache.flink.runtime.state.NotDuplicatingCheckpointStateToolset;
 import org.apache.flink.runtime.state.filesystem.AbstractFsCheckpointStorageAccess;
 import org.apache.flink.runtime.state.memory.MemCheckpointStreamFactory.MemoryCheckpointOutputStream;
+import org.apache.flink.runtime.state.storage.JobManagerCheckpointStorage;
 
 import javax.annotation.Nullable;
 
@@ -37,8 +40,8 @@ import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkState;
 
 /**
- * An implementation of a checkpoint storage for the {@link MemoryStateBackend}. Depending on
- * whether this is created with a checkpoint location, the setup supports durable checkpoints
+ * An implementation of a checkpoint storage for the {@link JobManagerCheckpointStorage}. Depending
+ * on whether this is created with a checkpoint location, the setup supports durable checkpoints
  * (durable metadata) or not.
  */
 public class MemoryBackendCheckpointStorageAccess extends AbstractFsCheckpointStorageAccess {
@@ -62,6 +65,7 @@ public class MemoryBackendCheckpointStorageAccess extends AbstractFsCheckpointSt
      * @param checkpointsBaseDirectory The directory to write checkpoints to. May be null, in which
      *     case this storage does not support durable persistence.
      * @param defaultSavepointLocation The default savepoint directory, or null, if none is set.
+     * @param createCheckpointSubDirs Whether to create sub-directory with name of jobId.
      * @param maxStateSize The maximum size of each individual piece of state.
      * @throws IOException Thrown if a checkpoint base directory is given configured and the
      *     checkpoint directory cannot be created within that directory.
@@ -70,6 +74,7 @@ public class MemoryBackendCheckpointStorageAccess extends AbstractFsCheckpointSt
             JobID jobId,
             @Nullable Path checkpointsBaseDirectory,
             @Nullable Path defaultSavepointLocation,
+            boolean createCheckpointSubDirs,
             int maxStateSize)
             throws IOException {
 
@@ -84,7 +89,9 @@ public class MemoryBackendCheckpointStorageAccess extends AbstractFsCheckpointSt
         } else {
             this.fileSystem = checkpointsBaseDirectory.getFileSystem();
             this.checkpointsDirectory =
-                    getCheckpointDirectoryForJob(checkpointsBaseDirectory, jobId);
+                    createCheckpointSubDirs
+                            ? getCheckpointDirectoryForJob(checkpointsBaseDirectory, jobId)
+                            : checkpointsBaseDirectory;
         }
     }
 
@@ -112,7 +119,7 @@ public class MemoryBackendCheckpointStorageAccess extends AbstractFsCheckpointSt
     }
 
     @Override
-    public void initializeBaseLocations() {
+    public void initializeBaseLocationsForCheckpoint() {
         // since 'checkpointDir' which under 'checkpointsDirectory' would be created when calling
         // #initializeLocationForCheckpoint, we could also avoid to call mkdirs for the
         // 'checkpointsDirectory' here.
@@ -154,6 +161,11 @@ public class MemoryBackendCheckpointStorageAccess extends AbstractFsCheckpointSt
     @Override
     public CheckpointStateOutputStream createTaskOwnedStateStream() {
         return new MemoryCheckpointOutputStream(maxStateSize);
+    }
+
+    @Override
+    public CheckpointStateToolset createTaskOwnedCheckpointStateToolset() {
+        return new NotDuplicatingCheckpointStateToolset();
     }
 
     @Override

@@ -19,28 +19,29 @@
 package org.apache.flink.runtime.util;
 
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.runtime.highavailability.HighAvailabilityServicesUtils;
-import org.apache.flink.runtime.rpc.akka.AkkaRpcServiceUtils;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.runtime.rpc.AddressResolution;
+import org.apache.flink.runtime.rpc.RpcSystem;
 
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 
-import static org.junit.Assert.fail;
-import static org.junit.Assume.assumeTrue;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assumptions.assumeThat;
 
-/** Unit tests for respecting {@link HighAvailabilityServicesUtils.AddressResolution}. */
-public class AddressResolutionTest extends TestLogger {
+/** Unit tests for respecting {@link AddressResolution}. */
+class AddressResolutionTest {
+
+    private static final RpcSystem RPC_SYSTEM = RpcSystem.load();
 
     private static final String ENDPOINT_NAME = "endpoint";
     private static final String NON_EXISTING_HOSTNAME = "foo.bar.com.invalid";
     private static final int PORT = 17234;
 
-    @BeforeClass
-    public static void check() {
+    @BeforeAll
+    static void check() {
         checkPreconditions();
     }
 
@@ -58,31 +59,29 @@ public class AddressResolutionTest extends TestLogger {
             throwsException = true;
         }
 
-        assumeTrue(throwsException);
+        assumeThat(throwsException).isTrue();
     }
 
     @Test
-    public void testNoAddressResolution() throws UnknownHostException {
-        AkkaRpcServiceUtils.getRpcUrl(
+    void testNoAddressResolution() throws UnknownHostException {
+        RPC_SYSTEM.getRpcUrl(
                 NON_EXISTING_HOSTNAME,
                 PORT,
                 ENDPOINT_NAME,
-                HighAvailabilityServicesUtils.AddressResolution.NO_ADDRESS_RESOLUTION,
+                AddressResolution.NO_ADDRESS_RESOLUTION,
                 new Configuration());
     }
 
     @Test
-    public void testTryAddressResolution() {
-        try {
-            AkkaRpcServiceUtils.getRpcUrl(
-                    NON_EXISTING_HOSTNAME,
-                    PORT,
-                    ENDPOINT_NAME,
-                    HighAvailabilityServicesUtils.AddressResolution.TRY_ADDRESS_RESOLUTION,
-                    new Configuration());
-            fail("This should fail with an UnknownHostException");
-        } catch (UnknownHostException ignore) {
-            // expected
-        }
+    void testTryAddressResolution() {
+        assertThatThrownBy(
+                        () ->
+                                RPC_SYSTEM.getRpcUrl(
+                                        NON_EXISTING_HOSTNAME,
+                                        PORT,
+                                        ENDPOINT_NAME,
+                                        AddressResolution.TRY_ADDRESS_RESOLUTION,
+                                        new Configuration()))
+                .isInstanceOf(UnknownHostException.class);
     }
 }

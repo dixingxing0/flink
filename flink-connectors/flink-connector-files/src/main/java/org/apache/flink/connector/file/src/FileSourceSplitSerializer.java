@@ -64,9 +64,11 @@ public final class FileSourceSplitSerializer implements SimpleVersionedSerialize
         final DataOutputSerializer out = SERIALIZER_CACHE.get();
 
         out.writeUTF(split.splitId());
-        split.path().write(out);
+        Path.serializeToDataOutputView(split.path(), out);
         out.writeLong(split.offset());
         out.writeLong(split.length());
+        out.writeLong(split.fileModificationTime());
+        out.writeLong(split.fileSize());
         writeStringArray(out, split.hostnames());
 
         final Optional<CheckpointedPosition> readerPosition = split.getReaderPosition();
@@ -98,17 +100,28 @@ public final class FileSourceSplitSerializer implements SimpleVersionedSerialize
         final DataInputDeserializer in = new DataInputDeserializer(serialized);
 
         final String id = in.readUTF();
-        final Path path = new Path();
-        path.read(in);
+        Path result = Path.deserializeFromDataInputView(in);
+        Path path = result == null ? new Path() : result;
         final long offset = in.readLong();
         final long len = in.readLong();
+        final long modificationTime = in.readLong();
+        final long fileSize = in.readLong();
         final String[] hosts = readStringArray(in);
 
         final CheckpointedPosition readerPosition =
                 in.readBoolean() ? new CheckpointedPosition(in.readLong(), in.readLong()) : null;
 
         // instantiate a new split and cache the serialized form
-        return new FileSourceSplit(id, path, offset, len, hosts, readerPosition, serialized);
+        return new FileSourceSplit(
+                id,
+                path,
+                offset,
+                len,
+                modificationTime,
+                fileSize,
+                hosts,
+                readerPosition,
+                serialized);
     }
 
     private static void writeStringArray(DataOutputView out, String[] strings) throws IOException {

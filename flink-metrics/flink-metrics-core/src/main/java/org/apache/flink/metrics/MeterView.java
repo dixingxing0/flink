@@ -18,6 +18,8 @@
 
 package org.apache.flink.metrics;
 
+import org.apache.flink.annotation.Internal;
+
 /**
  * A MeterView provides an average rate of events per second over a given time period.
  *
@@ -33,18 +35,23 @@ package org.apache.flink.metrics;
  *
  * <p>The events are counted by a {@link Counter}.
  */
+@Internal
 public class MeterView implements Meter, View {
 
     private static final int DEFAULT_TIME_SPAN_IN_SECONDS = 60;
 
     /** The underlying counter maintaining the count. */
     private final Counter counter;
+
     /** The time-span over which the average is calculated. */
     private final int timeSpanInSeconds;
+
     /** Circular array containing the history of values. */
     private final long[] values;
+
     /** The index in the array for the current time. */
     private int time = 0;
+
     /** The last rate we computed. */
     private double currentRate = 0;
 
@@ -66,6 +73,10 @@ public class MeterView implements Meter, View {
                         timeSpanInSeconds - (timeSpanInSeconds % UPDATE_INTERVAL_SECONDS),
                         UPDATE_INTERVAL_SECONDS);
         this.values = new long[this.timeSpanInSeconds / UPDATE_INTERVAL_SECONDS + 1];
+    }
+
+    public MeterView(Gauge<? extends Number> numberGauge) {
+        this(new GaugeWrapper(numberGauge));
     }
 
     @Override
@@ -94,5 +105,40 @@ public class MeterView implements Meter, View {
         values[time] = counter.getCount();
         currentRate =
                 ((double) (values[time] - values[(time + 1) % values.length]) / timeSpanInSeconds);
+    }
+
+    /** Simple wrapper to expose number gauges as timers. */
+    static class GaugeWrapper implements Counter {
+
+        final Gauge<? extends Number> numberGauge;
+
+        GaugeWrapper(Gauge<? extends Number> numberGauge) {
+            this.numberGauge = numberGauge;
+        }
+
+        @Override
+        public void inc() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void inc(long n) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void dec() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void dec(long n) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public long getCount() {
+            return numberGauge.getValue().longValue();
+        }
     }
 }

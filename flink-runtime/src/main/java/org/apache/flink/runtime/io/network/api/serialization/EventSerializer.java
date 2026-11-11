@@ -18,23 +18,35 @@
 
 package org.apache.flink.runtime.io.network.api.serialization;
 
+import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
 import org.apache.flink.core.memory.MemorySegment;
 import org.apache.flink.core.memory.MemorySegmentFactory;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.checkpoint.CheckpointType;
+import org.apache.flink.runtime.checkpoint.SavepointType;
+import org.apache.flink.runtime.checkpoint.SnapshotType;
+import org.apache.flink.runtime.checkpoint.channel.RecoveryCheckpointBarrier;
 import org.apache.flink.runtime.event.AbstractEvent;
+import org.apache.flink.runtime.event.WatermarkEvent;
 import org.apache.flink.runtime.io.network.api.CancelCheckpointMarker;
 import org.apache.flink.runtime.io.network.api.CheckpointBarrier;
+import org.apache.flink.runtime.io.network.api.EndOfData;
 import org.apache.flink.runtime.io.network.api.EndOfPartitionEvent;
+import org.apache.flink.runtime.io.network.api.EndOfSegmentEvent;
 import org.apache.flink.runtime.io.network.api.EndOfSuperstepEvent;
 import org.apache.flink.runtime.io.network.api.EventAnnouncement;
+import org.apache.flink.runtime.io.network.api.RecoveryMetadata;
+import org.apache.flink.runtime.io.network.api.StopMode;
+import org.apache.flink.runtime.io.network.api.SubtaskConnectionDescriptor;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.BufferConsumer;
 import org.apache.flink.runtime.io.network.buffer.FreeingBufferRecycler;
 import org.apache.flink.runtime.io.network.buffer.NetworkBuffer;
-import org.apache.flink.runtime.io.network.partition.consumer.EndOfChannelStateEvent;
+import org.apache.flink.runtime.io.network.partition.consumer.EndOfFetchedChannelStateEvent;
+import org.apache.flink.runtime.io.network.partition.consumer.EndOfInputChannelStateEvent;
+import org.apache.flink.runtime.io.network.partition.consumer.EndOfOutputChannelStateEvent;
 import org.apache.flink.runtime.state.CheckpointStorageLocationReference;
 import org.apache.flink.util.InstantiationUtil;
 
@@ -61,15 +73,38 @@ public class EventSerializer {
 
     private static final int CANCEL_CHECKPOINT_MARKER_EVENT = 4;
 
-    private static final int END_OF_CHANNEL_STATE_EVENT = 5;
+    private static final int END_OF_OUTPUT_CHANNEL_STATE_EVENT = 5;
 
     private static final int ANNOUNCEMENT_EVENT = 6;
 
-    private static final int CHECKPOINT_TYPE_CHECKPOINT = 0;
+    private static final int VIRTUAL_CHANNEL_SELECTOR_EVENT = 7;
 
-    private static final int CHECKPOINT_TYPE_SAVEPOINT = 1;
+    private static final int END_OF_USER_RECORDS_EVENT = 8;
 
-    private static final int CHECKPOINT_TYPE_SYNC_SAVEPOINT = 2;
+    private static final int END_OF_SEGMENT = 9;
+
+    private static final int RECOVERY_METADATA = 10;
+
+    private static final int GENERALIZED_WATERMARK_EVENT = 11;
+
+    private static final int END_OF_INPUT_CHANNEL_STATE_EVENT = 12;
+
+    private static final int RECOVERY_CHECKPOINT_BARRIER_EVENT = 13;
+
+    private static final int END_OF_FETCHED_CHANNEL_STATE_EVENT = 14;
+
+    private static final byte CHECKPOINT_TYPE_CHECKPOINT = 0;
+
+    private static final byte CHECKPOINT_TYPE_SAVEPOINT = 1;
+
+    private static final byte CHECKPOINT_TYPE_SAVEPOINT_SUSPEND = 2;
+
+    private static final byte CHECKPOINT_TYPE_SAVEPOINT_TERMINATE = 3;
+
+    private static final byte CHECKPOINT_TYPE_FULL_CHECKPOINT = 4;
+
+    private static final byte SAVEPOINT_FORMAT_CANONICAL = 0;
+    private static final byte SAVEPOINT_FORMAT_NATIVE = 1;
 
     // ------------------------------------------------------------------------
     //  Serialization Logic
@@ -83,8 +118,21 @@ public class EventSerializer {
             return serializeCheckpointBarrier((CheckpointBarrier) event);
         } else if (eventClass == EndOfSuperstepEvent.class) {
             return ByteBuffer.wrap(new byte[] {0, 0, 0, END_OF_SUPERSTEP_EVENT});
-        } else if (eventClass == EndOfChannelStateEvent.class) {
-            return ByteBuffer.wrap(new byte[] {0, 0, 0, END_OF_CHANNEL_STATE_EVENT});
+        } else if (eventClass == EndOfOutputChannelStateEvent.class) {
+            return ByteBuffer.wrap(new byte[] {0, 0, 0, END_OF_OUTPUT_CHANNEL_STATE_EVENT});
+        } else if (eventClass == EndOfInputChannelStateEvent.class) {
+            return ByteBuffer.wrap(new byte[] {0, 0, 0, END_OF_INPUT_CHANNEL_STATE_EVENT});
+        } else if (eventClass == EndOfFetchedChannelStateEvent.class) {
+            return ByteBuffer.wrap(new byte[] {0, 0, 0, END_OF_FETCHED_CHANNEL_STATE_EVENT});
+        } else if (eventClass == EndOfData.class) {
+            return ByteBuffer.wrap(
+                    new byte[] {
+                        0,
+                        0,
+                        0,
+                        END_OF_USER_RECORDS_EVENT,
+                        (byte) ((EndOfData) event).getStopMode().ordinal()
+                    });
         } else if (eventClass == CancelCheckpointMarker.class) {
             CancelCheckpointMarker marker = (CancelCheckpointMarker) event;
 
@@ -105,6 +153,39 @@ public class EventSerializer {
             serializedAnnouncement.put(serializedAnnouncedEvent);
             serializedAnnouncement.flip();
             return serializedAnnouncement;
+        } else if (eventClass == SubtaskConnectionDescriptor.class) {
+            SubtaskConnectionDescriptor selector = (SubtaskConnectionDescriptor) event;
+            ByteBuffer buf = ByteBuffer.allocate(12);
+            buf.putInt(VIRTUAL_CHANNEL_SELECTOR_EVENT);
+            buf.putInt(selector.getInputSubtaskIndex());
+            buf.putInt(selector.getOutputSubtaskIndex());
+            buf.flip();
+            return buf;
+        } else if (eventClass == EndOfSegmentEvent.class) {
+            return ByteBuffer.wrap(new byte[] {0, 0, 0, END_OF_SEGMENT});
+        } else if (eventClass == RecoveryMetadata.class) {
+            RecoveryMetadata recoveryMetadata = (RecoveryMetadata) event;
+
+            ByteBuffer buf = ByteBuffer.allocate(8);
+            buf.putInt(0, RECOVERY_METADATA);
+            buf.putInt(4, recoveryMetadata.getFinalBufferSubpartitionId());
+            return buf;
+        } else if (eventClass == RecoveryCheckpointBarrier.class) {
+            RecoveryCheckpointBarrier barrier = (RecoveryCheckpointBarrier) event;
+
+            ByteBuffer buf = ByteBuffer.allocate(12);
+            buf.putInt(0, RECOVERY_CHECKPOINT_BARRIER_EVENT);
+            buf.putLong(4, barrier.getCheckpointId());
+            return buf;
+        } else if (eventClass == WatermarkEvent.class) {
+            try {
+                final DataOutputSerializer serializer = new DataOutputSerializer(128);
+                serializer.writeInt(GENERALIZED_WATERMARK_EVENT);
+                event.write(serializer);
+                return serializer.wrapAsByteBuffer();
+            } catch (IOException e) {
+                throw new IOException("Error while serializing event.", e);
+            }
         } else {
             try {
                 final DataOutputSerializer serializer = new DataOutputSerializer(128);
@@ -136,8 +217,14 @@ public class EventSerializer {
                 return deserializeCheckpointBarrier(buffer);
             } else if (type == END_OF_SUPERSTEP_EVENT) {
                 return EndOfSuperstepEvent.INSTANCE;
-            } else if (type == END_OF_CHANNEL_STATE_EVENT) {
-                return EndOfChannelStateEvent.INSTANCE;
+            } else if (type == END_OF_OUTPUT_CHANNEL_STATE_EVENT) {
+                return EndOfOutputChannelStateEvent.INSTANCE;
+            } else if (type == END_OF_INPUT_CHANNEL_STATE_EVENT) {
+                return EndOfInputChannelStateEvent.INSTANCE;
+            } else if (type == END_OF_FETCHED_CHANNEL_STATE_EVENT) {
+                return EndOfFetchedChannelStateEvent.INSTANCE;
+            } else if (type == END_OF_USER_RECORDS_EVENT) {
+                return new EndOfData(StopMode.values()[buffer.get()]);
             } else if (type == CANCEL_CHECKPOINT_MARKER_EVENT) {
                 long id = buffer.getLong();
                 return new CancelCheckpointMarker(id);
@@ -145,6 +232,21 @@ public class EventSerializer {
                 int sequenceNumber = buffer.getInt();
                 AbstractEvent announcedEvent = fromSerializedEvent(buffer, classLoader);
                 return new EventAnnouncement(announcedEvent, sequenceNumber);
+            } else if (type == VIRTUAL_CHANNEL_SELECTOR_EVENT) {
+                return new SubtaskConnectionDescriptor(buffer.getInt(), buffer.getInt());
+            } else if (type == END_OF_SEGMENT) {
+                return EndOfSegmentEvent.INSTANCE;
+            } else if (type == RECOVERY_METADATA) {
+                int subpartitionId = buffer.getInt();
+                return new RecoveryMetadata(subpartitionId);
+            } else if (type == RECOVERY_CHECKPOINT_BARRIER_EVENT) {
+                long checkpointId = buffer.getLong();
+                return new RecoveryCheckpointBarrier(checkpointId);
+            } else if (type == GENERALIZED_WATERMARK_EVENT) {
+                final DataInputDeserializer deserializer = new DataInputDeserializer(buffer);
+                WatermarkEvent watermarkEvent = new WatermarkEvent();
+                watermarkEvent.read(deserializer);
+                return watermarkEvent;
             } else if (type == OTHER_EVENT) {
                 try {
                     final DataInputDeserializer deserializer = new DataInputDeserializer(buffer);
@@ -184,7 +286,6 @@ public class EventSerializer {
     private static ByteBuffer serializeCheckpointBarrier(CheckpointBarrier barrier)
             throws IOException {
         final CheckpointOptions checkpointOptions = barrier.getCheckpointOptions();
-        final CheckpointType checkpointType = checkpointOptions.getCheckpointType();
 
         final byte[] locationBytes =
                 checkpointOptions.getTargetLocation().isDefaultReference()
@@ -194,23 +295,22 @@ public class EventSerializer {
         final ByteBuffer buf =
                 ByteBuffer.allocate(38 + (locationBytes == null ? 0 : locationBytes.length));
 
-        // we do not use checkpointType.ordinal() here to make the serialization robust
-        // against changes in the enum (such as changes in the order of the values)
-        final int typeInt;
-        if (checkpointType == CheckpointType.CHECKPOINT) {
-            typeInt = CHECKPOINT_TYPE_CHECKPOINT;
-        } else if (checkpointType == CheckpointType.SAVEPOINT) {
-            typeInt = CHECKPOINT_TYPE_SAVEPOINT;
-        } else if (checkpointType == CheckpointType.SYNC_SAVEPOINT) {
-            typeInt = CHECKPOINT_TYPE_SYNC_SAVEPOINT;
-        } else {
-            throw new IOException("Unknown checkpoint type: " + checkpointType);
-        }
-
         buf.putInt(CHECKPOINT_BARRIER_EVENT);
         buf.putLong(barrier.getId());
         buf.putLong(barrier.getTimestamp());
-        buf.putInt(typeInt);
+
+        // we do not use checkpointType.ordinal() here to make the serialization robust
+        // against changes in the enum (such as changes in the order of the values)
+        final SnapshotType snapshotType = checkpointOptions.getCheckpointType();
+        if (snapshotType.isSavepoint()) {
+            encodeSavepointType(snapshotType, buf);
+        } else if (snapshotType.equals(CheckpointType.CHECKPOINT)) {
+            buf.put(CHECKPOINT_TYPE_CHECKPOINT);
+        } else if (snapshotType.equals(CheckpointType.FULL_CHECKPOINT)) {
+            buf.put(CHECKPOINT_TYPE_FULL_CHECKPOINT);
+        } else {
+            throw new IOException("Unknown checkpoint type: " + snapshotType);
+        }
 
         if (locationBytes == null) {
             buf.putInt(-1);
@@ -218,12 +318,39 @@ public class EventSerializer {
             buf.putInt(locationBytes.length);
             buf.put(locationBytes);
         }
-        buf.put((byte) (checkpointOptions.isExactlyOnceMode() ? 1 : 0));
-        buf.put((byte) (checkpointOptions.isUnalignedCheckpoint() ? 1 : 0));
-        buf.putLong(checkpointOptions.getAlignmentTimeout());
+        buf.put((byte) checkpointOptions.getAlignment().ordinal());
+        buf.putLong(checkpointOptions.getAlignedCheckpointTimeout());
 
         buf.flip();
         return buf;
+    }
+
+    private static void encodeSavepointType(SnapshotType snapshotType, ByteBuffer buf)
+            throws IOException {
+        SavepointType savepointType = (SavepointType) snapshotType;
+        switch (savepointType.getPostCheckpointAction()) {
+            case NONE:
+                buf.put(CHECKPOINT_TYPE_SAVEPOINT);
+                break;
+            case SUSPEND:
+                buf.put(CHECKPOINT_TYPE_SAVEPOINT_SUSPEND);
+                break;
+            case TERMINATE:
+                buf.put(CHECKPOINT_TYPE_SAVEPOINT_TERMINATE);
+                break;
+            default:
+                throw new IOException("Unknown savepoint type: " + snapshotType);
+        }
+        switch (savepointType.getFormatType()) {
+            case CANONICAL:
+                buf.put(SAVEPOINT_FORMAT_CANONICAL);
+                break;
+            case NATIVE:
+                buf.put(SAVEPOINT_FORMAT_NATIVE);
+                break;
+            default:
+                throw new IOException("Unknown savepoint format type: " + snapshotType);
+        }
     }
 
     private static CheckpointBarrier deserializeCheckpointBarrier(ByteBuffer buffer)
@@ -231,21 +358,23 @@ public class EventSerializer {
         final long id = buffer.getLong();
         final long timestamp = buffer.getLong();
 
-        final int checkpointTypeCode = buffer.getInt();
-        final int locationRefLen = buffer.getInt();
+        final byte checkpointTypeCode = buffer.get();
 
-        final CheckpointType checkpointType;
+        final SnapshotType snapshotType;
         if (checkpointTypeCode == CHECKPOINT_TYPE_CHECKPOINT) {
-            checkpointType = CheckpointType.CHECKPOINT;
-        } else if (checkpointTypeCode == CHECKPOINT_TYPE_SAVEPOINT) {
-            checkpointType = CheckpointType.SAVEPOINT;
-        } else if (checkpointTypeCode == CHECKPOINT_TYPE_SYNC_SAVEPOINT) {
-            checkpointType = CheckpointType.SYNC_SAVEPOINT;
+            snapshotType = CheckpointType.CHECKPOINT;
+        } else if (checkpointTypeCode == CHECKPOINT_TYPE_FULL_CHECKPOINT) {
+            snapshotType = CheckpointType.FULL_CHECKPOINT;
+        } else if (checkpointTypeCode == CHECKPOINT_TYPE_SAVEPOINT
+                || checkpointTypeCode == CHECKPOINT_TYPE_SAVEPOINT_SUSPEND
+                || checkpointTypeCode == CHECKPOINT_TYPE_SAVEPOINT_TERMINATE) {
+            snapshotType = decodeSavepointType(checkpointTypeCode, buffer);
         } else {
             throw new IOException("Unknown checkpoint type code: " + checkpointTypeCode);
         }
 
         final CheckpointStorageLocationReference locationRef;
+        final int locationRefLen = buffer.getInt();
         if (locationRefLen == -1) {
             locationRef = CheckpointStorageLocationReference.getDefault();
         } else {
@@ -253,19 +382,37 @@ public class EventSerializer {
             buffer.get(bytes);
             locationRef = new CheckpointStorageLocationReference(bytes);
         }
-        final boolean isExactlyOnceMode = buffer.get() == 1;
-        final boolean isUnalignedCheckpoint = buffer.get() == 1;
-        final long alignmentTimeout = buffer.getLong();
+        final CheckpointOptions.AlignmentType alignmentType =
+                CheckpointOptions.AlignmentType.values()[buffer.get()];
+        final long alignedCheckpointTimeout = buffer.getLong();
 
         return new CheckpointBarrier(
                 id,
                 timestamp,
                 new CheckpointOptions(
-                        checkpointType,
-                        locationRef,
-                        isExactlyOnceMode,
-                        isUnalignedCheckpoint,
-                        alignmentTimeout));
+                        snapshotType, locationRef, alignmentType, alignedCheckpointTimeout));
+    }
+
+    private static SavepointType decodeSavepointType(byte checkpointTypeCode, ByteBuffer buffer)
+            throws IOException {
+        final byte formatTypeCode = buffer.get();
+        final SavepointFormatType formatType;
+        if (formatTypeCode == SAVEPOINT_FORMAT_CANONICAL) {
+            formatType = SavepointFormatType.CANONICAL;
+        } else if (formatTypeCode == SAVEPOINT_FORMAT_NATIVE) {
+            formatType = SavepointFormatType.NATIVE;
+        } else {
+            throw new IOException("Unknown savepoint format type code: " + formatTypeCode);
+        }
+        if (checkpointTypeCode == CHECKPOINT_TYPE_SAVEPOINT) {
+            return SavepointType.savepoint(formatType);
+        } else if (checkpointTypeCode == CHECKPOINT_TYPE_SAVEPOINT_SUSPEND) {
+            return SavepointType.suspend(formatType);
+        } else if (checkpointTypeCode == CHECKPOINT_TYPE_SAVEPOINT_TERMINATE) {
+            return SavepointType.terminate(formatType);
+        } else {
+            throw new IOException("Unknown savepoint type code: " + checkpointTypeCode);
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -292,7 +439,9 @@ public class EventSerializer {
         MemorySegment data = MemorySegmentFactory.wrap(serializedEvent.array());
 
         return new BufferConsumer(
-                data, FreeingBufferRecycler.INSTANCE, getDataType(event, hasPriority));
+                new NetworkBuffer(
+                        data, FreeingBufferRecycler.INSTANCE, getDataType(event, hasPriority)),
+                data.size());
     }
 
     public static AbstractEvent fromBuffer(Buffer buffer, ClassLoader classLoader)

@@ -22,13 +22,17 @@ import org.apache.flink.api.common.JobID;
 import org.apache.flink.runtime.blob.BlobStore;
 import org.apache.flink.runtime.blob.VoidBlobStore;
 import org.apache.flink.runtime.checkpoint.CheckpointRecoveryFactory;
-import org.apache.flink.runtime.highavailability.nonha.standalone.StandaloneRunningJobsRegistry;
-import org.apache.flink.runtime.jobmanager.JobGraphStore;
-import org.apache.flink.runtime.leaderelection.LeaderElectionService;
+import org.apache.flink.runtime.highavailability.nonha.embedded.EmbeddedJobResultStore;
+import org.apache.flink.runtime.jobmanager.ApplicationStore;
+import org.apache.flink.runtime.jobmanager.ExecutionPlanStore;
+import org.apache.flink.runtime.leaderelection.LeaderElection;
 import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService;
+import org.apache.flink.util.concurrent.FutureUtils;
 
 import java.io.IOException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 import java.util.function.Function;
 
 /**
@@ -46,26 +50,37 @@ public class TestingHighAvailabilityServices implements HighAvailabilityServices
     private volatile Function<JobID, LeaderRetrievalService> jobMasterLeaderRetrieverFunction =
             ignored -> null;
 
-    private volatile Function<JobID, LeaderElectionService> jobMasterLeaderElectionServiceFunction =
+    private volatile Function<JobID, LeaderElection> jobMasterLeaderElectionServiceFunction =
             ignored -> null;
 
-    private ConcurrentHashMap<JobID, LeaderRetrievalService> jobMasterLeaderRetrievers =
+    private final ConcurrentHashMap<JobID, LeaderRetrievalService> jobMasterLeaderRetrievers =
             new ConcurrentHashMap<>();
 
-    private ConcurrentHashMap<JobID, LeaderElectionService> jobManagerLeaderElectionServices =
+    private final ConcurrentHashMap<JobID, LeaderElection> jobMasterLeaderElections =
             new ConcurrentHashMap<>();
 
-    private volatile LeaderElectionService resourceManagerLeaderElectionService;
+    private volatile LeaderElection resourceManagerLeaderElection;
 
-    private volatile LeaderElectionService dispatcherLeaderElectionService;
+    private volatile LeaderElection dispatcherLeaderElectionService;
 
-    private volatile LeaderElectionService clusterRestEndpointLeaderElectionService;
+    private volatile LeaderElection clusterRestEndpointLeaderElectionService;
 
     private volatile CheckpointRecoveryFactory checkpointRecoveryFactory;
 
-    private volatile JobGraphStore jobGraphStore;
+    private volatile ExecutionPlanStore executionPlanStore;
 
-    private volatile RunningJobsRegistry runningJobsRegistry = new StandaloneRunningJobsRegistry();
+    private volatile JobResultStore jobResultStore = new EmbeddedJobResultStore();
+
+    private volatile ApplicationStore applicationStore;
+
+    private volatile ApplicationResultStore applicationResultStore =
+            new EmbeddedApplicationResultStore();
+
+    private CompletableFuture<Void> closeFuture = new CompletableFuture<>();
+
+    private CompletableFuture<Void> cleanupAllDataFuture = new CompletableFuture<>();
+
+    private volatile CompletableFuture<JobID> globalCleanupFuture;
 
     // ------------------------------------------------------------------------
     //  Setters for mock / testing implementations
@@ -90,22 +105,20 @@ public class TestingHighAvailabilityServices implements HighAvailabilityServices
         this.jobMasterLeaderRetrievers.put(jobID, jobMasterLeaderRetriever);
     }
 
-    public void setJobMasterLeaderElectionService(
-            JobID jobID, LeaderElectionService leaderElectionService) {
-        this.jobManagerLeaderElectionServices.put(jobID, leaderElectionService);
+    public void setJobMasterLeaderElection(JobID jobID, LeaderElection leaderElection) {
+        this.jobMasterLeaderElections.put(jobID, leaderElection);
     }
 
-    public void setResourceManagerLeaderElectionService(
-            LeaderElectionService leaderElectionService) {
-        this.resourceManagerLeaderElectionService = leaderElectionService;
+    public void setResourceManagerLeaderElection(LeaderElection leaderElection) {
+        this.resourceManagerLeaderElection = leaderElection;
     }
 
-    public void setDispatcherLeaderElectionService(LeaderElectionService leaderElectionService) {
+    public void setDispatcherLeaderElection(LeaderElection leaderElectionService) {
         this.dispatcherLeaderElectionService = leaderElectionService;
     }
 
-    public void setClusterRestEndpointLeaderElectionService(
-            final LeaderElectionService clusterRestEndpointLeaderElectionService) {
+    public void setClusterRestEndpointLeaderElection(
+            final LeaderElection clusterRestEndpointLeaderElectionService) {
         this.clusterRestEndpointLeaderElectionService = clusterRestEndpointLeaderElectionService;
     }
 
@@ -113,22 +126,42 @@ public class TestingHighAvailabilityServices implements HighAvailabilityServices
         this.checkpointRecoveryFactory = checkpointRecoveryFactory;
     }
 
-    public void setJobGraphStore(JobGraphStore jobGraphStore) {
-        this.jobGraphStore = jobGraphStore;
+    public void setExecutionPlanStore(ExecutionPlanStore executionPlanStore) {
+        this.executionPlanStore = executionPlanStore;
     }
 
-    public void setRunningJobsRegistry(RunningJobsRegistry runningJobsRegistry) {
-        this.runningJobsRegistry = runningJobsRegistry;
+    public void setJobResultStore(JobResultStore jobResultStore) {
+        this.jobResultStore = jobResultStore;
     }
 
-    public void setJobMasterLeaderElectionServiceFunction(
-            Function<JobID, LeaderElectionService> jobMasterLeaderElectionServiceFunction) {
+    public void setApplicationStore(ApplicationStore applicationStore) {
+        this.applicationStore = applicationStore;
+    }
+
+    public void setApplicationResultStore(ApplicationResultStore applicationResultStore) {
+        this.applicationResultStore = applicationResultStore;
+    }
+
+    public void setJobMasterLeaderElectionFunction(
+            Function<JobID, LeaderElection> jobMasterLeaderElectionServiceFunction) {
         this.jobMasterLeaderElectionServiceFunction = jobMasterLeaderElectionServiceFunction;
     }
 
     public void setJobMasterLeaderRetrieverFunction(
             Function<JobID, LeaderRetrievalService> jobMasterLeaderRetrieverFunction) {
         this.jobMasterLeaderRetrieverFunction = jobMasterLeaderRetrieverFunction;
+    }
+
+    public void setCloseFuture(CompletableFuture<Void> closeFuture) {
+        this.closeFuture = closeFuture;
+    }
+
+    public void setCleanupAllDataFuture(CompletableFuture<Void> cleanupAllDataFuture) {
+        this.cleanupAllDataFuture = cleanupAllDataFuture;
+    }
+
+    public void setGlobalCleanupFuture(CompletableFuture<JobID> globalCleanupFuture) {
+        this.globalCleanupFuture = globalCleanupFuture;
     }
 
     // ------------------------------------------------------------------------
@@ -178,8 +211,8 @@ public class TestingHighAvailabilityServices implements HighAvailabilityServices
     }
 
     @Override
-    public LeaderElectionService getResourceManagerLeaderElectionService() {
-        LeaderElectionService service = resourceManagerLeaderElectionService;
+    public LeaderElection getResourceManagerLeaderElection() {
+        LeaderElection service = resourceManagerLeaderElection;
 
         if (service != null) {
             return service;
@@ -190,8 +223,8 @@ public class TestingHighAvailabilityServices implements HighAvailabilityServices
     }
 
     @Override
-    public LeaderElectionService getDispatcherLeaderElectionService() {
-        LeaderElectionService service = dispatcherLeaderElectionService;
+    public LeaderElection getDispatcherLeaderElection() {
+        LeaderElection service = dispatcherLeaderElectionService;
 
         if (service != null) {
             return service;
@@ -201,9 +234,9 @@ public class TestingHighAvailabilityServices implements HighAvailabilityServices
     }
 
     @Override
-    public LeaderElectionService getJobManagerLeaderElectionService(JobID jobID) {
-        LeaderElectionService service =
-                jobManagerLeaderElectionServices.computeIfAbsent(
+    public LeaderElection getJobManagerLeaderElection(JobID jobID) {
+        LeaderElection service =
+                jobMasterLeaderElections.computeIfAbsent(
                         jobID, jobMasterLeaderElectionServiceFunction);
 
         if (service != null) {
@@ -214,7 +247,7 @@ public class TestingHighAvailabilityServices implements HighAvailabilityServices
     }
 
     @Override
-    public LeaderElectionService getClusterRestEndpointLeaderElectionService() {
+    public LeaderElection getClusterRestEndpointLeaderElection() {
         return clusterRestEndpointLeaderElectionService;
     }
 
@@ -230,19 +263,35 @@ public class TestingHighAvailabilityServices implements HighAvailabilityServices
     }
 
     @Override
-    public JobGraphStore getJobGraphStore() {
-        JobGraphStore store = jobGraphStore;
+    public ExecutionPlanStore getExecutionPlanStore() {
+        ExecutionPlanStore store = executionPlanStore;
 
         if (store != null) {
             return store;
         } else {
-            throw new IllegalStateException("JobGraphStore has not been set");
+            throw new IllegalStateException("ExecutionPlanStore has not been set");
         }
     }
 
     @Override
-    public RunningJobsRegistry getRunningJobsRegistry() {
-        return runningJobsRegistry;
+    public JobResultStore getJobResultStore() {
+        return jobResultStore;
+    }
+
+    @Override
+    public ApplicationStore getApplicationStore() {
+        ApplicationStore store = applicationStore;
+
+        if (store != null) {
+            return store;
+        } else {
+            throw new IllegalStateException("ApplicationStore has not been set");
+        }
+    }
+
+    @Override
+    public ApplicationResultStore getApplicationResultStore() {
+        return applicationResultStore;
     }
 
     @Override
@@ -256,11 +305,20 @@ public class TestingHighAvailabilityServices implements HighAvailabilityServices
 
     @Override
     public void close() throws Exception {
-        // nothing to do
+        closeFuture.complete(null);
     }
 
     @Override
-    public void closeAndCleanupAllData() throws Exception {
-        // nothing to do
+    public void cleanupAllData() throws Exception {
+        cleanupAllDataFuture.complete(null);
+    }
+
+    @Override
+    public CompletableFuture<Void> globalCleanupAsync(JobID jobID, Executor executor) {
+        if (globalCleanupFuture != null) {
+            globalCleanupFuture.complete(jobID);
+        }
+
+        return FutureUtils.completedVoidFuture();
     }
 }

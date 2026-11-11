@@ -18,15 +18,15 @@
 
 package org.apache.flink.runtime.operators.sort;
 
+import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.functions.GroupCombineFunction;
 import org.apache.flink.api.common.typeutils.TypeComparator;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.configuration.AlgorithmOptions;
-import org.apache.flink.configuration.ConfigConstants;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.memory.MemorySegment;
 import org.apache.flink.runtime.io.disk.iomanager.IOManager;
-import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
+import org.apache.flink.runtime.jobgraph.tasks.TaskInvokable;
 import org.apache.flink.runtime.memory.MemoryAllocationException;
 import org.apache.flink.runtime.memory.MemoryManager;
 import org.apache.flink.util.MutableObjectIterator;
@@ -41,6 +41,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
+import static org.apache.flink.configuration.AlgorithmOptions.USE_LARGE_RECORDS_HANDLER;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
@@ -68,13 +69,13 @@ public final class ExternalSorterBuilder<T> {
     private static final int MIN_NUM_SORT_MEM_SEGMENTS = 10;
 
     private final MemoryManager memoryManager;
-    private final AbstractInvokable parentTask;
+    private final TaskInvokable parentTask;
     private final TypeSerializer<T> serializer;
     private final TypeComparator<T> comparator;
     private InMemorySorterFactory<T> inMemorySorterFactory;
     private int maxNumFileHandles = AlgorithmOptions.SPILLING_MAX_FAN.defaultValue();
     private boolean objectReuseEnabled = false;
-    private boolean handleLargeRecords = ConfigConstants.DEFAULT_USE_LARGE_RECORD_HANDLER;
+    private boolean handleLargeRecords = USE_LARGE_RECORDS_HANDLER.defaultValue();
     private double memoryFraction = 1.0;
     private int numSortBuffers = -1;
     private double startSpillingFraction = AlgorithmOptions.SORT_SPILLING_THRESHOLD.defaultValue();
@@ -83,14 +84,17 @@ public final class ExternalSorterBuilder<T> {
     private GroupCombineFunction<T, T> combineFunction;
     private Configuration udfConfig;
     private List<MemorySegment> memorySegments = null;
+    private final ExecutionConfig executionConfig;
 
     ExternalSorterBuilder(
             MemoryManager memoryManager,
-            AbstractInvokable parentTask,
+            TaskInvokable parentTask,
             TypeSerializer<T> serializer,
-            TypeComparator<T> comparator) {
+            TypeComparator<T> comparator,
+            ExecutionConfig executionConfig) {
         this.memoryManager = memoryManager;
         this.parentTask = parentTask;
+        this.executionConfig = executionConfig;
         this.serializer = serializer;
         this.comparator = comparator;
         this.inMemorySorterFactory =
@@ -358,7 +362,8 @@ public final class ExternalSorterBuilder<T> {
                             memoryManager,
                             mem,
                             parentTask,
-                            maxNumFileHandles);
+                            maxNumFileHandles,
+                            executionConfig);
         } else {
             largeRecordHandler = null;
         }

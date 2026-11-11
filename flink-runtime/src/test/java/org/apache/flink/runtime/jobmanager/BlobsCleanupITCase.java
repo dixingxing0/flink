@@ -29,8 +29,9 @@ import org.apache.flink.configuration.UnmodifiableConfiguration;
 import org.apache.flink.core.fs.Path;
 import org.apache.flink.runtime.blob.BlobClient;
 import org.apache.flink.runtime.blob.PermanentBlobKey;
-import org.apache.flink.runtime.clusterframework.ApplicationStatus;
+import org.apache.flink.runtime.client.JobSubmissionException;
 import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobgraph.JobGraphBuilder;
 import org.apache.flink.runtime.jobgraph.JobVertex;
 import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.minicluster.MiniCluster;
@@ -40,7 +41,6 @@ import org.apache.flink.runtime.testtasks.NoOpInvokable;
 import org.apache.flink.runtime.testutils.MiniClusterResource;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.util.ExceptionUtils;
-import org.apache.flink.util.SerializedThrowable;
 import org.apache.flink.util.TestLogger;
 
 import org.junit.AfterClass;
@@ -54,19 +54,18 @@ import javax.annotation.Nonnull;
 import java.io.File;
 import java.io.FilenameFilter;
 import java.net.InetSocketAddress;
-import java.nio.file.NoSuchFileException;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 
+import static org.apache.flink.configuration.RestartStrategyOptions.RestartStrategyType.FIXED_DELAY;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThat;
-import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
@@ -90,12 +89,12 @@ public class BlobsCleanupITCase extends TestLogger {
         blobBaseDir = TEMPORARY_FOLDER.newFolder();
 
         Configuration cfg = new Configuration();
-        cfg.setString(BlobServerOptions.STORAGE_DIRECTORY, blobBaseDir.getAbsolutePath());
-        cfg.setString(RestartStrategyOptions.RESTART_STRATEGY, "fixeddelay");
-        cfg.setInteger(RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_ATTEMPTS, 1);
+        cfg.set(BlobServerOptions.STORAGE_DIRECTORY, blobBaseDir.getAbsolutePath());
+        cfg.set(RestartStrategyOptions.RESTART_STRATEGY, FIXED_DELAY.getMainValue());
+        cfg.set(RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_ATTEMPTS, 1);
         // BLOBs are deleted from BlobCache between 1s and 2s after last reference
         // -> the BlobCache may still have the BLOB or not (let's test both cases randomly)
-        cfg.setLong(BlobServerOptions.CLEANUP_INTERVAL, 1L);
+        cfg.set(BlobServerOptions.CLEANUP_INTERVAL, 1L);
 
         configuration = new UnmodifiableConfiguration(cfg);
 
@@ -119,7 +118,7 @@ public class BlobsCleanupITCase extends TestLogger {
 
     /** Specifies which test case to run in {@link #testBlobServerCleanup(TestCase)}. */
     private enum TestCase {
-        JOB_FINISHES_SUCESSFULLY,
+        JOB_FINISHES_SUCCESSFULLY,
         JOB_IS_CANCELLED,
         JOB_FAILS,
         JOB_SUBMISSION_FAILS
@@ -128,7 +127,7 @@ public class BlobsCleanupITCase extends TestLogger {
     /** Test cleanup for a job that finishes ordinarily. */
     @Test
     public void testBlobServerCleanupFinishedJob() throws Exception {
-        testBlobServerCleanup(TestCase.JOB_FINISHES_SUCESSFULLY);
+        testBlobServerCleanup(TestCase.JOB_FINISHES_SUCCESSFULLY);
     }
 
     /** Test cleanup for a job which is cancelled after submission. */
@@ -180,23 +179,21 @@ public class BlobsCleanupITCase extends TestLogger {
             jobGraph.addUserJarBlobKey(new PermanentBlobKey());
         }
 
-        final JobSubmissionResult jobSubmissionResult = miniCluster.submitJob(jobGraph).get();
+        final CompletableFuture<JobSubmissionResult> submissionFuture =
+                miniCluster.submitJob(jobGraph);
 
         if (testCase == TestCase.JOB_SUBMISSION_FAILS) {
-            // Wait for submission to fail & check if exception is forwarded
-            Optional<SerializedThrowable> exception =
-                    miniCluster.requestJobResult(jid).get().getSerializedThrowable();
-            assertTrue(exception.isPresent());
-            assertTrue(
-                    ExceptionUtils.findThrowableSerializedAware(
-                                    exception.get(),
-                                    NoSuchFileException.class,
-                                    getClass().getClassLoader())
-                            .isPresent());
-
-            // check job status
-            assertThat(miniCluster.getJobStatus(jid).get(), is(JobStatus.FAILED));
+            try {
+                submissionFuture.get();
+                fail("Expected job submission failure.");
+            } catch (ExecutionException e) {
+                assertThat(
+                        ExceptionUtils.findThrowable(e, JobSubmissionException.class).isPresent(),
+                        is(true));
+            }
         } else {
+            final JobSubmissionResult jobSubmissionResult = submissionFuture.get();
+
             assertThat(jobSubmissionResult.getJobID(), is(jid));
 
             final CompletableFuture<JobResult> resultFuture = miniCluster.requestJobResult(jid);
@@ -210,14 +207,14 @@ public class BlobsCleanupITCase extends TestLogger {
                 // then the tasks will fail again and the restart strategy will finalise the job
                 final JobResult jobResult = resultFuture.get();
                 assertThat(jobResult.isSuccess(), is(false));
-                assertThat(jobResult.getApplicationStatus(), is(ApplicationStatus.FAILED));
+                assertThat(jobResult.getJobStatus().orElse(null), is(JobStatus.FAILED));
             } else if (testCase == TestCase.JOB_IS_CANCELLED) {
 
                 miniCluster.cancelJob(jid);
 
                 final JobResult jobResult = resultFuture.get();
                 assertThat(jobResult.isSuccess(), is(false));
-                assertThat(jobResult.getApplicationStatus(), is(ApplicationStatus.CANCELED));
+                assertThat(jobResult.getJobStatus().orElse(null), is(JobStatus.CANCELED));
             } else {
                 final JobResult jobResult = resultFuture.get();
                 Throwable cause =
@@ -254,7 +251,10 @@ public class BlobsCleanupITCase extends TestLogger {
         }
         source.setParallelism(numTasks);
 
-        return new JobGraph(new JobID(0, testCase.ordinal()), "BlobCleanupTest", source);
+        return JobGraphBuilder.newStreamingJobGraphBuilder()
+                .setJobId(new JobID(0, testCase.ordinal()))
+                .addJobVertex(source)
+                .build();
     }
 
     /**

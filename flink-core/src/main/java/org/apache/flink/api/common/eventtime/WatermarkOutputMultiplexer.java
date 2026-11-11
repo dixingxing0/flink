@@ -19,11 +19,10 @@
 package org.apache.flink.api.common.eventtime;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.api.common.eventtime.CombinedWatermarkStatus.PartialWatermark;
 import org.apache.flink.util.Preconditions;
 
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 import static org.apache.flink.util.Preconditions.checkState;
@@ -49,6 +48,15 @@ import static org.apache.flink.util.Preconditions.checkState;
  */
 @Internal
 public class WatermarkOutputMultiplexer {
+    /** A callback for propagating changes to split based watermarks. */
+    @Internal
+    public interface WatermarkUpdateListener {
+        /** Called when the watermark increases. */
+        void onWatermarkUpdate(long watermark);
+
+        /** Called when the idle state changes. */
+        void onIdleUpdate(boolean idle);
+    }
 
     /**
      * The {@link WatermarkOutput} that we use to emit our multiplexed watermark updates. We assume
@@ -57,16 +65,12 @@ public class WatermarkOutputMultiplexer {
      */
     private final WatermarkOutput underlyingOutput;
 
-    /** The combined watermark over the per-output watermarks. */
-    private long combinedWatermark = Long.MIN_VALUE;
-
     /**
      * Map view, to allow finding them when requesting the {@link WatermarkOutput} for a given id.
      */
-    private final Map<String, OutputState> watermarkPerOutputId;
+    private final Map<String, PartialWatermark> watermarkPerOutputId;
 
-    /** List of all watermark outputs, for efficient access. */
-    private final List<OutputState> watermarkOutputs;
+    private final CombinedWatermarkStatus combinedWatermarkStatus;
 
     /**
      * Creates a new {@link WatermarkOutputMultiplexer} that emits combined updates to the given
@@ -75,7 +79,7 @@ public class WatermarkOutputMultiplexer {
     public WatermarkOutputMultiplexer(WatermarkOutput underlyingOutput) {
         this.underlyingOutput = underlyingOutput;
         this.watermarkPerOutputId = new HashMap<>();
-        this.watermarkOutputs = new ArrayList<>();
+        this.combinedWatermarkStatus = new CombinedWatermarkStatus();
     }
 
     /**
@@ -83,19 +87,25 @@ public class WatermarkOutputMultiplexer {
      * an output ID that can be used to get a deferred or immediate {@link WatermarkOutput} for that
      * output.
      */
-    public void registerNewOutput(String id) {
-        final OutputState outputState = new OutputState();
+    public void registerNewOutput(String id, WatermarkUpdateListener onWatermarkUpdate) {
+        final PartialWatermark outputState = new PartialWatermark(onWatermarkUpdate);
 
-        final OutputState previouslyRegistered = watermarkPerOutputId.putIfAbsent(id, outputState);
+        final PartialWatermark previouslyRegistered =
+                watermarkPerOutputId.putIfAbsent(id, outputState);
         checkState(previouslyRegistered == null, "Already contains an output for ID %s", id);
 
-        watermarkOutputs.add(outputState);
+        combinedWatermarkStatus.add(outputState);
+    }
+
+    /** Registers a new multiplexed output with a no-op listener. */
+    public void registerNewOutput(String id) {
+        registerNewOutput(id, new NoOpWatermarkUpdateListener());
     }
 
     public boolean unregisterOutput(String id) {
-        final OutputState output = watermarkPerOutputId.remove(id);
+        final PartialWatermark output = watermarkPerOutputId.remove(id);
         if (output != null) {
-            watermarkOutputs.remove(output);
+            combinedWatermarkStatus.remove(output);
             return true;
         } else {
             return false;
@@ -109,7 +119,7 @@ public class WatermarkOutputMultiplexer {
      * outputs.
      */
     public WatermarkOutput getImmediateOutput(String outputId) {
-        final OutputState outputState = watermarkPerOutputId.get(outputId);
+        final PartialWatermark outputState = watermarkPerOutputId.get(outputId);
         Preconditions.checkArgument(
                 outputState != null, "no output registered under id %s", outputId);
         return new ImmediateOutput(outputState);
@@ -122,7 +132,7 @@ public class WatermarkOutputMultiplexer {
      * outputs.
      */
     public WatermarkOutput getDeferredOutput(String outputId) {
-        final OutputState outputState = watermarkPerOutputId.get(outputId);
+        final PartialWatermark outputState = watermarkPerOutputId.get(outputId);
         Preconditions.checkArgument(
                 outputState != null, "no output registered under id %s", outputId);
         return new DeferredOutput(outputState);
@@ -138,69 +148,32 @@ public class WatermarkOutputMultiplexer {
 
     /**
      * Checks whether we need to update the combined watermark. Should be called when a newly
-     * emitted per-output watermark is higher than the max so far or if we need to combined the
+     * emitted per-output watermark is higher than the max so far or if we need to combine the
      * deferred per-output updates.
+     *
+     * <p>It also handles scenarios where both emitting a watermark and entering the idle state
+     * occur within the same invocation.
+     *
+     * <p>Idleness is propagated in both directions: the combined status is reported to the {@link
+     * #underlyingOutput} whenever it is idle or active. An output that is active but whose
+     * watermark does not advance produces neither a watermark nor an idle update, so without
+     * reporting the active state the underlying output would never learn that it is active again.
+     *
+     * <p>Activity is only announced for outputs that reported being active. An output is registered
+     * for every assigned split, even when the reader never reports anything through it, and
+     * reporting idleness on one output says nothing about the others: such outputs hold the
+     * combined watermark back, but they must not keep the downstream output active.
      */
     private void updateCombinedWatermark() {
-        long minimumOverAllOutputs = Long.MAX_VALUE;
-
-        boolean hasOutputs = false;
-        boolean allIdle = true;
-        for (OutputState outputState : watermarkOutputs) {
-            if (!outputState.isIdle()) {
-                minimumOverAllOutputs = Math.min(minimumOverAllOutputs, outputState.getWatermark());
-                allIdle = false;
-            }
-            hasOutputs = true;
+        if (combinedWatermarkStatus.updateCombinedWatermark()) {
+            underlyingOutput.emitWatermark(
+                    new Watermark(combinedWatermarkStatus.getCombinedWatermark()));
         }
 
-        // if we don't have any outputs minimumOverAllOutputs is not valid, it's still
-        // at its initial Long.MAX_VALUE state and we must not emit that
-        if (!hasOutputs) {
-            return;
-        }
-
-        if (allIdle) {
+        if (combinedWatermarkStatus.isIdle()) {
             underlyingOutput.markIdle();
-        } else if (minimumOverAllOutputs > combinedWatermark) {
-            combinedWatermark = minimumOverAllOutputs;
-            underlyingOutput.emitWatermark(new Watermark(minimumOverAllOutputs));
-        }
-    }
-
-    /** Per-output watermark state. */
-    private static class OutputState {
-        private long watermark = Long.MIN_VALUE;
-        private boolean idle = false;
-
-        /**
-         * Returns the current watermark timestamp. This will throw {@link IllegalStateException} if
-         * the output is currently idle.
-         */
-        public long getWatermark() {
-            checkState(!idle, "Output is idle.");
-            return watermark;
-        }
-
-        /**
-         * Returns true if the watermark was advanced, that is if the new watermark is larger than
-         * the previous one.
-         *
-         * <p>Setting a watermark will clear the idleness flag.
-         */
-        public boolean setWatermark(long watermark) {
-            this.idle = false;
-            final boolean updated = watermark > this.watermark;
-            this.watermark = Math.max(watermark, this.watermark);
-            return updated;
-        }
-
-        public boolean isIdle() {
-            return idle;
-        }
-
-        public void setIdle(boolean idle) {
-            this.idle = idle;
+        } else if (combinedWatermarkStatus.hasActiveOutput()) {
+            underlyingOutput.markActive();
         }
     }
 
@@ -210,9 +183,9 @@ public class WatermarkOutputMultiplexer {
      */
     private class ImmediateOutput implements WatermarkOutput {
 
-        private final OutputState state;
+        private final PartialWatermark state;
 
-        public ImmediateOutput(OutputState state) {
+        public ImmediateOutput(PartialWatermark state) {
             this.state = state;
         }
 
@@ -223,7 +196,7 @@ public class WatermarkOutputMultiplexer {
 
             // if it's higher than the max watermark so far we might have to update the
             // combined watermark
-            if (wasUpdated && timestamp > combinedWatermark) {
+            if (wasUpdated && timestamp > combinedWatermarkStatus.getCombinedWatermark()) {
                 updateCombinedWatermark();
             }
         }
@@ -236,6 +209,14 @@ public class WatermarkOutputMultiplexer {
             // was holding back the watermark or not.
             updateCombinedWatermark();
         }
+
+        @Override
+        public void markActive() {
+            state.setIdle(false);
+
+            // stop potentially automatic advancing of the watermark
+            updateCombinedWatermark();
+        }
     }
 
     /**
@@ -245,9 +226,9 @@ public class WatermarkOutputMultiplexer {
      */
     private static class DeferredOutput implements WatermarkOutput {
 
-        private final OutputState state;
+        private final PartialWatermark state;
 
-        public DeferredOutput(OutputState state) {
+        public DeferredOutput(PartialWatermark state) {
             this.state = state;
         }
 
@@ -260,5 +241,20 @@ public class WatermarkOutputMultiplexer {
         public void markIdle() {
             state.setIdle(true);
         }
+
+        @Override
+        public void markActive() {
+            state.setIdle(false);
+        }
+    }
+
+    /** A No-op implementation of {@link WatermarkUpdateListener}. */
+    @Internal
+    public static class NoOpWatermarkUpdateListener implements WatermarkUpdateListener {
+        @Override
+        public void onWatermarkUpdate(long watermark) {}
+
+        @Override
+        public void onIdleUpdate(boolean idle) {}
     }
 }

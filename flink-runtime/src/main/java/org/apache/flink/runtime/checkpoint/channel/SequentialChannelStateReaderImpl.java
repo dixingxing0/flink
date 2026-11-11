@@ -23,15 +23,20 @@ import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.runtime.checkpoint.StateObjectCollection;
 import org.apache.flink.runtime.checkpoint.TaskStateSnapshot;
 import org.apache.flink.runtime.io.network.api.writer.ResultPartitionWriter;
+import org.apache.flink.runtime.io.network.logger.NetworkActionsLogger;
 import org.apache.flink.runtime.io.network.partition.consumer.InputGate;
 import org.apache.flink.runtime.state.AbstractChannelStateHandle;
+import org.apache.flink.runtime.state.ChannelStateHelper;
 import org.apache.flink.runtime.state.StreamStateHandle;
+import org.apache.flink.streaming.runtime.io.recovery.RecordFilterContext;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -51,18 +56,61 @@ public class SequentialChannelStateReaderImpl implements SequentialChannelStateR
 
     public SequentialChannelStateReaderImpl(TaskStateSnapshot taskStateSnapshot) {
         this.taskStateSnapshot = taskStateSnapshot;
-        this.serializer = new ChannelStateSerializerImpl();
-        this.chunkReader = new ChannelStateChunkReader(serializer);
+        serializer = new ChannelStateSerializerImpl();
+        chunkReader = new ChannelStateChunkReader(serializer);
     }
 
     @Override
-    public void readInputData(InputGate[] inputGates) throws IOException, InterruptedException {
-        try (InputChannelRecoveredStateHandler stateHandler =
-                new InputChannelRecoveredStateHandler(inputGates)) {
-            read(
-                    stateHandler,
-                    groupByDelegate(
-                            streamSubtaskStates(), OperatorSubtaskState::getInputChannelState));
+    public Optional<FetchedChannelState> readInputData(
+            InputGate[] inputGates, RecordFilterContext filterContext)
+            throws IOException, InterruptedException {
+
+        // Create filtering handler if filtering is needed
+        ChannelStateFilteringHandler filteringHandler =
+                filterContext.isCheckpointingDuringRecoveryEnabled()
+                        ? ChannelStateFilteringHandler.createFromContext(filterContext, inputGates)
+                        : null;
+
+        // Manual close ordering so the produced spill file can be published after
+        // stateHandler.close() flushes the filter writer.
+        AbstractInputChannelRecoveredStateHandler stateHandler =
+                AbstractInputChannelRecoveredStateHandler.create(
+                        inputGates,
+                        taskStateSnapshot.getInputRescalingDescriptor(),
+                        filterContext.isCheckpointingDuringRecoveryEnabled(),
+                        filteringHandler,
+                        filterContext.getMemorySegmentSize(),
+                        filterContext.getTmpDirectories());
+        try (ChannelStateFilteringHandler ignored = filteringHandler) {
+            try (stateHandler) {
+                read(
+                        stateHandler,
+                        groupByDelegate(
+                                streamSubtaskStates(),
+                                ChannelStateHelper::extractUnmergedInputHandles));
+                read(
+                        stateHandler,
+                        groupByDelegate(
+                                streamSubtaskStates(),
+                                OperatorSubtaskState::getUpstreamOutputBufferState));
+
+                if (filteringHandler != null) {
+                    checkState(
+                            !filteringHandler.hasPartialData(),
+                            "Not all data has been fully consumed during filtering");
+                }
+            }
+            // stateHandler.close() (above) has flushed the filter writer and published the
+            // produced spill file, so read getProducedChannelState() after the close completes.
+            return Optional.ofNullable(stateHandler.getProducedChannelState());
+        } catch (Throwable t) {
+            // The state was not handed off, so no drainer will release its spill files: delete
+            // them here. This does not rely on the produced state having been built, since
+            // stateHandler.close() itself may be what failed.
+            if (stateHandler instanceof AbstractSpillingHandler) {
+                ((AbstractSpillingHandler) stateHandler).discardSpilledFiles();
+            }
+            throw t;
         }
     }
 
@@ -70,12 +118,15 @@ public class SequentialChannelStateReaderImpl implements SequentialChannelStateR
     public void readOutputData(ResultPartitionWriter[] writers, boolean notifyAndBlockOnCompletion)
             throws IOException, InterruptedException {
         try (ResultSubpartitionRecoveredStateHandler stateHandler =
-                new ResultSubpartitionRecoveredStateHandler(writers, notifyAndBlockOnCompletion)) {
+                new ResultSubpartitionRecoveredStateHandler(
+                        writers,
+                        notifyAndBlockOnCompletion,
+                        taskStateSnapshot.getOutputRescalingDescriptor())) {
             read(
                     stateHandler,
                     groupByDelegate(
                             streamSubtaskStates(),
-                            OperatorSubtaskState::getResultSubpartitionState));
+                            ChannelStateHelper::extractUnmergedOutputHandles));
         }
     }
 
@@ -97,10 +148,14 @@ public class SequentialChannelStateReaderImpl implements SequentialChannelStateR
             throws IOException, InterruptedException {
         try (FSDataInputStream is = streamStateHandle.openInputStream()) {
             serializer.readHeader(is);
-            for (Tuple2<Long, Info> offsetAndChannelInfo :
+            for (RescaledOffset<Info> offsetAndChannelInfo :
                     extractOffsetsSorted(channelStateHandles)) {
                 chunkReader.readChunk(
-                        is, offsetAndChannelInfo.f0, stateHandler, offsetAndChannelInfo.f1);
+                        is,
+                        offsetAndChannelInfo.offset,
+                        stateHandler,
+                        offsetAndChannelInfo.channelInfo,
+                        offsetAndChannelInfo.oldSubtaskIndex);
             }
         }
     }
@@ -122,27 +177,48 @@ public class SequentialChannelStateReaderImpl implements SequentialChannelStateR
 
     private static <Info, Handle extends AbstractChannelStateHandle<Info>>
             Consumer<Handle> validate() {
-        Set<Info> seen = new HashSet<>();
-        // expect each channel to be described only once; otherwise, buffers in channel could be
+        Set<Tuple2<Info, Integer>> seen = new HashSet<>();
+        // expect each channel/subtask to be described only once; otherwise, buffers in channel
+        // could be
         // re-ordered
-        return handle -> checkState(seen.add(handle.getInfo()), "duplicate channel info: %s");
+        return handle -> {
+            if (!seen.add(new Tuple2<>(handle.getInfo(), handle.getSubtaskIndex()))) {
+                throw new IllegalStateException("Duplicate channel info: " + handle);
+            }
+        };
     }
 
     private static <Info, Handle extends AbstractChannelStateHandle<Info>>
-            List<Tuple2<Long, Info>> extractOffsetsSorted(List<Handle> channelStateHandles) {
+            List<RescaledOffset<Info>> extractOffsetsSorted(List<Handle> channelStateHandles) {
         return channelStateHandles.stream()
                 .flatMap(SequentialChannelStateReaderImpl::extractOffsets)
-                .sorted(comparingLong(offsetAndInfo -> offsetAndInfo.f0))
+                .sorted(comparingLong(offsetAndInfo -> offsetAndInfo.offset))
                 .collect(toList());
     }
 
     private static <Info, Handle extends AbstractChannelStateHandle<Info>>
-            Stream<Tuple2<Long, Info>> extractOffsets(Handle handle) {
-        return handle.getOffsets().stream().map(offset -> Tuple2.of(offset, handle.getInfo()));
+            Stream<RescaledOffset<Info>> extractOffsets(Handle handle) {
+        return handle.getOffsets().stream()
+                .map(
+                        offset ->
+                                new RescaledOffset<>(
+                                        offset, handle.getInfo(), handle.getSubtaskIndex()));
     }
 
     @Override
     public void close() throws Exception {}
+
+    static class RescaledOffset<Info> {
+        final Long offset;
+        final Info channelInfo;
+        final int oldSubtaskIndex;
+
+        RescaledOffset(Long offset, Info channelInfo, int oldSubtaskIndex) {
+            this.offset = offset;
+            this.channelInfo = channelInfo;
+            this.oldSubtaskIndex = oldSubtaskIndex;
+        }
+    }
 }
 
 class ChannelStateChunkReader {
@@ -152,11 +228,12 @@ class ChannelStateChunkReader {
         this.serializer = serializer;
     }
 
-    <Info, Context, Handle extends AbstractChannelStateHandle<Info>> void readChunk(
+    <Info, Context> void readChunk(
             FSDataInputStream source,
             long sourceOffset,
             RecoveredChannelStateHandler<Info, Context> stateHandler,
-            Info channelInfo)
+            Info channelInfo,
+            int oldSubtaskIndex)
             throws IOException, InterruptedException {
         if (source.getPos() != sourceOffset) {
             source.seek(sourceOffset);
@@ -165,15 +242,19 @@ class ChannelStateChunkReader {
         while (length > 0) {
             RecoveredChannelStateHandler.BufferWithContext<Context> bufferWithContext =
                     stateHandler.getBuffer(channelInfo);
-            try {
+            try (Closeable ignored =
+                    NetworkActionsLogger.measureIO(
+                            "ChannelStateChunkReader#readChunk", bufferWithContext.buffer)) {
                 while (length > 0 && bufferWithContext.buffer.isWritable()) {
                     length -= serializer.readData(source, bufferWithContext.buffer, length);
                 }
             } catch (Exception e) {
-                bufferWithContext.buffer.recycle();
+                bufferWithContext.close();
                 throw e;
             }
-            stateHandler.recover(channelInfo, bufferWithContext.context);
+
+            // Passing the ownership of buffer to inside.
+            stateHandler.recover(channelInfo, oldSubtaskIndex, bufferWithContext);
         }
     }
 }

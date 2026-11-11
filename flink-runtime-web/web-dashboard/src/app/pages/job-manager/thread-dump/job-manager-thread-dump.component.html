@@ -1,0 +1,55 @@
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~     http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing, software
+  ~ distributed under the License is distributed on an "AS IS" BASIS,
+  ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~ See the License for the specific language governing permissions and
+  ~ limitations under the License.
+  -->
+
+<nz-code-editor
+  flinkAutoResize
+  [nzLoading]="loading"
+  [ngModel]="dump"
+  [nzEditorOption]="editorOptions"
+></nz-code-editor>
+<div class="thread-dump-toolbar">
+  <nz-space-compact class="thread-dump-mode-group">
+    <a
+      nz-button
+      nzSize="small"
+      [nzType]="mode === 'lite' ? 'primary' : 'default'"
+      nz-tooltip
+      nzTooltipTitle="Stack traces only, no lock info (jstack without -l). Negligible JVM pause."
+      (click)="selectMode('lite')"
+    >
+      Lite
+    </a>
+    <a
+      nz-button
+      nzSize="small"
+      [nzType]="mode === 'full' ? 'primary' : 'default'"
+      [nzDanger]="true"
+      nz-tooltip
+      nzTooltipTitle="Adds locked monitors and j.u.c. synchronizers (jstack -l). Pauses the JVM in a safepoint for a duration that scales with heap size and thread count — seconds on large JMs."
+      (click)="selectMode('full')"
+    >
+      Full
+      <i nz-icon nzType="exclamation-circle" nzTheme="fill" class="thread-dump-mode-warn"></i>
+    </a>
+  </nz-space-compact>
+  <flink-addon-compact
+    [downloadHref]="downloadUrl"
+    [downloadName]="downloadName"
+    (reload)="reload()"
+  ></flink-addon-compact>
+</div>

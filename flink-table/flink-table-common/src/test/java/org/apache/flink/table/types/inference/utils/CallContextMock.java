@@ -20,10 +20,13 @@ package org.apache.flink.table.types.inference.utils;
 
 import org.apache.flink.table.catalog.DataTypeFactory;
 import org.apache.flink.table.functions.FunctionDefinition;
+import org.apache.flink.table.functions.ModelSemantics;
+import org.apache.flink.table.functions.TableSemantics;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.inference.CallContext;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /** {@link CallContext} mock for testing purposes. */
@@ -44,6 +47,12 @@ public class CallContextMock implements CallContext {
     public String name;
 
     public Optional<DataType> outputDataType;
+
+    public boolean isGroupedAggregation;
+
+    public Map<Integer, TableSemantics> tableSemantics;
+
+    public Map<Integer, ModelSemantics> modelSemantics;
 
     @Override
     public DataTypeFactory getDataTypeFactory() {
@@ -85,5 +94,26 @@ public class CallContextMock implements CallContext {
     @Override
     public Optional<DataType> getOutputDataType() {
         return outputDataType;
+    }
+
+    @Override
+    public boolean isGroupedAggregation() {
+        return isGroupedAggregation;
+    }
+
+    @Override
+    public Optional<TableSemantics> getTableSemantics(int pos) {
+        if (tableSemantics == null) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(tableSemantics.get(pos));
+    }
+
+    @Override
+    public Optional<ModelSemantics> getModelSemantics(int pos) {
+        if (modelSemantics == null) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(modelSemantics.get(pos));
     }
 }

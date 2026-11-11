@@ -19,38 +19,104 @@
 package org.apache.flink.sql.parser.dql;
 
 import org.apache.calcite.sql.SqlCall;
+import org.apache.calcite.sql.SqlCharStringLiteral;
+import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.SqlSpecialOperator;
-import org.apache.calcite.sql.SqlWriter;
 import org.apache.calcite.sql.parser.SqlParserPos;
 
-import java.util.Collections;
-import java.util.List;
+/**
+ * SHOW TABLES sql call. The full syntax for show functions is as followings:
+ *
+ * <pre>{@code
+ * SHOW ( VIEWS | [ MATERIALIZED ]TABLES ) [ ( FROM | IN ) [catalog_name.]database_name ] [ [NOT] LIKE
+ * <sql_like_pattern> ] statement
+ * }</pre>
+ */
+public class SqlShowTables extends SqlShowCall {
 
-/** SHOW Tables sql call. */
-public class SqlShowTables extends SqlCall {
+    private final SqlTableKind kind;
 
-    public static final SqlSpecialOperator OPERATOR =
-            new SqlSpecialOperator("SHOW TABLES", SqlKind.OTHER);
-
-    public SqlShowTables(SqlParserPos pos) {
-        super(pos);
+    public SqlShowTables(
+            SqlParserPos pos,
+            SqlTableKind kind,
+            String preposition,
+            SqlIdentifier databaseName,
+            boolean notLike,
+            SqlCharStringLiteral likeLiteral) {
+        // only LIKE currently supported for SHOW TABLES
+        super(
+                pos,
+                preposition,
+                databaseName,
+                likeLiteral == null ? null : "LIKE",
+                likeLiteral,
+                notLike);
+        this.kind = kind;
     }
 
     @Override
     public SqlOperator getOperator() {
-        return OPERATOR;
+        return kind.getOperator();
     }
 
     @Override
-    public List<SqlNode> getOperandList() {
-        return Collections.emptyList();
+    String getOperationName() {
+        return getOperator().getName();
     }
 
-    @Override
-    public void unparse(SqlWriter writer, int leftPrec, int rightPrec) {
-        writer.keyword("SHOW TABLES");
+    public SqlTableKind getTableKind() {
+        return kind;
+    }
+
+    private static SqlCall createCallForKind(
+            SqlOperator operator, SqlParserPos pos, SqlNode... operands) {
+        SqlTableKind tableKind = SqlTableKind.TABLE;
+        for (SqlTableKind candidate : SqlTableKind.values()) {
+            if (candidate.getOperator() == operator) {
+                tableKind = candidate;
+                break;
+            }
+        }
+        return new SqlShowTables(
+                pos,
+                tableKind,
+                operandToString(operands[1]),
+                (SqlIdentifier) operands[0],
+                operandToBoolean(operands[4]),
+                (SqlCharStringLiteral) operands[3]);
+    }
+
+    /**
+     * The kind of table. Keep in sync with {@link
+     * org.apache.flink.table.catalog.CatalogBaseTable.TableKind}.
+     */
+    public enum SqlTableKind {
+        MATERIALIZED_TABLE(getSpecialOperator("SHOW MATERIALIZED TABLES")),
+        TABLE(getSpecialOperator("SHOW TABLES")),
+        VIEW(getSpecialOperator("SHOW VIEWS"));
+
+        private final SqlSpecialOperator operator;
+
+        SqlTableKind(final SqlSpecialOperator operator) {
+            this.operator = operator;
+        }
+
+        public SqlSpecialOperator getOperator() {
+            return operator;
+        }
+
+        private static SqlSpecialOperator getSpecialOperator(final String name) {
+            return new SqlSpecialOperator(name, SqlKind.OTHER) {
+                @Override
+                public SqlCall createCall(
+                        SqlLiteral functionQualifier, SqlParserPos pos, SqlNode... operands) {
+                    return createCallForKind(this, pos, operands);
+                }
+            };
+        }
     }
 }

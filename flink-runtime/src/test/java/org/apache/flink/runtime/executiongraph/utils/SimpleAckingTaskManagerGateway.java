@@ -19,10 +19,8 @@
 package org.apache.flink.runtime.executiongraph.utils;
 
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
-import org.apache.flink.runtime.concurrent.FutureUtils;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.executiongraph.PartitionInfo;
@@ -30,11 +28,11 @@ import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobmanager.slots.TaskManagerGateway;
 import org.apache.flink.runtime.messages.Acknowledge;
-import org.apache.flink.runtime.messages.TaskBackPressureResponse;
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
 import org.apache.flink.util.SerializedValue;
 import org.apache.flink.util.function.TriConsumer;
 
+import java.time.Duration;
 import java.util.Collection;
 import java.util.Set;
 import java.util.UUID;
@@ -62,14 +60,9 @@ public class SimpleAckingTaskManagerGateway implements TaskManagerGateway {
             (ignore1, ignore2) -> {};
 
     private CheckpointConsumer checkpointConsumer =
-            (executionAttemptID,
-                    jobId,
-                    checkpointId,
-                    timestamp,
-                    checkpointOptions,
-                    advanceToEndOfEventTime) -> {};
+            (executionAttemptID, jobId, checkpointId, timestamp, checkpointOptions) -> {};
 
-    private TriConsumer<ExecutionAttemptID, Iterable<PartitionInfo>, Time>
+    private TriConsumer<ExecutionAttemptID, Iterable<PartitionInfo>, Duration>
             updatePartitionsConsumer = (ignore1, ignore2, ignore3) -> {};
 
     public void setSubmitConsumer(Consumer<TaskDeploymentDescriptor> submitConsumer) {
@@ -95,7 +88,7 @@ public class SimpleAckingTaskManagerGateway implements TaskManagerGateway {
     }
 
     public void setUpdatePartitionsConsumer(
-            TriConsumer<ExecutionAttemptID, Iterable<PartitionInfo>, Time>
+            TriConsumer<ExecutionAttemptID, Iterable<PartitionInfo>, Duration>
                     updatePartitionsConsumer) {
         this.updatePartitionsConsumer = updatePartitionsConsumer;
     }
@@ -106,20 +99,15 @@ public class SimpleAckingTaskManagerGateway implements TaskManagerGateway {
     }
 
     @Override
-    public CompletableFuture<TaskBackPressureResponse> requestTaskBackPressure(
-            ExecutionAttemptID executionAttemptID, int requestId, Time timeout) {
-        return FutureUtils.completedExceptionally(new UnsupportedOperationException());
-    }
-
-    @Override
-    public CompletableFuture<Acknowledge> submitTask(TaskDeploymentDescriptor tdd, Time timeout) {
+    public CompletableFuture<Acknowledge> submitTask(
+            TaskDeploymentDescriptor tdd, Duration timeout) {
         submitConsumer.accept(tdd);
         return CompletableFuture.completedFuture(Acknowledge.get());
     }
 
     @Override
     public CompletableFuture<Acknowledge> cancelTask(
-            ExecutionAttemptID executionAttemptID, Time timeout) {
+            ExecutionAttemptID executionAttemptID, Duration timeout) {
         cancelConsumer.accept(executionAttemptID);
         return CompletableFuture.completedFuture(Acknowledge.get());
     }
@@ -128,7 +116,7 @@ public class SimpleAckingTaskManagerGateway implements TaskManagerGateway {
     public CompletableFuture<Acknowledge> updatePartitions(
             ExecutionAttemptID executionAttemptID,
             Iterable<PartitionInfo> partitionInfos,
-            Time timeout) {
+            Duration timeout) {
         updatePartitionsConsumer.accept(executionAttemptID, partitionInfos, timeout);
         return CompletableFuture.completedFuture(Acknowledge.get());
     }
@@ -139,35 +127,32 @@ public class SimpleAckingTaskManagerGateway implements TaskManagerGateway {
     }
 
     @Override
-    public void notifyCheckpointComplete(
+    public void notifyCheckpointOnComplete(
             ExecutionAttemptID executionAttemptID,
             JobID jobId,
-            long checkpointId,
-            long timestamp) {}
+            long completedCheckpointId,
+            long completedTimestamp,
+            long lastSubsumedCheckpointId) {}
 
     @Override
     public void notifyCheckpointAborted(
             ExecutionAttemptID executionAttemptID,
             JobID jobId,
             long checkpointId,
+            long latestCompletedCheckpointId,
             long timestamp) {}
 
     @Override
-    public void triggerCheckpoint(
+    public CompletableFuture<Acknowledge> triggerCheckpoint(
             ExecutionAttemptID executionAttemptID,
             JobID jobId,
             long checkpointId,
             long timestamp,
-            CheckpointOptions checkpointOptions,
-            boolean advanceToEndOfEventTime) {
+            CheckpointOptions checkpointOptions) {
 
         checkpointConsumer.accept(
-                executionAttemptID,
-                jobId,
-                checkpointId,
-                timestamp,
-                checkpointOptions,
-                advanceToEndOfEventTime);
+                executionAttemptID, jobId, checkpointId, timestamp, checkpointOptions);
+        return CompletableFuture.completedFuture(Acknowledge.get());
     }
 
     @Override
@@ -179,7 +164,7 @@ public class SimpleAckingTaskManagerGateway implements TaskManagerGateway {
 
     @Override
     public CompletableFuture<Acknowledge> freeSlot(
-            AllocationID allocationId, Throwable cause, Time timeout) {
+            AllocationID allocationId, Throwable cause, Duration timeout) {
         final BiFunction<AllocationID, Throwable, CompletableFuture<Acknowledge>>
                 currentFreeSlotFunction = freeSlotFunction;
 
@@ -198,7 +183,6 @@ public class SimpleAckingTaskManagerGateway implements TaskManagerGateway {
                 JobID jobId,
                 long checkpointId,
                 long timestamp,
-                CheckpointOptions checkpointOptions,
-                boolean advanceToEndOfEventTime);
+                CheckpointOptions checkpointOptions);
     }
 }

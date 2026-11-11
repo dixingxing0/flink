@@ -18,24 +18,19 @@
 
 package org.apache.flink.runtime.jobmaster.slotpool;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
-import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
-import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
 import org.apache.flink.runtime.jobmanager.slots.TaskManagerGateway;
 import org.apache.flink.runtime.jobmaster.AllocatedSlotReport;
 import org.apache.flink.runtime.jobmaster.JobMasterId;
 import org.apache.flink.runtime.jobmaster.SlotInfo;
-import org.apache.flink.runtime.jobmaster.SlotRequestId;
 import org.apache.flink.runtime.resourcemanager.ResourceManagerGateway;
-import org.apache.flink.runtime.slots.ResourceRequirement;
 import org.apache.flink.runtime.taskexecutor.slot.SlotOffer;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
 
-import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.Collection;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -47,13 +42,7 @@ public interface SlotPool extends AllocatedSlotActions, AutoCloseable {
     //  lifecycle
     // ------------------------------------------------------------------------
 
-    void start(
-            JobMasterId jobMasterId,
-            String newJobManagerAddress,
-            ComponentMainThreadExecutor jmMainThreadScheduledExecutor)
-            throws Exception;
-
-    void suspend();
+    void start(JobMasterId jobMasterId, String newJobManagerAddress) throws Exception;
 
     void close();
 
@@ -114,33 +103,16 @@ public interface SlotPool extends AllocatedSlotActions, AutoCloseable {
             TaskManagerGateway taskManagerGateway,
             Collection<SlotOffer> offers);
 
-    /**
-     * Fails the slot with the given allocation id.
-     *
-     * @param allocationID identifying the slot which is being failed
-     * @param cause of the failure
-     * @return An optional task executor id if this task executor has no more slots registered
-     */
-    Optional<ResourceID> failAllocation(AllocationID allocationID, Exception cause);
-
-    default Optional<ResourceID> failAllocation(
-            @Nullable ResourceID resourceId, AllocationID allocationID, Exception cause) {
-        return failAllocation(allocationID, cause);
-    }
-
     // ------------------------------------------------------------------------
     //  allocating and disposing slots
     // ------------------------------------------------------------------------
 
     /**
-     * Returns a list of {@link SlotInfoWithUtilization} objects about all slots that are currently
-     * available in the slot pool.
+     * Returns all free slot tracker.
      *
-     * @return a list of {@link SlotInfoWithUtilization} objects about all slots that are currently
-     *     available in the slot pool.
+     * @return all free slot tracker
      */
-    @Nonnull
-    Collection<SlotInfoWithUtilization> getAvailableSlotsInformation();
+    FreeSlotTracker getFreeSlotTracker();
 
     /**
      * Returns a list of {@link SlotInfo} objects about all slots that are currently allocated in
@@ -152,59 +124,39 @@ public interface SlotPool extends AllocatedSlotActions, AutoCloseable {
     Collection<SlotInfo> getAllocatedSlotsInformation();
 
     /**
-     * Allocates the available slot with the given allocation id under the given request id for the
-     * given requirement profile. The slot must be able to fulfill the requirement profile,
-     * otherwise an {@link IllegalStateException} will be thrown.
+     * Allocates the available slot with the given physical slot request. The slot must be able to
+     * fulfill the requirement profile, otherwise an {@link IllegalStateException} will be thrown.
      *
-     * @param slotRequestId identifying the requested slot
      * @param allocationID the allocation id of the requested available slot
-     * @param requirementProfile resource profile of the requirement for which to allocate the slot
+     * @param physicalSlotRequest the physical slot request.
      * @return the previously available slot with the given allocation id, if a slot with this
      *     allocation id exists
      */
     Optional<PhysicalSlot> allocateAvailableSlot(
-            @Nonnull SlotRequestId slotRequestId,
-            @Nonnull AllocationID allocationID,
-            @Nonnull ResourceProfile requirementProfile);
+            AllocationID allocationID, PhysicalSlotRequest physicalSlotRequest);
 
     /**
      * Request the allocation of a new slot from the resource manager. This method will not return a
      * slot from the already available slots from the pool, but instead will add a new slot to that
      * pool that is immediately allocated and returned.
      *
-     * @param slotRequestId identifying the requested slot
-     * @param resourceProfile resource profile that specifies the resource requirements for the
-     *     requested slot
+     * @param physicalSlotRequest the physical slot request descriptor.
      * @param timeout timeout for the allocation procedure
      * @return a newly allocated slot that was previously not available.
      */
-    @Nonnull
     CompletableFuture<PhysicalSlot> requestNewAllocatedSlot(
-            @Nonnull SlotRequestId slotRequestId,
-            @Nonnull ResourceProfile resourceProfile,
-            @Nullable Time timeout);
+            PhysicalSlotRequest physicalSlotRequest, @Nullable Duration timeout);
 
     /**
      * Requests the allocation of a new batch slot from the resource manager. Unlike the normal
      * slot, a batch slot will only time out if the slot pool does not contain a suitable slot.
      * Moreover, it won't react to failure signals from the resource manager.
      *
-     * @param slotRequestId identifying the requested slot
-     * @param resourceProfile resource profile that specifies the resource requirements for the
-     *     requested batch slot
+     * @param physicalSlotRequest the physical slot request descriptor.
      * @return a future which is completed with newly allocated batch slot
      */
-    @Nonnull
     CompletableFuture<PhysicalSlot> requestNewAllocatedBatchSlot(
-            @Nonnull SlotRequestId slotRequestId, @Nonnull ResourceProfile resourceProfile);
-
-    /**
-     * Notifies that not enough resources are available to fulfill the resource requirements.
-     *
-     * @param acquiredResources the resources that have been acquired
-     */
-    default void notifyNotEnoughResourcesAvailable(
-            Collection<ResourceRequirement> acquiredResources) {}
+            PhysicalSlotRequest physicalSlotRequest);
 
     /**
      * Disables batch slot request timeout check. Invoked when someone else wants to take over the
@@ -219,4 +171,11 @@ public interface SlotPool extends AllocatedSlotActions, AutoCloseable {
      * @return the allocated slots on the task manager
      */
     AllocatedSlotReport createAllocatedSlotReport(ResourceID taskManagerId);
+
+    /**
+     * Sets whether the underlying job is currently restarting or not.
+     *
+     * @param isJobRestarting whether the job is restarting or not
+     */
+    void setIsJobRestarting(boolean isJobRestarting);
 }

@@ -86,11 +86,32 @@ public abstract class AbstractCheckpointStats implements Serializable {
      */
     public abstract long getStateSize();
 
-    /** @return the total number of processed bytes during the checkpoint. */
+    /**
+     * Returns the checkpointed size during that checkpoint.
+     *
+     * @return The checkpointed size during that checkpoint.
+     */
+    public abstract long getCheckpointedSize();
+
+    /**
+     * @return The metadata file size, -1 if unknown.
+     */
+    public abstract long getMetadataSize();
+
+    /**
+     * @return the total number of processed bytes during the checkpoint.
+     */
     public abstract long getProcessedData();
 
-    /** @return the total number of persisted bytes during the checkpoint. */
+    /**
+     * @return the total number of persisted bytes during the checkpoint.
+     */
     public abstract long getPersistedData();
+
+    /**
+     * @return whether the checkpoint is unaligned.
+     */
+    public abstract boolean isUnalignedCheckpoint();
 
     /**
      * Returns the latest acknowledged subtask stats or <code>null</code> if none was acknowledged

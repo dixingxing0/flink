@@ -42,6 +42,8 @@ public class SubtaskStateStats implements Serializable {
     /** Size of the checkpointed state at this subtask. */
     private final long stateSize;
 
+    private final long checkpointedSize;
+
     /** Checkpoint duration at the operator (sync part) in milliseconds. */
     private final long syncCheckpointDuration;
 
@@ -61,9 +63,17 @@ public class SubtaskStateStats implements Serializable {
     /** Is the checkpoint completed as an unaligned checkpoint. */
     private final boolean unalignedCheckpoint;
 
+    /** Is the checkpoint completed by this subtask. */
+    private final boolean completed;
+
+    SubtaskStateStats(int subtaskIndex, long ackTimestamp) {
+        this(subtaskIndex, ackTimestamp, 0, 0, 0, 0, 0, 0, 0, 0, false, true);
+    }
+
     SubtaskStateStats(
             int subtaskIndex,
             long ackTimestamp,
+            long checkpointedSize,
             long stateSize,
             long syncCheckpointDuration,
             long asyncCheckpointDuration,
@@ -71,10 +81,13 @@ public class SubtaskStateStats implements Serializable {
             long persistedData,
             long alignmentDuration,
             long checkpointStartDelay,
-            boolean unalignedCheckpoint) {
+            boolean unalignedCheckpoint,
+            boolean completed) {
 
         checkArgument(subtaskIndex >= 0, "Negative subtask index");
         this.subtaskIndex = subtaskIndex;
+        checkArgument(checkpointedSize >= 0, "Negative incremental state size");
+        this.checkpointedSize = checkpointedSize;
         checkArgument(stateSize >= 0, "Negative state size");
         this.stateSize = stateSize;
         this.ackTimestamp = ackTimestamp;
@@ -85,6 +98,7 @@ public class SubtaskStateStats implements Serializable {
         this.alignmentDuration = alignmentDuration;
         this.checkpointStartDelay = checkpointStartDelay;
         this.unalignedCheckpoint = unalignedCheckpoint;
+        this.completed = completed;
     }
 
     public int getSubtaskIndex() {
@@ -98,6 +112,15 @@ public class SubtaskStateStats implements Serializable {
      */
     public long getStateSize() {
         return stateSize;
+    }
+
+    /**
+     * Returns the incremental state size.
+     *
+     * @return The incremental state size.
+     */
+    public long getCheckpointedSize() {
+        return checkpointedSize;
     }
 
     /**
@@ -138,12 +161,16 @@ public class SubtaskStateStats implements Serializable {
         return asyncCheckpointDuration;
     }
 
-    /** @return the total number of processed bytes during the checkpoint. */
+    /**
+     * @return the total number of processed bytes during the checkpoint.
+     */
     public long getProcessedData() {
         return processedData;
     }
 
-    /** @return the total number of persisted bytes during the checkpoint. */
+    /**
+     * @return the total number of persisted bytes during the checkpoint.
+     */
     public long getPersistedData() {
         return persistedData;
     }
@@ -162,5 +189,9 @@ public class SubtaskStateStats implements Serializable {
 
     public boolean getUnalignedCheckpoint() {
         return unalignedCheckpoint;
+    }
+
+    public boolean isCompleted() {
+        return completed;
     }
 }

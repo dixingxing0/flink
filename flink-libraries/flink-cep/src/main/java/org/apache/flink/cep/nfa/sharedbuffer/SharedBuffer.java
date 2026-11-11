@@ -25,14 +25,23 @@ import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
 import org.apache.flink.api.common.typeutils.base.LongSerializer;
+import org.apache.flink.cep.configuration.SharedBufferCacheConfig;
 import org.apache.flink.util.WrappingRuntimeException;
 
-import org.apache.flink.shaded.guava18.com.google.common.collect.Iterables;
+import org.apache.flink.shaded.guava33.com.google.common.cache.Cache;
+import org.apache.flink.shaded.guava33.com.google.common.cache.CacheBuilder;
+import org.apache.flink.shaded.guava33.com.google.common.cache.RemovalCause;
+import org.apache.flink.shaded.guava33.com.google.common.cache.RemovalListener;
+import org.apache.flink.shaded.guava33.com.google.common.collect.Iterables;
 
-import java.util.HashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.Iterator;
 import java.util.Map;
-import java.util.stream.Collectors;
+import java.util.Objects;
+import java.util.Timer;
+import java.util.TimerTask;
 
 /**
  * A shared buffer implementation which stores values under according state. Additionally, the
@@ -56,67 +65,113 @@ import java.util.stream.Collectors;
  */
 public class SharedBuffer<V> {
 
-    private static final String entriesStateName = "sharedBuffer-entries";
-    private static final String eventsStateName = "sharedBuffer-events";
-    private static final String eventsCountStateName = "sharedBuffer-events-count";
+    private static final Logger LOG = LoggerFactory.getLogger(SharedBuffer.class);
 
-    private MapState<EventId, Lockable<V>> eventsBuffer;
+    private static final String ENTRIES_STATE_NAME = "sharedBuffer-entries-with-lockable-edges";
+    private static final String EVENTS_STATE_NAME = "sharedBuffer-events";
+    private static final String EVENTS_COUNT_STATE_NAME = "sharedBuffer-events-count";
+
+    private final MapState<EventId, Lockable<V>> eventsBuffer;
+
     /** The number of events seen so far in the stream per timestamp. */
-    private MapState<Long, Integer> eventsCount;
+    private final MapState<Long, Integer> eventsCount;
 
-    private MapState<NodeId, Lockable<SharedBufferNode>> entries;
+    private final MapState<NodeId, Lockable<SharedBufferNode>> entries;
 
     /** The cache of eventsBuffer State. */
-    private Map<EventId, Lockable<V>> eventsBufferCache = new HashMap<>();
+    private final Cache<EventId, Lockable<V>> eventsBufferCache;
 
     /** The cache of sharedBufferNode. */
-    private Map<NodeId, Lockable<SharedBufferNode>> entryCache = new HashMap<>();
+    private final Cache<NodeId, Lockable<SharedBufferNode>> entryCache;
 
+    private final Timer cacheStatisticsTimer;
+
+    @VisibleForTesting
     public SharedBuffer(KeyedStateStore stateStore, TypeSerializer<V> valueSerializer) {
+        this(stateStore, valueSerializer, new SharedBufferCacheConfig());
+    }
+
+    public SharedBuffer(
+            KeyedStateStore stateStore,
+            TypeSerializer<V> valueSerializer,
+            SharedBufferCacheConfig cacheConfig) {
         this.eventsBuffer =
                 stateStore.getMapState(
                         new MapStateDescriptor<>(
-                                eventsStateName,
+                                EVENTS_STATE_NAME,
                                 EventId.EventIdSerializer.INSTANCE,
                                 new Lockable.LockableTypeSerializer<>(valueSerializer)));
 
         this.entries =
                 stateStore.getMapState(
                         new MapStateDescriptor<>(
-                                entriesStateName,
+                                ENTRIES_STATE_NAME,
                                 new NodeId.NodeIdSerializer(),
                                 new Lockable.LockableTypeSerializer<>(
-                                        new SharedBufferNode.SharedBufferNodeSerializer())));
+                                        new SharedBufferNodeSerializer())));
 
         this.eventsCount =
                 stateStore.getMapState(
                         new MapStateDescriptor<>(
-                                eventsCountStateName,
+                                EVENTS_COUNT_STATE_NAME,
                                 LongSerializer.INSTANCE,
                                 IntSerializer.INSTANCE));
-    }
 
-    /**
-     * Initializes underlying state with given map of events and entries. Should be used only in
-     * case of migration from old state.
-     *
-     * @param events map of events with assigned unique ids
-     * @param entries map of SharedBufferNodes
-     * @throws Exception Thrown if the system cannot access the state.
-     * @deprecated Only for state migration!
-     */
-    @Deprecated
-    public void init(
-            Map<EventId, Lockable<V>> events, Map<NodeId, Lockable<SharedBufferNode>> entries)
-            throws Exception {
-        eventsBuffer.putAll(events);
-        this.entries.putAll(entries);
-
-        Map<Long, Integer> maxIds =
-                events.keySet().stream()
-                        .collect(
-                                Collectors.toMap(EventId::getTimestamp, EventId::getId, Math::max));
-        eventsCount.putAll(maxIds);
+        // set the events buffer cache and strategy of exchanging out
+        this.eventsBufferCache =
+                CacheBuilder.newBuilder()
+                        .maximumSize(cacheConfig.getEventsBufferCacheSlots())
+                        .removalListener(
+                                (RemovalListener<EventId, Lockable<V>>)
+                                        removalNotification -> {
+                                            if (RemovalCause.SIZE
+                                                    == removalNotification.getCause()) {
+                                                try {
+                                                    eventsBuffer.put(
+                                                            removalNotification.getKey(),
+                                                            removalNotification.getValue());
+                                                } catch (Exception e) {
+                                                    LOG.error(
+                                                            "Error in putting value into eventsBuffer.",
+                                                            e);
+                                                }
+                                            }
+                                        })
+                        .build();
+        // set the entry cache and strategy of exchanging out
+        this.entryCache =
+                CacheBuilder.newBuilder()
+                        .maximumSize(cacheConfig.getEntryCacheSlots())
+                        .removalListener(
+                                (RemovalListener<NodeId, Lockable<SharedBufferNode>>)
+                                        removalNotification -> {
+                                            if (RemovalCause.SIZE
+                                                    == removalNotification.getCause()) {
+                                                try {
+                                                    entries.put(
+                                                            removalNotification.getKey(),
+                                                            removalNotification.getValue());
+                                                } catch (Exception e) {
+                                                    LOG.error(
+                                                            "Error in putting value into entries.",
+                                                            e);
+                                                }
+                                            }
+                                        })
+                        .build();
+        cacheStatisticsTimer = new Timer();
+        cacheStatisticsTimer.schedule(
+                new TimerTask() {
+                    @Override
+                    public void run() {
+                        LOG.info(
+                                "Statistics details of eventsBufferCache: {}, statistics details of entryCache: {}.",
+                                eventsBufferCache.stats(),
+                                entryCache.stats());
+                    }
+                },
+                cacheConfig.getCacheStatisticsInterval().toMillis(),
+                cacheConfig.getCacheStatisticsInterval().toMillis());
     }
 
     /**
@@ -135,6 +190,11 @@ public class SharedBuffer<V> {
             if (next < timestamp) {
                 iterator.remove();
             }
+        }
+
+        // memory leak resolution
+        if (eventsCount.isEmpty()) {
+            eventsCount.clear();
         }
     }
 
@@ -157,8 +217,14 @@ public class SharedBuffer<V> {
      * @throws Exception Thrown if the system cannot access the state.
      */
     public boolean isEmpty() throws Exception {
-        return Iterables.isEmpty(eventsBufferCache.keySet())
+        return Iterables.isEmpty(eventsBufferCache.asMap().keySet())
                 && Iterables.isEmpty(eventsBuffer.keys());
+    }
+
+    public void releaseCacheStatisticsTimer() {
+        if (cacheStatisticsTimer != null) {
+            cacheStatisticsTimer.cancel();
+        }
     }
 
     /**
@@ -187,7 +253,7 @@ public class SharedBuffer<V> {
      * @param eventId id of the event
      */
     void removeEvent(EventId eventId) throws Exception {
-        this.eventsBufferCache.remove(eventId);
+        this.eventsBufferCache.invalidate(eventId);
         this.eventsBuffer.remove(eventId);
     }
 
@@ -197,7 +263,7 @@ public class SharedBuffer<V> {
      * @param nodeId id of the event
      */
     void removeEntry(NodeId nodeId) throws Exception {
-        this.entryCache.remove(nodeId);
+        this.entryCache.invalidate(nodeId);
         this.entries.remove(nodeId);
     }
 
@@ -208,15 +274,20 @@ public class SharedBuffer<V> {
      * @return SharedBufferNode
      */
     Lockable<SharedBufferNode> getEntry(NodeId nodeId) {
-        return entryCache.computeIfAbsent(
-                nodeId,
-                id -> {
-                    try {
-                        return entries.get(id);
-                    } catch (Exception ex) {
-                        throw new WrappingRuntimeException(ex);
-                    }
-                });
+        try {
+            Lockable<SharedBufferNode> lockableFromCache = entryCache.getIfPresent(nodeId);
+            if (Objects.nonNull(lockableFromCache)) {
+                return lockableFromCache;
+            } else {
+                Lockable<SharedBufferNode> lockableFromState = entries.get(nodeId);
+                if (Objects.nonNull(lockableFromState)) {
+                    entryCache.put(nodeId, lockableFromState);
+                }
+                return lockableFromState;
+            }
+        } catch (Exception ex) {
+            throw new WrappingRuntimeException(ex);
+        }
     }
 
     /**
@@ -226,15 +297,20 @@ public class SharedBuffer<V> {
      * @return event
      */
     Lockable<V> getEvent(EventId eventId) {
-        return eventsBufferCache.computeIfAbsent(
-                eventId,
-                id -> {
-                    try {
-                        return eventsBuffer.get(id);
-                    } catch (Exception ex) {
-                        throw new WrappingRuntimeException(ex);
-                    }
-                });
+        try {
+            Lockable<V> lockableFromCache = eventsBufferCache.getIfPresent(eventId);
+            if (Objects.nonNull(lockableFromCache)) {
+                return lockableFromCache;
+            } else {
+                Lockable<V> lockableFromState = eventsBuffer.get(eventId);
+                if (Objects.nonNull(lockableFromState)) {
+                    eventsBufferCache.put(eventId, lockableFromState);
+                }
+                return lockableFromState;
+            }
+        } catch (Exception ex) {
+            throw new WrappingRuntimeException(ex);
+        }
     }
 
     /**
@@ -243,13 +319,13 @@ public class SharedBuffer<V> {
      * @throws Exception Thrown if the system cannot access the state.
      */
     void flushCache() throws Exception {
-        if (!entryCache.isEmpty()) {
-            entries.putAll(entryCache);
-            entryCache.clear();
+        if (!entryCache.asMap().isEmpty()) {
+            entries.putAll(entryCache.asMap());
+            entryCache.invalidateAll();
         }
-        if (!eventsBufferCache.isEmpty()) {
-            eventsBuffer.putAll(eventsBufferCache);
-            eventsBufferCache.clear();
+        if (!eventsBufferCache.asMap().isEmpty()) {
+            eventsBuffer.putAll(eventsBufferCache.asMap());
+            eventsBufferCache.invalidateAll();
         }
     }
 
@@ -260,7 +336,7 @@ public class SharedBuffer<V> {
 
     @VisibleForTesting
     public int getEventsBufferCacheSize() {
-        return eventsBufferCache.size();
+        return (int) eventsBufferCache.size();
     }
 
     @VisibleForTesting
@@ -275,6 +351,6 @@ public class SharedBuffer<V> {
 
     @VisibleForTesting
     public int getSharedBufferNodeCacheSize() throws Exception {
-        return entryCache.size();
+        return (int) entryCache.size();
     }
 }

@@ -25,7 +25,7 @@ import org.apache.flink.kubernetes.utils.Constants;
 import org.apache.flink.runtime.security.SecurityConfiguration;
 import org.apache.flink.util.StringUtils;
 
-import org.apache.flink.shaded.guava18.com.google.common.io.Files;
+import org.apache.flink.shaded.guava33.com.google.common.io.Files;
 
 import io.fabric8.kubernetes.api.model.ConfigMapBuilder;
 import io.fabric8.kubernetes.api.model.ContainerBuilder;
@@ -43,6 +43,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 
+import static org.apache.flink.kubernetes.utils.Constants.KERBEROS_KRB5CONF_FILE;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /** Mount the custom Kerberos Configuration and Credential to the JobManager(s)/TaskManagers. */
@@ -60,7 +61,7 @@ public class KerberosMountDecorator extends AbstractKubernetesStepDecorator {
 
     @Override
     public FlinkPod decorateFlinkPod(FlinkPod flinkPod) {
-        PodBuilder podBuilder = new PodBuilder(flinkPod.getPod());
+        PodBuilder podBuilder = new PodBuilder(flinkPod.getPodWithoutMainContainer());
         ContainerBuilder containerBuilder = new ContainerBuilder(flinkPod.getMainContainer());
 
         if (!StringUtils.isNullOrWhitespaceOnly(securityConfig.getKeytab())
@@ -107,7 +108,7 @@ public class KerberosMountDecorator extends AbstractKubernetesStepDecorator {
                             .withItems(
                                     new KeyToPathBuilder()
                                             .withKey(krb5Conf.getName())
-                                            .withPath(krb5Conf.getName())
+                                            .withPath(KERBEROS_KRB5CONF_FILE)
                                             .build())
                             .endConfigMap()
                             .endVolume()
@@ -117,8 +118,11 @@ public class KerberosMountDecorator extends AbstractKubernetesStepDecorator {
                     containerBuilder
                             .addNewVolumeMount()
                             .withName(Constants.KERBEROS_KRB5CONF_VOLUME)
-                            .withMountPath(Constants.KERBEROS_KRB5CONF_MOUNT_DIR + "/krb5.conf")
-                            .withSubPath("krb5.conf")
+                            .withMountPath(
+                                    Constants.KERBEROS_KRB5CONF_MOUNT_DIR
+                                            + "/"
+                                            + KERBEROS_KRB5CONF_FILE)
+                            .withSubPath(KERBEROS_KRB5CONF_FILE)
                             .endVolumeMount();
         }
 

@@ -21,18 +21,16 @@ package org.apache.flink.runtime.executiongraph;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.Archiveable;
 import org.apache.flink.api.common.accumulators.Accumulator;
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.core.io.InputSplit;
 import org.apache.flink.runtime.JobException;
 import org.apache.flink.runtime.accumulators.StringifiedAccumulatorResult;
+import org.apache.flink.runtime.blob.BlobWriter;
+import org.apache.flink.runtime.blob.PermanentBlobKey;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
-import org.apache.flink.runtime.checkpoint.CheckpointType;
-import org.apache.flink.runtime.checkpoint.InflightDataRescalingDescriptor;
 import org.apache.flink.runtime.checkpoint.JobManagerTaskRestore;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
-import org.apache.flink.runtime.concurrent.FutureUtils;
 import org.apache.flink.runtime.deployment.ResultPartitionDeploymentDescriptor;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptorFactory;
@@ -42,35 +40,39 @@ import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
 import org.apache.flink.runtime.jobgraph.IntermediateResultPartitionID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
-import org.apache.flink.runtime.jobmanager.scheduler.LocationPreferenceConstraint;
 import org.apache.flink.runtime.jobmanager.slots.TaskManagerGateway;
 import org.apache.flink.runtime.jobmaster.LogicalSlot;
 import org.apache.flink.runtime.messages.Acknowledge;
-import org.apache.flink.runtime.messages.TaskBackPressureResponse;
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
 import org.apache.flink.runtime.operators.coordination.TaskNotRunningException;
-import org.apache.flink.runtime.shuffle.NettyShuffleMaster;
+import org.apache.flink.runtime.scheduler.ClusterDatasetCorruptedException;
+import org.apache.flink.runtime.scheduler.strategy.ConsumerVertexGroup;
+import org.apache.flink.runtime.scheduler.strategy.ExecutionVertexID;
 import org.apache.flink.runtime.shuffle.PartitionDescriptor;
 import org.apache.flink.runtime.shuffle.ProducerDescriptor;
 import org.apache.flink.runtime.shuffle.ShuffleDescriptor;
 import org.apache.flink.runtime.shuffle.ShuffleMaster;
 import org.apache.flink.runtime.taskexecutor.TaskExecutorOperatorEventGateway;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
+import org.apache.flink.types.Either;
+import org.apache.flink.util.CollectionUtil;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkException;
-import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.OptionalFailure;
-import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.SerializedValue;
+import org.apache.flink.util.concurrent.FutureUtils;
+import org.apache.flink.util.function.FunctionUtils;
 
 import org.slf4j.Logger;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.LinkedHashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -78,7 +80,9 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.runtime.deployment.TaskDeploymentDescriptorFactory.getConsumedPartitionShuffleDescriptor;
@@ -88,8 +92,10 @@ import static org.apache.flink.runtime.execution.ExecutionState.CREATED;
 import static org.apache.flink.runtime.execution.ExecutionState.DEPLOYING;
 import static org.apache.flink.runtime.execution.ExecutionState.FAILED;
 import static org.apache.flink.runtime.execution.ExecutionState.FINISHED;
+import static org.apache.flink.runtime.execution.ExecutionState.INITIALIZING;
 import static org.apache.flink.runtime.execution.ExecutionState.RUNNING;
 import static org.apache.flink.runtime.execution.ExecutionState.SCHEDULED;
+import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkState;
 
@@ -117,7 +123,7 @@ import static org.apache.flink.util.Preconditions.checkState;
 public class Execution
         implements AccessExecution, Archiveable<ArchivedExecution>, LogicalSlot.Payload {
 
-    private static final Logger LOG = ExecutionGraph.LOG;
+    private static final Logger LOG = DefaultExecutionGraph.LOG;
 
     private static final int NUM_CANCEL_CALL_TRIES = 3;
 
@@ -130,23 +136,20 @@ public class Execution
     private final ExecutionVertex vertex;
 
     /** The unique ID marking the specific execution instant of the task. */
-    private final ExecutionAttemptID attemptId;
-
-    /**
-     * Gets the global modification version of the execution graph when this execution was created.
-     * This version is bumped in the ExecutionGraph whenever a global failover happens. It is used
-     * to resolve conflicts between concurrent modification by global and local failover actions.
-     */
-    private final long globalModVersion;
+    private ExecutionAttemptID attemptId;
 
     /**
      * The timestamps when state transitions occurred, indexed by {@link ExecutionState#ordinal()}.
      */
     private final long[] stateTimestamps;
 
-    private final int attemptNumber;
+    /**
+     * The end timestamps when state transitions occurred, indexed by {@link
+     * ExecutionState#ordinal()}.
+     */
+    private final long[] stateEndTimestamps;
 
-    private final Time rpcTimeout;
+    private final Duration rpcTimeout;
 
     private final Collection<PartitionInfo> partitionInfos;
 
@@ -157,11 +160,26 @@ public class Execution
 
     private final CompletableFuture<TaskManagerLocation> taskManagerLocationFuture;
 
+    /**
+     * Gets completed successfully when the task switched to {@link ExecutionState#INITIALIZING} or
+     * {@link ExecutionState#RUNNING}. If the task never switches to those state, but fails
+     * immediately, then this future never completes.
+     */
+    private final CompletableFuture<?> initializingOrRunningFuture;
+
     private volatile ExecutionState state = CREATED;
 
     private LogicalSlot assignedResource;
 
-    private Throwable failureCause; // once assigned, never changes
+    private Optional<ErrorInfo> failureCause =
+            Optional.empty(); // once an ErrorInfo is set, never changes
+
+    /**
+     * Future that indicates {@link TaskDeploymentDescriptor} being created after the most recent
+     * deploy. This is only used for testing purposes to handle race conditions caused by thread
+     * switching between main and async pool in #deploy().
+     */
+    @Nullable private volatile CompletableFuture<Void> tddCreatedDuringDeployFuture;
 
     /**
      * Information to restore the task on recovery, such as checkpoint id and task state snapshot.
@@ -196,8 +214,6 @@ public class Execution
      *     calls.
      * @param vertex The execution vertex to which this Execution belongs
      * @param attemptNumber The execution attempt number.
-     * @param globalModVersion The global modification version of the execution graph when this
-     *     execution was created
      * @param startTimestamp The timestamp that marks the creation of this Execution
      * @param rpcTimeout The rpcTimeout for RPC calls like deploy/cancel/stop.
      */
@@ -205,19 +221,20 @@ public class Execution
             Executor executor,
             ExecutionVertex vertex,
             int attemptNumber,
-            long globalModVersion,
             long startTimestamp,
-            Time rpcTimeout) {
+            Duration rpcTimeout) {
 
         this.executor = checkNotNull(executor);
         this.vertex = checkNotNull(vertex);
-        this.attemptId = new ExecutionAttemptID();
+        this.attemptId =
+                new ExecutionAttemptID(
+                        vertex.getExecutionGraphAccessor().getExecutionGraphID(),
+                        vertex.getID(),
+                        attemptNumber);
         this.rpcTimeout = checkNotNull(rpcTimeout);
 
-        this.globalModVersion = globalModVersion;
-        this.attemptNumber = attemptNumber;
-
         this.stateTimestamps = new long[ExecutionState.values().length];
+        this.stateEndTimestamps = new long[ExecutionState.values().length];
         markTimestamp(CREATED, startTimestamp);
 
         this.partitionInfos = new ArrayList<>(16);
@@ -225,6 +242,7 @@ public class Execution
         this.terminalStateFuture = new CompletableFuture<>();
         this.releaseFuture = new CompletableFuture<>();
         this.taskManagerLocationFuture = new CompletableFuture<>();
+        this.initializingOrRunningFuture = new CompletableFuture<>();
 
         this.assignedResource = null;
     }
@@ -244,7 +262,7 @@ public class Execution
 
     @Override
     public int getAttemptNumber() {
-        return attemptNumber;
+        return attemptId.getAttemptNumber();
     }
 
     @Override
@@ -255,17 +273,6 @@ public class Execution
     @Nullable
     public AllocationID getAssignedAllocationID() {
         return assignedAllocationID;
-    }
-
-    /**
-     * Gets the global modification version of the execution graph when this execution was created.
-     *
-     * <p>This version is bumped in the ExecutionGraph whenever a global failover happens. It is
-     * used to resolve conflicts between concurrent modification by global and local failover
-     * actions.
-     */
-    public long getGlobalModVersion() {
-        return globalModVersion;
     }
 
     public CompletableFuture<TaskManagerLocation> getTaskManagerLocationFuture() {
@@ -305,6 +312,10 @@ public class Execution
                             && !taskManagerLocationFuture.isDone()) {
                         taskManagerLocationFuture.complete(logicalSlot.getTaskManagerLocation());
                         assignedAllocationID = logicalSlot.getAllocationId();
+                        getVertex()
+                                .setLatestPriorSlotAllocation(
+                                        assignedResource.getTaskManagerLocation(),
+                                        logicalSlot.getAllocationId());
                         return true;
                     } else {
                         // free assigned resource and return false
@@ -325,10 +336,10 @@ public class Execution
         }
     }
 
-    public InputSplit getNextInputSplit() {
+    public Optional<InputSplit> getNextInputSplit() {
         final LogicalSlot slot = this.getAssignedResource();
         final String host = slot != null ? slot.getTaskManagerLocation().getHostname() : null;
-        return this.vertex.getNextInputSplit(host);
+        return this.vertex.getNextInputSplit(host, getAttemptNumber());
     }
 
     @Override
@@ -340,13 +351,9 @@ public class Execution
                 : null;
     }
 
-    public Throwable getFailureCause() {
-        return failureCause;
-    }
-
     @Override
-    public String getFailureCauseAsString() {
-        return ExceptionUtils.stringifyException(getFailureCause());
+    public Optional<ErrorInfo> getFailureInfo() {
+        return failureCause;
     }
 
     @Override
@@ -355,12 +362,18 @@ public class Execution
     }
 
     @Override
+    public long[] getStateEndTimestamps() {
+        return stateEndTimestamps;
+    }
+
+    @Override
     public long getStateTimestamp(ExecutionState state) {
         return this.stateTimestamps[state.ordinal()];
     }
 
-    public boolean isFinished() {
-        return state.isTerminal();
+    @Override
+    public long getStateEndTimestamp(ExecutionState state) {
+        return this.stateEndTimestamps[state.ordinal()];
     }
 
     @Nullable
@@ -374,8 +387,25 @@ public class Execution
      *
      * @param taskRestore information to restore the state
      */
-    public void setInitialState(@Nullable JobManagerTaskRestore taskRestore) {
+    public void setInitialState(JobManagerTaskRestore taskRestore) {
         this.taskRestore = taskRestore;
+    }
+
+    /**
+     * Gets a future that completes once the task execution reaches one of the states {@link
+     * ExecutionState#INITIALIZING} or {@link ExecutionState#RUNNING}. If this task never reaches
+     * these states (for example because the task is cancelled before it was properly deployed and
+     * restored), then this future will never complete.
+     *
+     * <p>The future is completed already in the {@link ExecutionState#INITIALIZING} state, because
+     * various running actions are already possible in that state (the task already accepts and
+     * sends events and network data for task recovery). (Note that in earlier versions, the
+     * INITIALIZING state was not separate but part of the RUNNING state).
+     *
+     * <p>This future is always completed from the job master's main thread.
+     */
+    public CompletableFuture<?> getInitializingOrRunningFuture() {
+        return initializingOrRunningFuture;
     }
 
     /**
@@ -405,53 +435,79 @@ public class Execution
     //  Actions
     // --------------------------------------------------------------------------------------------
 
-    public CompletableFuture<Execution> registerProducedPartitions(
-            TaskManagerLocation location, boolean notifyPartitionDataAvailable) {
+    public CompletableFuture<Void> registerProducedPartitions(TaskManagerLocation location) {
 
         assertRunningInJobMasterMainThread();
 
         return FutureUtils.thenApplyAsyncIfNotDone(
-                registerProducedPartitions(
-                        vertex, location, attemptId, notifyPartitionDataAvailable),
-                vertex.getExecutionGraph().getJobMasterMainThreadExecutor(),
+                registerProducedPartitions(vertex, location, attemptId),
+                vertex.getExecutionGraphAccessor().getJobMasterMainThreadExecutor(),
                 producedPartitionsCache -> {
                     producedPartitions = producedPartitionsCache;
-                    startTrackingPartitions(
-                            location.getResourceID(), producedPartitionsCache.values());
-                    return this;
+
+                    if (getState() == SCHEDULED) {
+                        startTrackingPartitions(
+                                location.getResourceID(), producedPartitionsCache.values());
+                    } else {
+                        LOG.info(
+                                "Discarding late registered partitions for {} task {}.",
+                                getState(),
+                                attemptId);
+                        for (ResultPartitionDeploymentDescriptor desc :
+                                producedPartitionsCache.values()) {
+                            getVertex()
+                                    .getExecutionGraphAccessor()
+                                    .getShuffleMaster()
+                                    .releasePartitionExternally(desc.getShuffleDescriptor());
+                        }
+                    }
+                    return null;
                 });
     }
 
-    /**
-     * Register producedPartitions to {@link ShuffleMaster}
-     *
-     * <p>HACK: Please notice that this method simulates asynchronous registration in a synchronous
-     * way by making sure the returned {@link CompletableFuture} from {@link
-     * ShuffleMaster#registerPartitionWithProducer} is completed immediately.
-     *
-     * <p>{@link Execution#producedPartitions} are registered through an asynchronous interface
-     * {@link ShuffleMaster#registerPartitionWithProducer} to {@link ShuffleMaster}, however they
-     * are not always accessed through callbacks. So, it is possible that {@link
-     * Execution#producedPartitions} have not been available yet when accessed (in {@link
-     * Execution#deploy} for example).
-     *
-     * <p>Since the only implementation of {@link ShuffleMaster} is {@link NettyShuffleMaster},
-     * which indeed registers producedPartition in a synchronous way, this method enforces
-     * synchronous registration under an asynchronous interface for now.
-     *
-     * <p>TODO: If asynchronous registration is needed in the future, use callbacks to access {@link
-     * Execution#producedPartitions}.
-     *
-     * @return completed future of partition deployment descriptors.
-     */
-    @VisibleForTesting
-    static CompletableFuture<
+    private void recoverAttempt(ExecutionAttemptID newId) {
+        if (!this.attemptId.equals(newId)) {
+            getVertex().getExecutionGraphAccessor().deregisterExecution(this);
+            this.attemptId = newId;
+            getVertex().getExecutionGraphAccessor().registerExecution(this);
+        }
+    }
+
+    /** Recover the execution attempt status after JM failover. */
+    public void recoverExecution(
+            ExecutionAttemptID attemptId,
+            TaskManagerLocation location,
+            Map<String, Accumulator<?, ?>> userAccumulators,
+            IOMetrics metrics) {
+        recoverAttempt(attemptId);
+        taskManagerLocationFuture.complete(location);
+
+        try {
+            transitionToTerminalState(
+                    this.state,
+                    FINISHED,
+                    null,
+                    () -> updateAccumulatorsAndMetrics(userAccumulators, metrics));
+            finishPartitionsAndUpdateConsumers();
+            releaseAssignedResource(null);
+            vertex.getExecutionGraphAccessor().deregisterExecution(this);
+        } finally {
+            vertex.executionFinished(this);
+        }
+    }
+
+    public void recoverProducedPartitions(
+            Map<IntermediateResultPartitionID, ResultPartitionDeploymentDescriptor>
+                    producedPartitions) {
+        this.producedPartitions = checkNotNull(producedPartitions);
+    }
+
+    private static CompletableFuture<
                     Map<IntermediateResultPartitionID, ResultPartitionDeploymentDescriptor>>
             registerProducedPartitions(
                     ExecutionVertex vertex,
                     TaskManagerLocation location,
-                    ExecutionAttemptID attemptId,
-                    boolean notifyPartitionDataAvailable) {
+                    ExecutionAttemptID attemptId) {
 
         ProducerDescriptor producerDescriptor = ProducerDescriptor.create(location, attemptId);
 
@@ -462,24 +518,17 @@ public class Execution
 
         for (IntermediateResultPartition partition : partitions) {
             PartitionDescriptor partitionDescriptor = PartitionDescriptor.from(partition);
-            int maxParallelism = getPartitionMaxParallelism(partition);
             CompletableFuture<? extends ShuffleDescriptor> shuffleDescriptorFuture =
-                    vertex.getExecutionGraph()
+                    vertex.getExecutionGraphAccessor()
                             .getShuffleMaster()
-                            .registerPartitionWithProducer(partitionDescriptor, producerDescriptor);
-
-            // temporary hack; the scheduler does not handle incomplete futures properly
-            Preconditions.checkState(
-                    shuffleDescriptorFuture.isDone(), "ShuffleDescriptor future is incomplete.");
+                            .registerPartitionWithProducer(
+                                    vertex.getJobId(), partitionDescriptor, producerDescriptor);
 
             CompletableFuture<ResultPartitionDeploymentDescriptor> partitionRegistration =
                     shuffleDescriptorFuture.thenApply(
                             shuffleDescriptor ->
-                                    new ResultPartitionDeploymentDescriptor(
-                                            partitionDescriptor,
-                                            shuffleDescriptor,
-                                            maxParallelism,
-                                            notifyPartitionDataAvailable));
+                                    createResultPartitionDeploymentDescriptor(
+                                            partitionDescriptor, partition, shuffleDescriptor));
             partitionRegistrations.add(partitionRegistration);
         }
 
@@ -487,7 +536,9 @@ public class Execution
                 .thenApply(
                         rpdds -> {
                             Map<IntermediateResultPartitionID, ResultPartitionDeploymentDescriptor>
-                                    producedPartitions = new LinkedHashMap<>(partitions.size());
+                                    producedPartitions =
+                                            CollectionUtil.newLinkedHashMapWithExpectedSize(
+                                                    partitions.size());
                             rpdds.forEach(
                                     rpdd -> producedPartitions.put(rpdd.getPartitionId(), rpdd));
                             return producedPartitions;
@@ -495,14 +546,25 @@ public class Execution
     }
 
     private static int getPartitionMaxParallelism(IntermediateResultPartition partition) {
-        final List<List<ExecutionEdge>> consumers = partition.getConsumers();
-        Preconditions.checkArgument(
-                !consumers.isEmpty(),
-                "Currently there has to be exactly one consumer in real jobs");
-        List<ExecutionEdge> consumer = consumers.get(0);
-        ExecutionJobVertex consumerVertex = consumer.get(0).getTarget().getJobVertex();
-        int maxParallelism = consumerVertex.getMaxParallelism();
-        return maxParallelism;
+        return partition.getIntermediateResult().getConsumersMaxParallelism();
+    }
+
+    public static ResultPartitionDeploymentDescriptor createResultPartitionDeploymentDescriptor(
+            IntermediateResultPartition partition, ShuffleDescriptor shuffleDescriptor) {
+        PartitionDescriptor partitionDescriptor = PartitionDescriptor.from(partition);
+        return createResultPartitionDeploymentDescriptor(
+                partitionDescriptor, partition, shuffleDescriptor);
+    }
+
+    private static ResultPartitionDeploymentDescriptor createResultPartitionDeploymentDescriptor(
+            PartitionDescriptor partitionDescriptor,
+            IntermediateResultPartition partition,
+            ShuffleDescriptor shuffleDescriptor) {
+        return new ResultPartitionDeploymentDescriptor(
+                partitionDescriptor,
+                shuffleDescriptor,
+                getPartitionMaxParallelism(partition),
+                partition.getIntermediateResult().getConsumersParallelism());
     }
 
     /**
@@ -527,9 +589,8 @@ public class Execution
         }
 
         // make sure exactly one deployment call happens from the correct state
-        // note: the transition from CREATED to DEPLOYING is for testing purposes only
         ExecutionState previous = this.state;
-        if (previous == SCHEDULED || previous == CREATED) {
+        if (previous == SCHEDULED) {
             if (!transitionState(previous, DEPLOYING)) {
                 // race condition, someone else beat us to the deploying call.
                 // this should actually not happen and indicates a race somewhere else
@@ -539,7 +600,7 @@ public class Execution
         } else {
             // vertex may have been cancelled, or it was already scheduled
             throw new IllegalStateException(
-                    "The vertex must be in CREATED or SCHEDULED state to be deployed. Found state "
+                    "The vertex must be in SCHEDULED state to be deployed. Found state "
                             + previous);
         }
 
@@ -552,97 +613,240 @@ public class Execution
         try {
 
             // race double check, did we fail/cancel and do we need to release the slot?
-            if (this.state != DEPLOYING) {
-                slot.releaseSlot(
-                        new FlinkException(
-                                "Actual state of execution "
-                                        + this
-                                        + " ("
-                                        + state
-                                        + ") does not match expected state DEPLOYING."));
+            if (state != DEPLOYING) {
+                releaseSlotWhenNotInDeployingState(slot);
                 return;
             }
 
             LOG.info(
-                    "Deploying {} (attempt #{}) with attempt id {} to {} with allocation id {}",
+                    "Deploying {} (attempt #{}) with attempt id {} and vertex id {} to {} with allocation id {}",
                     vertex.getTaskNameWithSubtaskIndex(),
-                    attemptNumber,
-                    vertex.getCurrentExecutionAttempt().getAttemptId(),
+                    getAttemptNumber(),
+                    attemptId,
+                    vertex.getID(),
                     getAssignedResourceLocation(),
                     slot.getAllocationId());
-
-            if (taskRestore != null) {
-                checkState(
-                        taskRestore.getTaskStateSnapshot().getSubtaskStateMappings().stream()
-                                .allMatch(
-                                        entry ->
-                                                entry.getValue()
-                                                                .getInputRescalingDescriptor()
-                                                                .equals(
-                                                                        InflightDataRescalingDescriptor
-                                                                                .NO_RESCALE)
-                                                        && entry.getValue()
-                                                                .getOutputRescalingDescriptor()
-                                                                .equals(
-                                                                        InflightDataRescalingDescriptor
-                                                                                .NO_RESCALE)),
-                        "Rescaling from unaligned checkpoint is not yet supported.");
-            }
-
-            final TaskDeploymentDescriptor deployment =
-                    TaskDeploymentDescriptorFactory.fromExecutionVertex(vertex, attemptNumber)
-                            .createDeploymentDescriptor(
-                                    slot.getAllocationId(),
-                                    slot.getPhysicalSlotNumber(),
-                                    taskRestore,
-                                    producedPartitions.values());
-
-            // null taskRestore to let it be GC'ed
-            taskRestore = null;
 
             final TaskManagerGateway taskManagerGateway = slot.getTaskManagerGateway();
 
             final ComponentMainThreadExecutor jobMasterMainThreadExecutor =
-                    vertex.getExecutionGraph().getJobMasterMainThreadExecutor();
+                    vertex.getExecutionGraphAccessor().getJobMasterMainThreadExecutor();
 
             getVertex().notifyPendingDeployment(this);
             // We run the submission in the future executor so that the serialization of large TDDs
             // does not block
             // the main thread and sync back to the main thread once submission is completed.
-            CompletableFuture.supplyAsync(
-                            () -> taskManagerGateway.submitTask(deployment, rpcTimeout), executor)
-                    .thenCompose(Function.identity())
+            AtomicReference<Either<SerializedValue<JobManagerTaskRestore>, PermanentBlobKey>>
+                    maybeOffloadedTaskRestoreCleanupRef = new AtomicReference<>();
+            final CompletableFuture<TaskDeploymentDescriptor> taskDeploymentDescriptorFuture =
+                    CompletableFuture.supplyAsync(
+                                    initOffloadedTaskRestoreRef(
+                                            // Passing a copy of the task restore from the
+                                            // main thread to the I/O executor in order to
+                                            // avoid synchronization issues
+                                            taskRestore, maybeOffloadedTaskRestoreCleanupRef),
+                                    executor)
+                            // back to main thread because this accesses execution graph
+                            // internals
+                            .thenComposeAsync(
+                                    tryGetTaskDeploymentDescriptorForSlot(slot),
+                                    jobMasterMainThreadExecutor);
+            this.tddCreatedDuringDeployFuture = taskDeploymentDescriptorFuture.thenRun(() -> {});
+            // back to io executor for TDD serialization
+            taskDeploymentDescriptorFuture
+                    .thenComposeAsync(
+                            deploymentDescriptor ->
+                                    taskManagerGateway.submitTask(deploymentDescriptor, rpcTimeout),
+                            executor)
                     .whenCompleteAsync(
-                            (ack, failure) -> {
-                                if (failure == null) {
-                                    vertex.notifyCompletedDeployment(this);
-                                } else {
-                                    if (failure instanceof TimeoutException) {
-                                        String taskname =
-                                                vertex.getTaskNameWithSubtaskIndex()
-                                                        + " ("
-                                                        + attemptId
-                                                        + ')';
-
-                                        markFailed(
-                                                new Exception(
-                                                        "Cannot deploy task "
-                                                                + taskname
-                                                                + " - TaskManager ("
-                                                                + getAssignedResourceLocation()
-                                                                + ") not responding after a rpcTimeout of "
-                                                                + rpcTimeout,
-                                                        failure));
-                                    } else {
-                                        markFailed(failure);
-                                    }
-                                }
-                            },
+                            (ack, failure) ->
+                                    handleDeploymentCompletionAndCleanup(
+                                            maybeOffloadedTaskRestoreCleanupRef, ack, failure),
                             jobMasterMainThreadExecutor);
 
         } catch (Throwable t) {
+            ExceptionUtils.rethrowIfFatalErrorOrOOM(t);
             markFailed(t);
         }
+    }
+
+    private void handleDeploymentCompletionAndCleanup(
+            AtomicReference<Either<SerializedValue<JobManagerTaskRestore>, PermanentBlobKey>>
+                    cleanupRef,
+            @Nullable final Acknowledge ack,
+            @Nullable final Throwable failure) {
+
+        // Running in async thread to avoid blocking the main thread on cleanup.
+        CompletableFuture.runAsync(() -> cleanUpOffloadedTaskRestore(cleanupRef), executor)
+                .exceptionally(
+                        cleanupError -> {
+                            LOG.warn(
+                                    "Failed to cleanup offloaded task restore for "
+                                            + "{} (attempt #{}) with attempt "
+                                            + "id {} and vertex id {} to {}",
+                                    vertex.getTaskNameWithSubtaskIndex(),
+                                    getAttemptNumber(),
+                                    attemptId,
+                                    vertex.getID(),
+                                    getAssignedResourceLocation(),
+                                    cleanupError);
+                            return null;
+                        });
+
+        finalizeDeploymentAndCleanUpInMainThread(ack, failure);
+    }
+
+    private Supplier<Either<SerializedValue<JobManagerTaskRestore>, PermanentBlobKey>>
+            initOffloadedTaskRestoreRef(
+                    final JobManagerTaskRestore taskRestoreSnapshot,
+                    final AtomicReference<
+                                    Either<
+                                            SerializedValue<JobManagerTaskRestore>,
+                                            PermanentBlobKey>>
+                            maybeOffloadedTaskRestoreCleanupRef) {
+        return FunctionUtils.uncheckedSupplier(
+                () -> {
+                    maybeOffloadedTaskRestoreCleanupRef.set(
+                            getMaybeOffloadedTaskRestore(taskRestoreSnapshot));
+                    return maybeOffloadedTaskRestoreCleanupRef.get();
+                });
+    }
+
+    private void finalizeDeploymentAndCleanUpInMainThread(
+            @Nullable final Acknowledge ack, @Nullable final Throwable failure) {
+        // Verify that we are back in the job master main thread
+        assertRunningInJobMasterMainThread();
+        // null taskRestore to let it be GC'ed
+        taskRestore = null;
+
+        if (failure == null) {
+            vertex.notifyCompletedDeployment(this);
+        } else {
+            final Throwable actualFailure = ExceptionUtils.stripCompletionException(failure);
+
+            if (actualFailure instanceof TimeoutException) {
+                String taskname = vertex.getTaskNameWithSubtaskIndex() + " (" + attemptId + ')';
+
+                markFailed(
+                        new Exception(
+                                "Cannot deploy task "
+                                        + taskname
+                                        + " - TaskManager ("
+                                        + getAssignedResourceLocation()
+                                        + ") not responding after a rpcTimeout of "
+                                        + rpcTimeout,
+                                actualFailure));
+            } else {
+                markFailed(actualFailure);
+            }
+        }
+    }
+
+    private Function<
+                    Either<SerializedValue<JobManagerTaskRestore>, PermanentBlobKey>,
+                    CompletableFuture<TaskDeploymentDescriptor>>
+            tryGetTaskDeploymentDescriptorForSlot(final LogicalSlot slot) {
+        return FunctionUtils.uncheckedFunction(
+                (maybeOffloadedTaskRestore) -> {
+                    // Check that we are in jm main thread while creating
+                    // task deployment descriptor.
+                    assertRunningInJobMasterMainThread();
+                    if (state != DEPLOYING) {
+                        return FutureUtils.completedExceptionally(
+                                new IllegalStateException(
+                                        String.format(
+                                                "Cannot deploy %s (attempt #%s) with attempt "
+                                                        + "id %s and vertex id %s to %s "
+                                                        + "with allocation id %s "
+                                                        + "because execution state has switched to %s "
+                                                        + "during task restore offload",
+                                                vertex.getTaskNameWithSubtaskIndex(),
+                                                getAttemptNumber(),
+                                                attemptId,
+                                                vertex.getID(),
+                                                getAssignedResourceLocation(),
+                                                slot.getAllocationId(),
+                                                state)));
+                    }
+                    return CompletableFuture.completedFuture(
+                            getDeploymentDescriptor(maybeOffloadedTaskRestore, slot));
+                });
+    }
+
+    /**
+     * Helper method to release the slot when Execution is not in DEPLOYING state.
+     *
+     * @param slot The slot to release.
+     */
+    private void releaseSlotWhenNotInDeployingState(final LogicalSlot slot) {
+        slot.releaseSlot(
+                new FlinkException(
+                        "Actual state of execution "
+                                + this
+                                + " ("
+                                + state
+                                + ") does not match expected state DEPLOYING."));
+    }
+
+    /**
+     * Cleans up the offloaded task restore if it was offloaded to the blob store.
+     *
+     * @param maybeOffloadedTaskRestoreCleanupRef The reference to the offloaded task restore
+     */
+    private void cleanUpOffloadedTaskRestore(
+            final AtomicReference<Either<SerializedValue<JobManagerTaskRestore>, PermanentBlobKey>>
+                    maybeOffloadedTaskRestoreCleanupRef) {
+        if (maybeOffloadedTaskRestoreCleanupRef.get() != null
+                && maybeOffloadedTaskRestoreCleanupRef.get().isRight()) {
+            vertex.getExecutionGraphAccessor()
+                    .deleteBlobs(
+                            Collections.singletonList(
+                                    maybeOffloadedTaskRestoreCleanupRef.get().right()));
+            maybeOffloadedTaskRestoreCleanupRef.set(null);
+        }
+    }
+
+    /**
+     * Creates the task deployment descriptor for the task.
+     *
+     * @param maybeOffloadedTaskRestore The serialized task restore information or the blob key if
+     *     it was offloaded
+     * @param slot The slot to which the task is deployed
+     * @return The task deployment descriptor
+     * @throws IOException If an I/O error occurs
+     * @throws ClusterDatasetCorruptedException If the cluster dataset is corrupted
+     */
+    private TaskDeploymentDescriptor getDeploymentDescriptor(
+            final Either<SerializedValue<JobManagerTaskRestore>, PermanentBlobKey>
+                    maybeOffloadedTaskRestore,
+            final LogicalSlot slot)
+            throws IOException, ClusterDatasetCorruptedException {
+        return vertex.getExecutionGraphAccessor()
+                .getTaskDeploymentDescriptorFactory()
+                .createDeploymentDescriptor(
+                        this,
+                        slot.getAllocationId(),
+                        maybeOffloadedTaskRestore,
+                        producedPartitions.values());
+    }
+
+    /**
+     * Returns the serialized task restore information or the blob key if it was offloaded.
+     *
+     * @param taskRestoreSnapshot Task restore snapshot value at the time of deployment.
+     * @return The serialized task restore information or the blob key if it was offloaded
+     * @throws IOException If an I/O error occurs
+     */
+    @VisibleForTesting
+    protected Either<SerializedValue<JobManagerTaskRestore>, PermanentBlobKey>
+            getMaybeOffloadedTaskRestore(final JobManagerTaskRestore taskRestoreSnapshot)
+                    throws IOException {
+        return taskRestoreSnapshot == null
+                ? null
+                : BlobWriter.serializeAndTryOffload(
+                        taskRestoreSnapshot,
+                        vertex.getJobId(),
+                        vertex.getExecutionGraphAccessor().getBlobWriter());
     }
 
     public void cancel() {
@@ -662,7 +866,7 @@ public class Execution
             }
 
             // these two are the common cases where we need to send a cancel call
-            else if (current == RUNNING || current == DEPLOYING) {
+            else if (current == INITIALIZING || current == RUNNING || current == DEPLOYING) {
                 // try to transition to canceling, if successful, send the cancel call
                 if (startCancelling(NUM_CANCEL_CALL_TRIES)) {
                     return;
@@ -702,6 +906,7 @@ public class Execution
     public CompletableFuture<?> suspend() {
         switch (state) {
             case RUNNING:
+            case INITIALIZING:
             case DEPLOYING:
             case CREATED:
             case SCHEDULED:
@@ -734,44 +939,57 @@ public class Execution
         return releaseFuture;
     }
 
-    private void updatePartitionConsumers(final List<List<ExecutionEdge>> allConsumers) {
-        if (allConsumers.size() == 0) {
+    private void updatePartitionConsumers(final IntermediateResultPartition partition) {
+        final List<ConsumerVertexGroup> consumerVertexGroups = partition.getConsumerVertexGroups();
+        if (consumerVertexGroups.isEmpty()) {
             return;
         }
-        if (allConsumers.size() > 1) {
-            fail(
-                    new IllegalStateException(
-                            "Currently, only a single consumer group per partition is supported."));
-            return;
-        }
+        final Set<ExecutionVertexID> updatedVertices = new HashSet<>();
+        for (ConsumerVertexGroup consumerVertexGroup : consumerVertexGroups) {
+            for (ExecutionVertexID consumerVertexId : consumerVertexGroup) {
+                if (updatedVertices.contains(consumerVertexId)) {
+                    continue;
+                }
 
-        for (ExecutionEdge edge : allConsumers.get(0)) {
-            final ExecutionVertex consumerVertex = edge.getTarget();
-            final Execution consumer = consumerVertex.getCurrentExecutionAttempt();
-            final ExecutionState consumerState = consumer.getState();
+                final ExecutionVertex consumerVertex =
+                        vertex.getExecutionGraphAccessor()
+                                .getExecutionVertexOrThrow(consumerVertexId);
+                final Collection<Execution> consumers = consumerVertex.getCurrentExecutions();
+                for (Execution consumer : consumers) {
+                    final ExecutionState consumerState = consumer.getState();
+                    // ----------------------------------------------------------------
+                    // Consumer is recovering or running => send update message now
+                    // Consumer is deploying => cache the partition info which would be
+                    // sent after switching to running
+                    // ----------------------------------------------------------------
+                    if (consumerState == DEPLOYING
+                            || consumerState == RUNNING
+                            || consumerState == INITIALIZING) {
+                        final PartitionInfo partitionInfo = createFinishedPartitionInfo(partition);
+                        updatedVertices.add(consumerVertexId);
 
-            // ----------------------------------------------------------------
-            // Consumer is running => send update message now
-            // Consumer is deploying => cache the partition info which would be
-            // sent after switching to running
-            // ----------------------------------------------------------------
-            if (consumerState == DEPLOYING || consumerState == RUNNING) {
-                final PartitionInfo partitionInfo = createPartitionInfo(edge);
-
-                if (consumerState == DEPLOYING) {
-                    consumerVertex.cachePartitionInfo(partitionInfo);
-                } else {
-                    consumer.sendUpdatePartitionInfoRpcCall(Collections.singleton(partitionInfo));
+                        if (consumerState == DEPLOYING) {
+                            consumerVertex.cachePartitionInfo(partitionInfo);
+                        } else {
+                            consumer.sendUpdatePartitionInfoRpcCall(
+                                    Collections.singleton(partitionInfo));
+                        }
+                    }
                 }
             }
         }
     }
 
-    private static PartitionInfo createPartitionInfo(ExecutionEdge executionEdge) {
+    private static PartitionInfo createFinishedPartitionInfo(
+            IntermediateResultPartition consumedPartition) {
         IntermediateDataSetID intermediateDataSetID =
-                executionEdge.getSource().getIntermediateResult().getId();
+                consumedPartition.getIntermediateResult().getId();
         ShuffleDescriptor shuffleDescriptor =
-                getConsumedPartitionShuffleDescriptor(executionEdge, false);
+                getConsumedPartitionShuffleDescriptor(
+                        consumedPartition,
+                        TaskDeploymentDescriptorFactory.PartitionLocationConstraint.MUST_BE_KNOWN,
+                        // because partition is already finished, false is fair enough.
+                        false);
         return new PartitionInfo(intermediateDataSetID, shuffleDescriptor);
     }
 
@@ -788,41 +1006,28 @@ public class Execution
     }
 
     /**
-     * Request the back pressure ratio from the task of this execution.
+     * Notify the task of this execution about a completed checkpoint and the last subsumed
+     * checkpoint id if possible.
      *
-     * @param requestId id of the request.
-     * @param timeout the request times out.
-     * @return A future of the task back pressure result.
+     * @param completedCheckpointId of the completed checkpoint
+     * @param completedTimestamp of the completed checkpoint
+     * @param lastSubsumedCheckpointId of the last subsumed checkpoint, a value of {@link
+     *     org.apache.flink.runtime.checkpoint.CheckpointStoreUtil#INVALID_CHECKPOINT_ID} means no
+     *     checkpoint has been subsumed.
      */
-    public CompletableFuture<TaskBackPressureResponse> requestBackPressure(
-            int requestId, Time timeout) {
-
+    public void notifyCheckpointOnComplete(
+            long completedCheckpointId, long completedTimestamp, long lastSubsumedCheckpointId) {
         final LogicalSlot slot = assignedResource;
 
         if (slot != null) {
             final TaskManagerGateway taskManagerGateway = slot.getTaskManagerGateway();
 
-            return taskManagerGateway.requestTaskBackPressure(attemptId, requestId, timeout);
-        } else {
-            return FutureUtils.completedExceptionally(
-                    new Exception("The execution has no slot assigned."));
-        }
-    }
-
-    /**
-     * Notify the task of this execution about a completed checkpoint.
-     *
-     * @param checkpointId of the completed checkpoint
-     * @param timestamp of the completed checkpoint
-     */
-    public void notifyCheckpointComplete(long checkpointId, long timestamp) {
-        final LogicalSlot slot = assignedResource;
-
-        if (slot != null) {
-            final TaskManagerGateway taskManagerGateway = slot.getTaskManagerGateway();
-
-            taskManagerGateway.notifyCheckpointComplete(
-                    attemptId, getVertex().getJobId(), checkpointId, timestamp);
+            taskManagerGateway.notifyCheckpointOnComplete(
+                    attemptId,
+                    getVertex().getJobId(),
+                    completedCheckpointId,
+                    completedTimestamp,
+                    lastSubsumedCheckpointId);
         } else {
             LOG.debug(
                     "The execution has no slot assigned. This indicates that the execution is "
@@ -834,16 +1039,22 @@ public class Execution
      * Notify the task of this execution about a aborted checkpoint.
      *
      * @param abortCheckpointId of the subsumed checkpoint
+     * @param latestCompletedCheckpointId of the latest completed checkpoint
      * @param timestamp of the subsumed checkpoint
      */
-    public void notifyCheckpointAborted(long abortCheckpointId, long timestamp) {
+    public void notifyCheckpointAborted(
+            long abortCheckpointId, long latestCompletedCheckpointId, long timestamp) {
         final LogicalSlot slot = assignedResource;
 
         if (slot != null) {
             final TaskManagerGateway taskManagerGateway = slot.getTaskManagerGateway();
 
             taskManagerGateway.notifyCheckpointAborted(
-                    attemptId, getVertex().getJobId(), abortCheckpointId, timestamp);
+                    attemptId,
+                    getVertex().getJobId(),
+                    abortCheckpointId,
+                    latestCompletedCheckpointId,
+                    timestamp);
         } else {
             LOG.debug(
                     "The execution has no slot assigned. This indicates that the execution is "
@@ -857,10 +1068,11 @@ public class Execution
      * @param checkpointId of th checkpoint to trigger
      * @param timestamp of the checkpoint to trigger
      * @param checkpointOptions of the checkpoint to trigger
+     * @return Future acknowledge which is returned once the checkpoint has been triggered
      */
-    public void triggerCheckpoint(
+    public CompletableFuture<Acknowledge> triggerCheckpoint(
             long checkpointId, long timestamp, CheckpointOptions checkpointOptions) {
-        triggerCheckpointHelper(checkpointId, timestamp, checkpointOptions, false);
+        return triggerCheckpointHelper(checkpointId, timestamp, checkpointOptions);
     }
 
     /**
@@ -869,47 +1081,27 @@ public class Execution
      * @param checkpointId of th checkpoint to trigger
      * @param timestamp of the checkpoint to trigger
      * @param checkpointOptions of the checkpoint to trigger
-     * @param advanceToEndOfEventTime Flag indicating if the source should inject a {@code
-     *     MAX_WATERMARK} in the pipeline to fire any registered event-time timers
+     * @return Future acknowledge which is returned once the checkpoint has been triggered
      */
-    public void triggerSynchronousSavepoint(
-            long checkpointId,
-            long timestamp,
-            CheckpointOptions checkpointOptions,
-            boolean advanceToEndOfEventTime) {
-        triggerCheckpointHelper(
-                checkpointId, timestamp, checkpointOptions, advanceToEndOfEventTime);
+    public CompletableFuture<Acknowledge> triggerSynchronousSavepoint(
+            long checkpointId, long timestamp, CheckpointOptions checkpointOptions) {
+        return triggerCheckpointHelper(checkpointId, timestamp, checkpointOptions);
     }
 
-    private void triggerCheckpointHelper(
-            long checkpointId,
-            long timestamp,
-            CheckpointOptions checkpointOptions,
-            boolean advanceToEndOfEventTime) {
-
-        final CheckpointType checkpointType = checkpointOptions.getCheckpointType();
-        if (advanceToEndOfEventTime
-                && !(checkpointType.isSynchronous() && checkpointType.isSavepoint())) {
-            throw new IllegalArgumentException(
-                    "Only synchronous savepoints are allowed to advance the watermark to MAX.");
-        }
+    private CompletableFuture<Acknowledge> triggerCheckpointHelper(
+            long checkpointId, long timestamp, CheckpointOptions checkpointOptions) {
 
         final LogicalSlot slot = assignedResource;
 
         if (slot != null) {
             final TaskManagerGateway taskManagerGateway = slot.getTaskManagerGateway();
 
-            taskManagerGateway.triggerCheckpoint(
-                    attemptId,
-                    getVertex().getJobId(),
-                    checkpointId,
-                    timestamp,
-                    checkpointOptions,
-                    advanceToEndOfEventTime);
-        } else {
-            LOG.debug(
-                    "The execution has no slot assigned. This indicates that the execution is no longer running.");
+            return taskManagerGateway.triggerCheckpoint(
+                    attemptId, getVertex().getJobId(), checkpointId, timestamp, checkpointOptions);
         }
+        LOG.debug(
+                "The execution has no slot assigned. This indicates that the execution is no longer running.");
+        return CompletableFuture.completedFuture(Acknowledge.get());
     }
 
     /**
@@ -919,9 +1111,11 @@ public class Execution
      */
     public CompletableFuture<Acknowledge> sendOperatorEvent(
             OperatorID operatorId, SerializedValue<OperatorEvent> event) {
+
+        assertRunningInJobMasterMainThread();
         final LogicalSlot slot = assignedResource;
 
-        if (slot != null && getState() == RUNNING) {
+        if (slot != null && (getState() == RUNNING || getState() == INITIALIZING)) {
             final TaskExecutorOperatorEventGateway eventGateway = slot.getTaskManagerGateway();
             return eventGateway.sendOperatorEventToTask(getAttemptId(), operatorId, event);
         } else {
@@ -929,7 +1123,8 @@ public class Execution
                     new TaskNotRunningException(
                             '"'
                                     + vertex.getTaskNameWithSubtaskIndex()
-                                    + "\" is currently not running or ready."));
+                                    + "\" is not running, but in state "
+                                    + getState()));
         }
     }
 
@@ -944,7 +1139,7 @@ public class Execution
      *
      * @param t The exception that caused the task to fail.
      */
-    void markFailed(Throwable t) {
+    public void markFailed(Throwable t) {
         processFail(t, false);
     }
 
@@ -959,7 +1154,7 @@ public class Execution
     }
 
     @VisibleForTesting
-    void markFinished() {
+    public void markFinished() {
         markFinished(null, null);
     }
 
@@ -972,14 +1167,17 @@ public class Execution
         while (true) {
             ExecutionState current = this.state;
 
-            if (current == RUNNING || current == DEPLOYING) {
+            if (current == INITIALIZING || current == RUNNING || current == DEPLOYING) {
 
-                if (transitionState(current, FINISHED)) {
+                if (transitionToTerminalState(
+                        current,
+                        FINISHED,
+                        null,
+                        () -> updateAccumulatorsAndMetrics(userAccumulators, metrics))) {
                     try {
                         finishPartitionsAndUpdateConsumers();
-                        updateAccumulatorsAndMetrics(userAccumulators, metrics);
                         releaseAssignedResource(null);
-                        vertex.getExecutionGraph().deregisterExecution(this);
+                        vertex.getExecutionGraphAccessor().deregisterExecution(this);
                     } finally {
                         vertex.executionFinished(this);
                     }
@@ -1006,19 +1204,11 @@ public class Execution
     }
 
     private void finishPartitionsAndUpdateConsumers() {
-        final List<IntermediateResultPartition> newlyFinishedResults =
-                getVertex().finishAllBlockingPartitions();
-        if (newlyFinishedResults.isEmpty()) {
-            return;
-        }
+        final List<IntermediateResultPartition> finishedPartitions =
+                getVertex().finishPartitionsIfNeeded();
 
-        for (IntermediateResultPartition finishedPartition : newlyFinishedResults) {
-            final IntermediateResultPartition[] allPartitionsOfNewlyFinishedResults =
-                    finishedPartition.getIntermediateResult().getPartitions();
-
-            for (IntermediateResultPartition partition : allPartitionsOfNewlyFinishedResults) {
-                updatePartitionConsumers(partition.getConsumers());
-            }
+        for (IntermediateResultPartition partition : finishedPartitions) {
+            updatePartitionConsumers(partition);
         }
     }
 
@@ -1062,11 +1252,16 @@ public class Execution
 
             if (current == CANCELED) {
                 return;
-            } else if (current == CANCELING || current == RUNNING || current == DEPLOYING) {
+            } else if (current == CANCELING
+                    || current == RUNNING
+                    || current == INITIALIZING
+                    || current == DEPLOYING) {
 
-                updateAccumulatorsAndMetrics(userAccumulators, metrics);
-
-                if (transitionState(current, CANCELED)) {
+                if (transitionToTerminalState(
+                        current,
+                        CANCELED,
+                        null,
+                        () -> updateAccumulatorsAndMetrics(userAccumulators, metrics))) {
                     finishCancellation(releasePartitions);
                     return;
                 }
@@ -1081,7 +1276,7 @@ public class Execution
                                     "Asynchronous race: Found %s in state %s after successful cancel call.",
                                     vertex.getTaskNameWithSubtaskIndex(), state);
                     LOG.error(message);
-                    vertex.getExecutionGraph().failGlobal(new Exception(message));
+                    vertex.getExecutionGraphAccessor().failGlobal(new Exception(message));
                 }
                 return;
             }
@@ -1090,7 +1285,7 @@ public class Execution
 
     private void finishCancellation(boolean releasePartitions) {
         releaseAssignedResource(new FlinkException("Execution " + this + " was cancelled."));
-        vertex.getExecutionGraph().deregisterExecution(this);
+        vertex.getExecutionGraphAccessor().deregisterExecution(this);
         handlePartitionCleanup(releasePartitions, releasePartitions);
     }
 
@@ -1170,21 +1365,27 @@ public class Execution
         }
 
         if (!fromSchedulerNg) {
-            vertex.getExecutionGraph()
+            vertex.getExecutionGraphAccessor()
                     .notifySchedulerNgAboutInternalTaskFailure(
                             attemptId, t, cancelTask, releasePartitions);
             return;
         }
 
-        checkState(transitionState(current, FAILED, t));
-
-        // success (in a manner of speaking)
-        this.failureCause = t;
-
-        updateAccumulatorsAndMetrics(userAccumulators, metrics);
+        checkState(
+                transitionToTerminalState(
+                        current,
+                        FAILED,
+                        t,
+                        () -> {
+                            updateAccumulatorsAndMetrics(userAccumulators, metrics);
+                            this.failureCause =
+                                    Optional.of(
+                                            ErrorInfo.createErrorInfoWithNullableCause(
+                                                    t, getStateTimestamp(FAILED)));
+                        }));
 
         releaseAssignedResource(t);
-        vertex.getExecutionGraph().deregisterExecution(this);
+        vertex.getExecutionGraphAccessor().deregisterExecution(this);
 
         maybeReleasePartitionsAndSendCancelRpcCall(current, cancelTask, releasePartitions);
     }
@@ -1196,7 +1397,10 @@ public class Execution
 
         handlePartitionCleanup(releasePartitions, releasePartitions);
 
-        if (cancelTask && (stateBeforeFailed == RUNNING || stateBeforeFailed == DEPLOYING)) {
+        if (cancelTask
+                && (stateBeforeFailed == RUNNING
+                        || stateBeforeFailed == INITIALIZING
+                        || stateBeforeFailed == DEPLOYING)) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Sending out cancel request, to remove task execution from TaskManager.");
             }
@@ -1215,10 +1419,22 @@ public class Execution
         }
     }
 
-    boolean switchToRunning() {
-
-        if (transitionState(DEPLOYING, RUNNING)) {
+    boolean switchToInitializing() {
+        if (switchTo(DEPLOYING, INITIALIZING)) {
             sendPartitionInfos();
+            return true;
+        }
+
+        return false;
+    }
+
+    boolean switchToRunning() {
+        return switchTo(INITIALIZING, RUNNING);
+    }
+
+    private boolean switchTo(ExecutionState from, ExecutionState to) {
+
+        if (transitionState(from, to)) {
             return true;
         } else {
             // something happened while the call was in progress.
@@ -1246,8 +1462,8 @@ public class Execution
             } else {
                 String message =
                         String.format(
-                                "Concurrent unexpected state transition of task %s to %s while deployment was in progress.",
-                                getVertexWithAttempt(), currentState);
+                                "Concurrent unexpected state transition of task %s from %s (expected %s) to %s while deployment was in progress.",
+                                getAttemptId(), currentState, from, to);
 
                 LOG.debug(message);
 
@@ -1273,7 +1489,7 @@ public class Execution
         if (slot != null) {
             final TaskManagerGateway taskManagerGateway = slot.getTaskManagerGateway();
             final ComponentMainThreadExecutor jobMasterMainThreadExecutor =
-                    getVertex().getExecutionGraph().getJobMasterMainThreadExecutor();
+                    getVertex().getExecutionGraphAccessor().getJobMasterMainThreadExecutor();
 
             CompletableFuture<Acknowledge> cancelResultFuture =
                     FutureUtils.retry(
@@ -1294,7 +1510,7 @@ public class Execution
             final ResourceID taskExecutorId,
             final Collection<ResultPartitionDeploymentDescriptor> partitions) {
         JobMasterPartitionTracker partitionTracker =
-                vertex.getExecutionGraph().getPartitionTracker();
+                vertex.getExecutionGraphAccessor().getPartitionTracker();
         for (ResultPartitionDeploymentDescriptor partition : partitions) {
             partitionTracker.startTrackingPartition(taskExecutorId, partition);
         }
@@ -1308,7 +1524,7 @@ public class Execution
 
         final Collection<ResultPartitionID> partitionIds = getPartitionIds();
         final JobMasterPartitionTracker partitionTracker =
-                getVertex().getExecutionGraph().getPartitionTracker();
+                getVertex().getExecutionGraphAccessor().getPartitionTracker();
 
         if (!partitionIds.isEmpty()) {
             if (releaseBlockingPartitions) {
@@ -1335,7 +1551,7 @@ public class Execution
             final TaskManagerGateway taskManagerGateway = slot.getTaskManagerGateway();
 
             final ShuffleMaster<?> shuffleMaster =
-                    getVertex().getExecutionGraph().getShuffleMaster();
+                    getVertex().getExecutionGraphAccessor().getShuffleMaster();
 
             Set<ResultPartitionID> partitionIds =
                     producedPartitions.values().stream()
@@ -1343,7 +1559,7 @@ public class Execution
                                     resultPartitionDeploymentDescriptor ->
                                             resultPartitionDeploymentDescriptor
                                                     .getPartitionType()
-                                                    .isPipelined())
+                                                    .isReleaseByUpstream())
                             .map(ResultPartitionDeploymentDescriptor::getShuffleDescriptor)
                             .peek(shuffleMaster::releasePartitionExternally)
                             .map(ShuffleDescriptor::getResultPartitionID)
@@ -1387,7 +1603,7 @@ public class Execution
                                             failure));
                         }
                     },
-                    getVertex().getExecutionGraph().getJobMasterMainThreadExecutor());
+                    getVertex().getExecutionGraphAccessor().getJobMasterMainThreadExecutor());
         }
     }
 
@@ -1405,7 +1621,7 @@ public class Execution
 
         if (slot != null) {
             ComponentMainThreadExecutor jobMasterMainThreadExecutor =
-                    getVertex().getExecutionGraph().getJobMasterMainThreadExecutor();
+                    getVertex().getExecutionGraphAccessor().getJobMasterMainThreadExecutor();
 
             slot.releaseSlot(cause)
                     .whenComplete(
@@ -1427,67 +1643,34 @@ public class Execution
     //  Miscellaneous
     // --------------------------------------------------------------------------------------------
 
-    /**
-     * Calculates the preferred locations based on the location preference constraint.
-     *
-     * @param locationPreferenceConstraint constraint for the location preference
-     * @return Future containing the collection of preferred locations. This might not be completed
-     *     if not all inputs have been a resource assigned.
-     */
-    @VisibleForTesting
-    public CompletableFuture<Collection<TaskManagerLocation>> calculatePreferredLocations(
-            LocationPreferenceConstraint locationPreferenceConstraint) {
-        final Collection<CompletableFuture<TaskManagerLocation>> preferredLocationFutures =
-                getVertex().getPreferredLocations();
-        final CompletableFuture<Collection<TaskManagerLocation>> preferredLocationsFuture;
-
-        switch (locationPreferenceConstraint) {
-            case ALL:
-                preferredLocationsFuture = FutureUtils.combineAll(preferredLocationFutures);
-                break;
-            case ANY:
-                final ArrayList<TaskManagerLocation> completedTaskManagerLocations =
-                        new ArrayList<>(preferredLocationFutures.size());
-
-                for (CompletableFuture<TaskManagerLocation> preferredLocationFuture :
-                        preferredLocationFutures) {
-                    if (preferredLocationFuture.isDone()
-                            && !preferredLocationFuture.isCompletedExceptionally()) {
-                        final TaskManagerLocation taskManagerLocation =
-                                preferredLocationFuture.getNow(null);
-
-                        if (taskManagerLocation == null) {
-                            throw new FlinkRuntimeException(
-                                    "TaskManagerLocationFuture was completed with null. This indicates a programming bug.");
-                        }
-
-                        completedTaskManagerLocations.add(taskManagerLocation);
-                    }
-                }
-
-                preferredLocationsFuture =
-                        CompletableFuture.completedFuture(completedTaskManagerLocations);
-                break;
-            default:
-                throw new RuntimeException(
-                        "Unknown LocationPreferenceConstraint "
-                                + locationPreferenceConstraint
-                                + '.');
-        }
-
-        return preferredLocationsFuture;
-    }
-
     public void transitionState(ExecutionState targetState) {
         transitionState(state, targetState);
     }
 
     private boolean transitionState(ExecutionState currentState, ExecutionState targetState) {
-        return transitionState(currentState, targetState, null);
+        return transitionState(currentState, targetState, null, null);
+    }
+
+    /**
+     * Transitions to a terminal state, running {@code preCompletionAction} after the state is set
+     * but before {@link #terminalStateFuture} is completed and listeners are notified. Use this for
+     * storing metrics/accumulators so that both {@code terminalStateFuture} consumers and {@link
+     * ExecutionStateUpdateListener}s see them.
+     */
+    private boolean transitionToTerminalState(
+            ExecutionState currentState,
+            ExecutionState targetState,
+            @Nullable Throwable error,
+            Runnable preCompletionAction) {
+        checkArgument(targetState.isTerminal(), "targetState must be terminal");
+        return transitionState(currentState, targetState, error, preCompletionAction);
     }
 
     private boolean transitionState(
-            ExecutionState currentState, ExecutionState targetState, Throwable error) {
+            ExecutionState currentState,
+            ExecutionState targetState,
+            @Nullable Throwable error,
+            @Nullable Runnable preCompletionAction) {
         // sanity check
         if (currentState.isTerminal()) {
             throw new IllegalStateException(
@@ -1500,7 +1683,7 @@ public class Execution
 
         if (state == currentState) {
             state = targetState;
-            markTimestamp(targetState);
+            markTimestamp(currentState, targetState);
 
             if (error == null) {
                 LOG.info(
@@ -1509,20 +1692,27 @@ public class Execution
                         getAttemptId(),
                         currentState,
                         targetState);
-            } else {
-                if (LOG.isInfoEnabled()) {
-                    LOG.info(
-                            "{} ({}) switched from {} to {} on {}.",
-                            getVertex().getTaskNameWithSubtaskIndex(),
-                            getAttemptId(),
-                            currentState,
-                            targetState,
-                            getLocationInformation(),
-                            error);
-                }
+            } else if (LOG.isInfoEnabled()) {
+                LOG.info(
+                        "{} ({}) switched from {} to {} on {}.",
+                        getVertex().getTaskNameWithSubtaskIndex(),
+                        getAttemptId(),
+                        currentState,
+                        targetState,
+                        getLocationInformation(),
+                        ExceptionUtils.stripCompletionException(error));
             }
 
-            if (targetState.isTerminal()) {
+            if (targetState == INITIALIZING || targetState == RUNNING) {
+                initializingOrRunningFuture.complete(null);
+            } else if (targetState.isTerminal()) {
+                if (preCompletionAction != null) {
+                    try {
+                        preCompletionAction.run();
+                    } catch (Exception e) {
+                        LOG.error("Error while executing pre-completion action.", e);
+                    }
+                }
                 // complete the terminal state future
                 terminalStateFuture.complete(targetState);
             }
@@ -1530,7 +1720,7 @@ public class Execution
             // make sure that the state transition completes normally.
             // potential errors (in listeners may not affect the main logic)
             try {
-                vertex.notifyStateTransition(this, targetState);
+                vertex.notifyStateTransition(this, currentState, targetState);
             } catch (Throwable t) {
                 LOG.error(
                         "Error while notifying execution graph of execution state transition.", t);
@@ -1549,16 +1739,22 @@ public class Execution
         }
     }
 
-    private void markTimestamp(ExecutionState state) {
-        markTimestamp(state, System.currentTimeMillis());
+    private void markTimestamp(ExecutionState currentState, ExecutionState targetState) {
+        long now = System.currentTimeMillis();
+        markTimestamp(targetState, now);
+        markEndTimestamp(currentState, now);
     }
 
     private void markTimestamp(ExecutionState state, long timestamp) {
         this.stateTimestamps[state.ordinal()] = timestamp;
     }
 
+    private void markEndTimestamp(ExecutionState state, long timestamp) {
+        this.stateEndTimestamps[state.ordinal()] = timestamp;
+    }
+
     public String getVertexWithAttempt() {
-        return vertex.getTaskNameWithSubtaskIndex() + " - execution #" + attemptNumber;
+        return vertex.getTaskNameWithSubtaskIndex() + " - execution #" + getAttemptNumber();
     }
 
     // ------------------------------------------------------------------------
@@ -1613,7 +1809,17 @@ public class Execution
             }
         }
         if (metrics != null) {
-            this.ioMetrics = metrics;
+            // Drop IOMetrics#resultPartitionBytes because it will not be used anymore. It can
+            // result in very high memory usage when there are many executions and sub-partitions.
+            this.ioMetrics =
+                    new IOMetrics(
+                            metrics.getNumBytesIn(),
+                            metrics.getNumBytesOut(),
+                            metrics.getNumRecordsIn(),
+                            metrics.getNumRecordsOut(),
+                            metrics.getAccumulateIdleTime(),
+                            metrics.getAccumulateBusyTime(),
+                            metrics.getAccumulateBackPressuredTime());
         }
     }
 
@@ -1627,7 +1833,7 @@ public class Execution
 
         return String.format(
                 "Attempt #%d (%s) @ %s - [%s]",
-                attemptNumber,
+                getAttemptNumber(),
                 vertex.getTaskNameWithSubtaskIndex(),
                 (slot == null ? "(unassigned)" : slot),
                 state);
@@ -1638,7 +1844,21 @@ public class Execution
         return new ArchivedExecution(this);
     }
 
+    @VisibleForTesting
+    public CompletableFuture<Void> getTddCreationDuringDeployFuture() {
+        // Defensive copy in case future is set to null between check and join.
+        final CompletableFuture<Void> future = tddCreatedDuringDeployFuture;
+        if (future == null) {
+            throw new IllegalStateException(
+                    "Task deployment descriptor creation future is null, "
+                            + "please ensure that this method is called after `Execution.deploy()`.");
+        }
+        return future;
+    }
+
     private void assertRunningInJobMasterMainThread() {
-        vertex.getExecutionGraph().assertRunningInJobMasterMainThread();
+        vertex.getExecutionGraphAccessor()
+                .getJobMasterMainThreadExecutor()
+                .assertRunningInMainThread();
     }
 }

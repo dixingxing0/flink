@@ -18,73 +18,68 @@
 
 package org.apache.flink.state.api;
 
+import org.apache.flink.api.common.RuntimeExecutionMode;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
-import org.apache.flink.api.java.DataSet;
-import org.apache.flink.api.java.ExecutionEnvironment;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.tuple.Tuple3;
-import org.apache.flink.client.program.ClusterClient;
-import org.apache.flink.contrib.streaming.state.RocksDBStateBackend;
-import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.StateBackendOptions;
 import org.apache.flink.runtime.jobgraph.SavepointRestoreSettings;
 import org.apache.flink.runtime.state.StateBackend;
-import org.apache.flink.runtime.state.memory.MemoryStateBackend;
+import org.apache.flink.runtime.state.hashmap.HashMapStateBackend;
 import org.apache.flink.state.api.utils.MaxWatermarkSource;
+import org.apache.flink.state.rocksdb.EmbeddedRocksDBStateBackend;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.datastream.WindowedStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.functions.windowing.WindowFunction;
+import org.apache.flink.streaming.api.graph.StreamGraph;
 import org.apache.flink.streaming.api.windowing.assigners.SlidingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.evictors.CountEvictor;
-import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
-import org.apache.flink.streaming.util.StreamCollector;
 import org.apache.flink.test.util.AbstractTestBase;
+import org.apache.flink.testutils.junit.extensions.parameterized.Parameter;
+import org.apache.flink.testutils.junit.extensions.parameterized.ParameterizedTestExtension;
+import org.apache.flink.testutils.junit.extensions.parameterized.Parameters;
 import org.apache.flink.util.AbstractID;
+import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.util.Collector;
-import org.apache.flink.util.SerializedThrowable;
 
-import org.hamcrest.Matcher;
-import org.hamcrest.Matchers;
-import org.junit.Assert;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** IT Test for writing savepoints to the {@code WindowOperator}. */
 @SuppressWarnings("unchecked")
-@RunWith(Parameterized.class)
-public class SavepointWriterWindowITCase extends AbstractTestBase {
+@ExtendWith(ParameterizedTestExtension.class)
+class SavepointWriterWindowITCase extends AbstractTestBase {
 
     private static final String UID = "uid";
 
     private static final Collection<String> WORDS =
             Arrays.asList("hello", "world", "hello", "everyone");
 
-    private static final Matcher<Iterable<? extends Tuple2<String, Integer>>> STANDARD_MATCHER =
-            Matchers.containsInAnyOrder(
-                    Tuple2.of("hello", 2), Tuple2.of("world", 1), Tuple2.of("everyone", 1));
+    private static final Iterable<? extends Tuple2<String, Integer>> STANDARD_MATCHER =
+            Arrays.asList(Tuple2.of("hello", 2), Tuple2.of("world", 1), Tuple2.of("everyone", 1));
 
-    private static final Matcher<Iterable<? extends Tuple2<String, Integer>>> EVICTOR_MATCHER =
-            Matchers.containsInAnyOrder(
-                    Tuple2.of("hello", 1), Tuple2.of("world", 1), Tuple2.of("everyone", 1));
+    private static final Iterable<? extends Tuple2<String, Integer>> EVICTOR_MATCHER =
+            Arrays.asList(Tuple2.of("hello", 1), Tuple2.of("world", 1), Tuple2.of("everyone", 1));
 
     private static final TypeInformation<Tuple2<String, Integer>> TUPLE_TYPE_INFO =
             new TypeHint<Tuple2<String, Integer>>() {}.getTypeInfo();
@@ -109,21 +104,29 @@ public class SavepointWriterWindowITCase extends AbstractTestBase {
                                     transformation.process(new CustomProcessWindowFunction()),
                             stream -> stream.process(new CustomProcessWindowFunction())));
 
-    private static final List<Tuple2<String, StateBackend>> STATE_BACKENDS =
+    private static final List<Tuple3<String, StateBackend, Configuration>> STATE_BACKENDS =
             Arrays.asList(
-                    Tuple2.of("MemoryStateBackend", new MemoryStateBackend()),
-                    Tuple2.of(
-                            "RocksDB",
-                            new RocksDBStateBackend((StateBackend) new MemoryStateBackend())));
+                    Tuple3.of(
+                            "HashMap",
+                            new HashMapStateBackend(),
+                            new Configuration().set(StateBackendOptions.STATE_BACKEND, "hashmap")),
+                    Tuple3.of(
+                            "EmbeddedRocksDB",
+                            new EmbeddedRocksDBStateBackend(),
+                            new Configuration().set(StateBackendOptions.STATE_BACKEND, "rocksdb")));
 
-    @Parameterized.Parameters(name = "{0}")
+    @Parameters(name = "{0}")
     public static Collection<Object[]> data() {
         List<Object[]> parameterList = new ArrayList<>();
-        for (Tuple2<String, StateBackend> stateBackend : STATE_BACKENDS) {
+        for (Tuple3<String, StateBackend, Configuration> stateBackend : STATE_BACKENDS) {
             for (Tuple3<String, WindowBootstrap, WindowStream> setup : SETUP_FUNCTIONS) {
                 Object[] parameters =
                         new Object[] {
-                            stateBackend.f0 + ": " + setup.f0, setup.f1, setup.f2, stateBackend.f1
+                            stateBackend.f0 + ": " + setup.f0,
+                            setup.f1,
+                            setup.f2,
+                            stateBackend.f1,
+                            stateBackend.f2
                         };
                 parameterList.add(parameters);
             }
@@ -132,202 +135,215 @@ public class SavepointWriterWindowITCase extends AbstractTestBase {
         return parameterList;
     }
 
-    @Rule public StreamCollector collector = new StreamCollector();
-
-    private final WindowBootstrap windowBootstrap;
-
-    private final WindowStream windowStream;
-
-    private final StateBackend stateBackend;
-
     @SuppressWarnings("unused")
-    public SavepointWriterWindowITCase(
-            String ignore,
-            WindowBootstrap windowBootstrap,
-            WindowStream windowStream,
-            StateBackend stateBackend) {
-        this.windowBootstrap = windowBootstrap;
-        this.windowStream = windowStream;
-        this.stateBackend = stateBackend;
-    }
+    @Parameter
+    public String ignore;
 
-    @Test
-    public void testTumbleWindow() throws Exception {
+    @Parameter(1)
+    public WindowBootstrap windowBootstrap;
+
+    @Parameter(2)
+    public WindowStream windowStream;
+
+    @Parameter(3)
+    public StateBackend stateBackend;
+
+    @Parameter(4)
+    public Configuration configuration;
+
+    @TestTemplate
+    void testTumbleWindow() throws Exception {
         final String savepointPath = getTempDirPath(new AbstractID().toHexString());
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(configuration);
+        env.setRuntimeMode(RuntimeExecutionMode.AUTOMATIC);
 
-        ExecutionEnvironment bEnv = ExecutionEnvironment.getExecutionEnvironment();
-        DataSet<Tuple2<String, Integer>> bootstrapData =
-                bEnv.fromCollection(WORDS).map(word -> Tuple2.of(word, 1)).returns(TUPLE_TYPE_INFO);
+        DataStream<Tuple2<String, Integer>> bootstrapData =
+                env.fromData(WORDS)
+                        .map(word -> Tuple2.of(word, 1))
+                        .returns(TUPLE_TYPE_INFO)
+                        .assignTimestampsAndWatermarks(
+                                WatermarkStrategy.<Tuple2<String, Integer>>noWatermarks()
+                                        .withTimestampAssigner((record, ts) -> 2L));
 
-        WindowedOperatorTransformation<Tuple2<String, Integer>, String, TimeWindow> transformation =
+        WindowedStateTransformation<Tuple2<String, Integer>, String, TimeWindow> transformation =
                 OperatorTransformation.bootstrapWith(bootstrapData)
-                        .assignTimestamps(record -> 2L)
                         .keyBy(tuple -> tuple.f0, Types.STRING)
-                        .window(TumblingEventTimeWindows.of(Time.milliseconds(5)));
+                        .window(TumblingEventTimeWindows.of(Duration.ofMillis(5)));
 
-        Savepoint.create(stateBackend, 128)
-                .withOperator(UID, windowBootstrap.bootstrap(transformation))
+        SavepointWriter.newSavepoint(env, stateBackend, 128)
+                .withOperator(
+                        OperatorIdentifier.forUid(UID), windowBootstrap.bootstrap(transformation))
                 .write(savepointPath);
 
-        bEnv.execute("write state");
-
-        StreamExecutionEnvironment sEnv = StreamExecutionEnvironment.getExecutionEnvironment();
-        sEnv.setStateBackend(stateBackend);
+        env.execute("write state");
 
         WindowedStream<Tuple2<String, Integer>, String, TimeWindow> stream =
-                sEnv.addSource(new MaxWatermarkSource<Tuple2<String, Integer>>())
+                env.addSource(new MaxWatermarkSource<Tuple2<String, Integer>>())
                         .returns(TUPLE_TYPE_INFO)
                         .keyBy(tuple -> tuple.f0)
-                        .window(TumblingEventTimeWindows.of(Time.milliseconds(5)));
+                        .window(TumblingEventTimeWindows.of(Duration.ofMillis(5)));
 
         DataStream<Tuple2<String, Integer>> windowed = windowStream.window(stream).uid(UID);
-        CompletableFuture<Collection<Tuple2<String, Integer>>> future = collector.collect(windowed);
+        CloseableIterator<Tuple2<String, Integer>> future = windowed.collectAsync();
 
-        submitJob(savepointPath, sEnv);
+        submitJob(savepointPath, env);
 
-        Collection<Tuple2<String, Integer>> results = future.get();
-        Assert.assertThat("Incorrect results from bootstrapped windows", results, STANDARD_MATCHER);
+        assertThat(future)
+                .toIterable()
+                .as("Incorrect results from bootstrapped windows")
+                .containsAll(STANDARD_MATCHER);
     }
 
-    @Test
-    public void testTumbleWindowWithEvictor() throws Exception {
+    @TestTemplate
+    void testTumbleWindowWithEvictor() throws Exception {
         final String savepointPath = getTempDirPath(new AbstractID().toHexString());
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(configuration);
+        env.setRuntimeMode(RuntimeExecutionMode.AUTOMATIC);
 
-        ExecutionEnvironment bEnv = ExecutionEnvironment.getExecutionEnvironment();
-        DataSet<Tuple2<String, Integer>> bootstrapData =
-                bEnv.fromCollection(WORDS).map(word -> Tuple2.of(word, 1)).returns(TUPLE_TYPE_INFO);
+        DataStream<Tuple2<String, Integer>> bootstrapData =
+                env.fromData(WORDS)
+                        .map(word -> Tuple2.of(word, 1))
+                        .returns(TUPLE_TYPE_INFO)
+                        .assignTimestampsAndWatermarks(
+                                WatermarkStrategy.<Tuple2<String, Integer>>noWatermarks()
+                                        .withTimestampAssigner((record, ts) -> 2L));
 
-        WindowedOperatorTransformation<Tuple2<String, Integer>, String, TimeWindow> transformation =
+        WindowedStateTransformation<Tuple2<String, Integer>, String, TimeWindow> transformation =
                 OperatorTransformation.bootstrapWith(bootstrapData)
-                        .assignTimestamps(record -> 2L)
                         .keyBy(tuple -> tuple.f0, Types.STRING)
-                        .window(TumblingEventTimeWindows.of(Time.milliseconds(5)))
+                        .window(TumblingEventTimeWindows.of(Duration.ofMillis(5)))
                         .evictor(CountEvictor.of(1));
 
-        Savepoint.create(new MemoryStateBackend(), 128)
-                .withOperator(UID, windowBootstrap.bootstrap(transformation))
+        SavepointWriter.newSavepoint(env, stateBackend, 128)
+                .withOperator(
+                        OperatorIdentifier.forUid(UID), windowBootstrap.bootstrap(transformation))
                 .write(savepointPath);
 
-        bEnv.execute("write state");
-
-        StreamExecutionEnvironment sEnv = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.execute("write state");
 
         WindowedStream<Tuple2<String, Integer>, String, TimeWindow> stream =
-                sEnv.addSource(new MaxWatermarkSource<>(), TUPLE_TYPE_INFO)
-                        .keyBy(tuple -> tuple.f0)
-                        .window(TumblingEventTimeWindows.of(Time.milliseconds(5)))
-                        .evictor(CountEvictor.of(1));
-
-        DataStream<Tuple2<String, Integer>> windowed = windowStream.window(stream).uid(UID);
-        CompletableFuture<Collection<Tuple2<String, Integer>>> future = collector.collect(windowed);
-
-        submitJob(savepointPath, sEnv);
-
-        Collection<Tuple2<String, Integer>> results = future.get();
-        Assert.assertThat("Incorrect results from bootstrapped windows", results, EVICTOR_MATCHER);
-    }
-
-    @Test
-    public void testSlideWindow() throws Exception {
-        final String savepointPath = getTempDirPath(new AbstractID().toHexString());
-
-        ExecutionEnvironment bEnv = ExecutionEnvironment.getExecutionEnvironment();
-        DataSet<Tuple2<String, Integer>> bootstrapData =
-                bEnv.fromCollection(WORDS).map(word -> Tuple2.of(word, 1)).returns(TUPLE_TYPE_INFO);
-
-        WindowedOperatorTransformation<Tuple2<String, Integer>, String, TimeWindow> transformation =
-                OperatorTransformation.bootstrapWith(bootstrapData)
-                        .assignTimestamps(record -> 2L)
-                        .keyBy(tuple -> tuple.f0, Types.STRING)
-                        .window(
-                                SlidingEventTimeWindows.of(
-                                        Time.milliseconds(5), Time.milliseconds(1)));
-
-        Savepoint.create(new MemoryStateBackend(), 128)
-                .withOperator(UID, windowBootstrap.bootstrap(transformation))
-                .write(savepointPath);
-
-        bEnv.execute("write state");
-
-        StreamExecutionEnvironment sEnv = StreamExecutionEnvironment.getExecutionEnvironment();
-
-        WindowedStream<Tuple2<String, Integer>, String, TimeWindow> stream =
-                sEnv.addSource(new MaxWatermarkSource<Tuple2<String, Integer>>())
+                env.addSource(new MaxWatermarkSource<Tuple2<String, Integer>>())
                         .returns(TUPLE_TYPE_INFO)
                         .keyBy(tuple -> tuple.f0)
-                        .window(
-                                SlidingEventTimeWindows.of(
-                                        Time.milliseconds(5), Time.milliseconds(1)));
+                        .window(TumblingEventTimeWindows.of(Duration.ofMillis(5)))
+                        .evictor(CountEvictor.of(1));
 
         DataStream<Tuple2<String, Integer>> windowed = windowStream.window(stream).uid(UID);
-        CompletableFuture<Collection<Tuple2<String, Integer>>> future = collector.collect(windowed);
+        CloseableIterator<Tuple2<String, Integer>> future = windowed.collectAsync();
 
-        submitJob(savepointPath, sEnv);
+        submitJob(savepointPath, env);
 
-        Collection<Tuple2<String, Integer>> results = future.get();
-        Assert.assertEquals("Incorrect number of results", 15, results.size());
-        Assert.assertThat("Incorrect bootstrap state", new HashSet<>(results), STANDARD_MATCHER);
+        assertThat(future)
+                .toIterable()
+                .as("Incorrect results from bootstrapped windows")
+                .containsAll(EVICTOR_MATCHER);
     }
 
-    @Test
-    public void testSlideWindowWithEvictor() throws Exception {
+    @TestTemplate
+    void testSlideWindow() throws Exception {
         final String savepointPath = getTempDirPath(new AbstractID().toHexString());
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(configuration);
+        env.setRuntimeMode(RuntimeExecutionMode.AUTOMATIC);
 
-        ExecutionEnvironment bEnv = ExecutionEnvironment.getExecutionEnvironment();
-        DataSet<Tuple2<String, Integer>> bootstrapData =
-                bEnv.fromCollection(WORDS).map(word -> Tuple2.of(word, 1)).returns(TUPLE_TYPE_INFO);
+        DataStream<Tuple2<String, Integer>> bootstrapData =
+                env.fromData(WORDS)
+                        .map(word -> Tuple2.of(word, 1), TUPLE_TYPE_INFO)
+                        .assignTimestampsAndWatermarks(
+                                WatermarkStrategy.<Tuple2<String, Integer>>noWatermarks()
+                                        .withTimestampAssigner((record, ts) -> 2L));
 
-        WindowedOperatorTransformation<Tuple2<String, Integer>, String, TimeWindow> transformation =
+        WindowedStateTransformation<Tuple2<String, Integer>, String, TimeWindow> transformation =
                 OperatorTransformation.bootstrapWith(bootstrapData)
-                        .assignTimestamps(record -> 2L)
                         .keyBy(tuple -> tuple.f0, Types.STRING)
                         .window(
                                 SlidingEventTimeWindows.of(
-                                        Time.milliseconds(5), Time.milliseconds(1)))
-                        .evictor(CountEvictor.of(1));
+                                        Duration.ofMillis(5), Duration.ofMillis(1)));
 
-        Savepoint.create(new MemoryStateBackend(), 128)
-                .withOperator(UID, windowBootstrap.bootstrap(transformation))
+        SavepointWriter.newSavepoint(env, stateBackend, 128)
+                .withOperator(
+                        OperatorIdentifier.forUid(UID), windowBootstrap.bootstrap(transformation))
                 .write(savepointPath);
 
-        bEnv.execute("write state");
-
-        StreamExecutionEnvironment sEnv = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.execute("write state");
 
         WindowedStream<Tuple2<String, Integer>, String, TimeWindow> stream =
-                sEnv.addSource(new MaxWatermarkSource<Tuple2<String, Integer>>())
+                env.addSource(new MaxWatermarkSource<Tuple2<String, Integer>>())
                         .returns(TUPLE_TYPE_INFO)
                         .keyBy(tuple -> tuple.f0)
                         .window(
                                 SlidingEventTimeWindows.of(
-                                        Time.milliseconds(5), Time.milliseconds(1)))
+                                        Duration.ofMillis(5), Duration.ofMillis(1)));
+
+        DataStream<Tuple2<String, Integer>> windowed = windowStream.window(stream).uid(UID);
+        CloseableIterator<Tuple2<String, Integer>> future = windowed.collectAsync();
+
+        submitJob(savepointPath, env);
+
+        assertThat(future)
+                .toIterable()
+                .as("Incorrect results from bootstrapped windows")
+                .containsAll(STANDARD_MATCHER);
+    }
+
+    @TestTemplate
+    void testSlideWindowWithEvictor() throws Exception {
+        final String savepointPath = getTempDirPath(new AbstractID().toHexString());
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(configuration);
+        env.setRuntimeMode(RuntimeExecutionMode.AUTOMATIC);
+
+        DataStream<Tuple2<String, Integer>> bootstrapData =
+                env.fromData(WORDS)
+                        .map(word -> Tuple2.of(word, 1))
+                        .returns(TUPLE_TYPE_INFO)
+                        .assignTimestampsAndWatermarks(
+                                WatermarkStrategy.<Tuple2<String, Integer>>noWatermarks()
+                                        .withTimestampAssigner((record, ts) -> 2L));
+
+        WindowedStateTransformation<Tuple2<String, Integer>, String, TimeWindow> transformation =
+                OperatorTransformation.bootstrapWith(bootstrapData)
+                        .keyBy(tuple -> tuple.f0, Types.STRING)
+                        .window(
+                                SlidingEventTimeWindows.of(
+                                        Duration.ofMillis(5), Duration.ofMillis(1)))
+                        .evictor(CountEvictor.of(1));
+
+        SavepointWriter.newSavepoint(env, stateBackend, 128)
+                .withOperator(
+                        OperatorIdentifier.forUid(UID), windowBootstrap.bootstrap(transformation))
+                .write(savepointPath);
+
+        env.execute("write state");
+
+        WindowedStream<Tuple2<String, Integer>, String, TimeWindow> stream =
+                env.addSource(new MaxWatermarkSource<Tuple2<String, Integer>>())
+                        .returns(TUPLE_TYPE_INFO)
+                        .keyBy(tuple -> tuple.f0)
+                        .window(
+                                SlidingEventTimeWindows.of(
+                                        Duration.ofMillis(5), Duration.ofMillis(1)))
                         .evictor(CountEvictor.of(1));
 
         DataStream<Tuple2<String, Integer>> windowed = windowStream.window(stream).uid(UID);
-        CompletableFuture<Collection<Tuple2<String, Integer>>> future = collector.collect(windowed);
+        CloseableIterator<Tuple2<String, Integer>> future = windowed.collectAsync();
 
-        submitJob(savepointPath, sEnv);
+        submitJob(savepointPath, env);
 
-        Collection<Tuple2<String, Integer>> results = future.get();
-        Assert.assertEquals("Incorrect number of results", 15, results.size());
-        Assert.assertThat("Incorrect bootstrap state", new HashSet<>(results), EVICTOR_MATCHER);
+        assertThat(future)
+                .toIterable()
+                .as("Incorrect results from bootstrapped windows")
+                .containsAll(EVICTOR_MATCHER);
     }
 
-    private void submitJob(String savepointPath, StreamExecutionEnvironment sEnv) {
-        JobGraph jobGraph = sEnv.getStreamGraph().getJobGraph();
-        jobGraph.setSavepointRestoreSettings(SavepointRestoreSettings.forPath(savepointPath, true));
+    private void submitJob(String savepointPath, StreamExecutionEnvironment sEnv) throws Exception {
+        StreamGraph streamGraph = sEnv.getStreamGraph();
+        streamGraph.setSavepointRestoreSettings(
+                SavepointRestoreSettings.forPath(savepointPath, true));
 
-        ClusterClient<?> client = miniClusterResource.getClusterClient();
-        try {
-            Optional<SerializedThrowable> serializedThrowable =
-                    client.submitJob(jobGraph)
-                            .thenCompose(client::requestJobResult)
-                            .get()
-                            .getSerializedThrowable();
-            Assert.assertFalse(serializedThrowable.isPresent());
-        } catch (Throwable t) {
-            Assert.fail("Failed to submit job");
-        }
+        sEnv.execute(streamGraph);
     }
 
     private static class Reducer implements ReduceFunction<Tuple2<String, Integer>> {
@@ -417,8 +433,8 @@ public class SavepointWriterWindowITCase extends AbstractTestBase {
 
     @FunctionalInterface
     private interface WindowBootstrap {
-        BootstrapTransformation<Tuple2<String, Integer>> bootstrap(
-                WindowedOperatorTransformation<Tuple2<String, Integer>, String, TimeWindow>
+        StateBootstrapTransformation<Tuple2<String, Integer>> bootstrap(
+                WindowedStateTransformation<Tuple2<String, Integer>, String, TimeWindow>
                         transformation);
     }
 

@@ -18,38 +18,50 @@
 
 package org.apache.flink.runtime.dispatcher;
 
+import org.apache.flink.api.common.ApplicationID;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
-import org.apache.flink.core.fs.Path;
-import org.apache.flink.runtime.executiongraph.AccessExecutionGraph;
+import org.apache.flink.runtime.application.ArchivedApplication;
 import org.apache.flink.runtime.messages.Acknowledge;
-import org.apache.flink.runtime.webmonitor.WebMonitorUtils;
+import org.apache.flink.runtime.scheduler.ExecutionGraphInfo;
+import org.apache.flink.runtime.webmonitor.history.ApplicationJsonArchivist;
 import org.apache.flink.runtime.webmonitor.history.JsonArchivist;
+
+import javax.annotation.Nullable;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
-/** Writer for an {@link AccessExecutionGraph}. */
+/** Writer for an {@link ExecutionGraphInfo}. */
 public interface HistoryServerArchivist {
 
     /**
-     * Archives the given {@link AccessExecutionGraph} on the history server.
+     * Archives the given {@link ExecutionGraphInfo} on the history server.
      *
-     * @param executionGraph to store on the history server
+     * @param executionGraphInfo to store on the history server
      * @return Future which is completed once the archiving has been completed.
      */
-    CompletableFuture<Acknowledge> archiveExecutionGraph(AccessExecutionGraph executionGraph);
+    CompletableFuture<Acknowledge> archiveExecutionGraph(
+            ExecutionGraphInfo executionGraphInfo, @Nullable ApplicationID applicationId);
+
+    /**
+     * Archives the given application on the history server.
+     *
+     * @param archivedApplication application information used to archive
+     * @return Future which is completed once the archiving has been completed.
+     */
+    CompletableFuture<Acknowledge> archiveApplication(ArchivedApplication archivedApplication);
 
     static HistoryServerArchivist createHistoryServerArchivist(
-            Configuration configuration, JsonArchivist jsonArchivist, Executor ioExecutor) {
-        final String configuredArchivePath = configuration.getString(JobManagerOptions.ARCHIVE_DIR);
+            Configuration configuration,
+            JsonArchivist jsonArchivist,
+            ApplicationJsonArchivist applicationJsonArchivist,
+            Executor ioExecutor) {
+        final String configuredArchivePath = configuration.get(JobManagerOptions.ARCHIVE_DIR);
 
         if (configuredArchivePath != null) {
-            final Path archivePath =
-                    WebMonitorUtils.validateAndNormalizeUri(
-                            new Path(configuredArchivePath).toUri());
-
-            return new JsonResponseHistoryServerArchivist(jsonArchivist, archivePath, ioExecutor);
+            return new JsonResponseHistoryServerArchivist(
+                    configuration, jsonArchivist, applicationJsonArchivist, ioExecutor);
         } else {
             return VoidHistoryServerArchivist.INSTANCE;
         }

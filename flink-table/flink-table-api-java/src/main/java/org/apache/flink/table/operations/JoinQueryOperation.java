@@ -19,27 +19,34 @@
 package org.apache.flink.table.operations;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.expressions.ResolvedExpression;
+import org.apache.flink.table.expressions.SqlFactory;
+import org.apache.flink.table.operations.utils.OperationExpressionsUtils;
 
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /** Table operation that joins two relational operations based on given condition. */
 @Internal
 public class JoinQueryOperation implements QueryOperation {
 
+    private static final String INPUT_1_ALIAS = "$$T1_JOIN";
+    private static final String INPUT_2_ALIAS = "$$T2_JOIN";
     private final QueryOperation left;
     private final QueryOperation right;
     private final JoinType joinType;
     private final ResolvedExpression condition;
     private final boolean correlated;
-    private final TableSchema tableSchema;
+    private final ResolvedSchema resolvedSchema;
 
     /** Specifies how the two Tables should be joined. */
+    @Internal
     public enum JoinType {
         INNER,
         LEFT_OUTER,
@@ -59,34 +66,21 @@ public class JoinQueryOperation implements QueryOperation {
         this.condition = condition;
         this.correlated = correlated;
 
-        this.tableSchema = calculateResultingSchema(left, right);
+        this.resolvedSchema = calculateResultingSchema(left, right);
     }
 
-    private TableSchema calculateResultingSchema(QueryOperation left, QueryOperation right) {
-        TableSchema leftSchema = left.getTableSchema();
-        TableSchema rightSchema = right.getTableSchema();
-        int resultingSchemaSize = leftSchema.getFieldCount() + rightSchema.getFieldCount();
-        String[] newFieldNames = new String[resultingSchemaSize];
-        System.arraycopy(
-                leftSchema.getFieldNames(), 0, newFieldNames, 0, leftSchema.getFieldCount());
-        System.arraycopy(
-                rightSchema.getFieldNames(),
-                0,
-                newFieldNames,
-                leftSchema.getFieldCount(),
-                rightSchema.getFieldCount());
-
-        TypeInformation[] newFieldTypes = new TypeInformation[resultingSchemaSize];
-
-        System.arraycopy(
-                leftSchema.getFieldTypes(), 0, newFieldTypes, 0, leftSchema.getFieldCount());
-        System.arraycopy(
-                rightSchema.getFieldTypes(),
-                0,
-                newFieldTypes,
-                leftSchema.getFieldCount(),
-                rightSchema.getFieldCount());
-        return new TableSchema(newFieldNames, newFieldTypes);
+    private ResolvedSchema calculateResultingSchema(QueryOperation left, QueryOperation right) {
+        final ResolvedSchema leftSchema = left.getResolvedSchema();
+        final ResolvedSchema rightSchema = right.getResolvedSchema();
+        return ResolvedSchema.physical(
+                Stream.concat(
+                                leftSchema.getColumnNames().stream(),
+                                rightSchema.getColumnNames().stream())
+                        .collect(Collectors.toList()),
+                Stream.concat(
+                                leftSchema.getColumnDataTypes().stream(),
+                                rightSchema.getColumnDataTypes().stream())
+                        .collect(Collectors.toList()));
     }
 
     public JoinType getJoinType() {
@@ -102,8 +96,8 @@ public class JoinQueryOperation implements QueryOperation {
     }
 
     @Override
-    public TableSchema getTableSchema() {
-        return tableSchema;
+    public ResolvedSchema getResolvedSchema() {
+        return resolvedSchema;
     }
 
     @Override
@@ -115,6 +109,49 @@ public class JoinQueryOperation implements QueryOperation {
 
         return OperationUtils.formatWithChildren(
                 "Join", args, getChildren(), Operation::asSummaryString);
+    }
+
+    @Override
+    public String asSerializableString(SqlFactory sqlFactory) {
+
+        Map<Integer, String> inputAliases = new HashMap<>();
+        inputAliases.put(0, INPUT_1_ALIAS);
+        inputAliases.put(
+                1, correlated ? CorrelatedFunctionQueryOperation.INPUT_ALIAS : INPUT_2_ALIAS);
+
+        return String.format(
+                "SELECT %s FROM (%s\n) %s %s JOIN %s ON %s",
+                getSelectList(),
+                OperationUtils.indent(left.asSerializableString(sqlFactory)),
+                INPUT_1_ALIAS,
+                joinType.toString().replaceAll("_", " "),
+                rightToSerializable(sqlFactory),
+                OperationExpressionsUtils.scopeReferencesWithAlias(inputAliases, condition)
+                        .asSerializableString(sqlFactory));
+    }
+
+    private String getSelectList() {
+        String leftColumns =
+                OperationUtils.formatSelectColumns(left.getResolvedSchema(), INPUT_1_ALIAS);
+        String rightColumns =
+                OperationUtils.formatSelectColumns(
+                        right.getResolvedSchema(),
+                        correlated ? CorrelatedFunctionQueryOperation.INPUT_ALIAS : INPUT_2_ALIAS);
+        return leftColumns + ", " + rightColumns;
+    }
+
+    private String rightToSerializable(SqlFactory sqlFactory) {
+        final StringBuilder s = new StringBuilder();
+        if (!correlated) {
+            s.append("(");
+        }
+        s.append(OperationUtils.indent(right.asSerializableString(sqlFactory)));
+        if (!correlated) {
+            s.append("\n)");
+            s.append(" ");
+            s.append(INPUT_2_ALIAS);
+        }
+        return s.toString();
     }
 
     @Override

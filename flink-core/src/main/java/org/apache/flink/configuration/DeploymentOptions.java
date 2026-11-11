@@ -18,8 +18,11 @@
 
 package org.apache.flink.configuration;
 
+import org.apache.flink.annotation.Experimental;
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.annotation.docs.Documentation;
 import org.apache.flink.configuration.description.Description;
+import org.apache.flink.configuration.description.TextElement;
 
 import java.util.List;
 
@@ -37,14 +40,16 @@ public class DeploymentOptions {
                     .withDescription(
                             Description.builder()
                                     .text(
-                                            "The deployment target for the execution. This can take one of the following values:")
+                                            "The deployment target for the execution. This can take one of the following values "
+                                                    + "when calling %s:",
+                                            TextElement.code("bin/flink run"))
                                     .list(
                                             text("remote"),
                                             text("local"),
-                                            text("yarn-per-job"),
+                                            text("yarn-application"),
                                             text("yarn-session"),
+                                            text("kubernetes-application"),
                                             text("kubernetes-session"))
-                                    .text(".")
                                     .build());
 
     public static final ConfigOption<Boolean> ATTACHED =
@@ -70,4 +75,98 @@ public class DeploymentOptions {
                     .withDescription(
                             "Custom JobListeners to be registered with the execution environment."
                                     + " The registered listeners cannot have constructors with arguments.");
+
+    public static final ConfigOption<List<String>> JOB_STATUS_CHANGED_LISTENERS =
+            key("execution.job-status-changed-listeners")
+                    .stringType()
+                    .asList()
+                    .noDefaultValue()
+                    .withDescription(
+                            "When job is created or its status is changed, Flink will generate job event and notify job status changed listener.");
+
+    public static final ConfigOption<Boolean> SHUTDOWN_ON_APPLICATION_FINISH =
+            ConfigOptions.key("execution.shutdown-on-application-finish")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether a Flink Application cluster should shut down automatically after its application finishes"
+                                    + " (either successfully or as result of a failure). Has no effect for other deployment modes.");
+
+    /**
+     * @deprecated Check application exceptions instead.
+     */
+    @Deprecated
+    @Documentation.ExcludeFromDocumentation("Hidden for deprecated")
+    public static final ConfigOption<Boolean> SUBMIT_FAILED_JOB_ON_APPLICATION_ERROR =
+            ConfigOptions.key("execution.submit-failed-job-on-application-error")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            Description.builder()
+                                    .text(
+                                            "If a failed job should be submitted (in the application mode) when"
+                                                    + " there is an error in the application driver before an actual job"
+                                                    + " submission. This is intended for providing a clean way of reporting"
+                                                    + " failures back to the user and is especially useful in combination"
+                                                    + " with '%s'. This option only works when the single job submission is"
+                                                    + " enforced ('%s' is enabled). Please note that this is an experimental"
+                                                    + " option and may be changed in the future.",
+                                            TextElement.text(SHUTDOWN_ON_APPLICATION_FINISH.key()),
+                                            TextElement.text(HighAvailabilityOptions.HA_MODE.key()))
+                                    .build());
+
+    @Experimental
+    public static final ConfigOption<List<String>> PROGRAM_CONFIG_WILDCARDS =
+            ConfigOptions.key("execution.program-config.wildcards")
+                    .stringType()
+                    .asList()
+                    .defaultValues()
+                    .withDescription(
+                            Description.builder()
+                                    .text(
+                                            "List of configuration keys that are allowed to be set in a user program "
+                                                    + "regardless whether program configuration is enabled or not.")
+                                    .linebreak()
+                                    .linebreak()
+                                    .text(
+                                            "Currently changes that are not backed by the Configuration class are always allowed.")
+                                    .build());
+
+    @Experimental
+    public static final ConfigOption<Boolean> PROGRAM_CONFIG_ENABLED =
+            ConfigOptions.key("execution.program-config.enabled")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDeprecatedKeys("execution.allow-client-job-configurations")
+                    .withDescription(
+                            Description.builder()
+                                    .text(
+                                            "Determines whether configurations in the user program are allowed. By default, "
+                                                    + "configuration can be set both on a cluster-level (via options) or "
+                                                    + "within the user program (i.e. programmatic via environment setters). "
+                                                    + "If disabled, all configuration must be defined on a cluster-level and "
+                                                    + "programmatic setters in the user program are prohibited.")
+                                    .linebreak()
+                                    .linebreak()
+                                    .text(
+                                            "Depending on your deployment mode failing the job might have different implications. "
+                                                    + "Either your client that is trying to submit the job to an external "
+                                                    + "cluster (session cluster deployment) throws the exception or the "
+                                                    + "job manager (application mode deployment).")
+                                    .linebreak()
+                                    .linebreak()
+                                    .text(
+                                            "The '%s' option lists configuration keys that are allowed to be set in user programs "
+                                                    + "regardless of this setting.",
+                                            TextElement.text(PROGRAM_CONFIG_WILDCARDS.key()))
+                                    .build());
+
+    @Experimental
+    public static final ConfigOption<Boolean> TERMINATE_APPLICATION_ON_ANY_JOB_EXCEPTION =
+            ConfigOptions.key("execution.terminate-application-on-any-job-terminated-exceptionally")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "When it is set to true, the application will complete exceptionally if any job fails or is canceled."
+                                    + " When it is set to false, the application will finish after all jobs reach terminal states.");
 }

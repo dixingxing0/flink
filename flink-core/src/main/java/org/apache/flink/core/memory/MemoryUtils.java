@@ -19,7 +19,6 @@
 package org.apache.flink.core.memory;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.util.JavaGcCleanerWrapper;
 import org.apache.flink.util.Preconditions;
 
 import java.lang.reflect.Field;
@@ -112,23 +111,17 @@ public class MemoryUtils {
     }
 
     /**
-     * Creates a cleaner to release the unsafe memory by VM GC.
+     * Creates a cleaner to release the unsafe memory.
      *
-     * <p>When memory owner becomes <a href="package-summary.html#reachability">phantom
-     * reachable</a>, GC will release the underlying unsafe memory if not released yet.
-     *
-     * @param owner memory owner which phantom reaching is to monitor by GC and release the unsafe
-     *     memory
      * @param address address of the unsafe memory to release
+     * @param customCleanup A custom action to clean up GC
      * @return action to run to release the unsafe memory manually
      */
-    static Runnable createMemoryGcCleaner(Object owner, long address, Runnable customCleanup) {
-        return JavaGcCleanerWrapper.createCleaner(
-                owner,
-                () -> {
-                    releaseUnsafe(address);
-                    customCleanup.run();
-                });
+    static Runnable createMemoryCleaner(long address, Runnable customCleanup) {
+        return () -> {
+            releaseUnsafe(address);
+            customCleanup.run();
+        };
     }
 
     private static void releaseUnsafe(long address) {
@@ -161,15 +154,26 @@ public class MemoryUtils {
      * @param buffer {@link ByteBuffer} which wraps the native memory address to get
      * @return native memory address wrapped by the given {@link ByteBuffer}
      */
-    static long getByteBufferAddress(ByteBuffer buffer) {
+    public static long getByteBufferAddress(ByteBuffer buffer) {
         Preconditions.checkNotNull(buffer, "buffer is null");
         Preconditions.checkArgument(
                 buffer.isDirect(), "Can't get address of a non-direct ByteBuffer.");
+
+        long offHeapAddress;
         try {
-            return UNSAFE.getLong(buffer, BUFFER_ADDRESS_FIELD_OFFSET);
+            offHeapAddress = UNSAFE.getLong(buffer, BUFFER_ADDRESS_FIELD_OFFSET);
         } catch (Throwable t) {
             throw new Error("Could not access direct byte buffer address field.", t);
         }
+
+        Preconditions.checkState(offHeapAddress > 0, "negative pointer or size");
+        Preconditions.checkState(
+                offHeapAddress < Long.MAX_VALUE - Integer.MAX_VALUE,
+                "Segment initialized with too large address: %s ; Max allowed address is %d",
+                offHeapAddress,
+                (Long.MAX_VALUE - Integer.MAX_VALUE - 1));
+
+        return offHeapAddress;
     }
 
     /** Should not be instantiated. */

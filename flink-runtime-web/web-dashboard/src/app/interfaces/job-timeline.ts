@@ -16,13 +16,13 @@
  * limitations under the License.
  */
 
-export interface JobSubTaskTimeInterface {
+export interface JobSubTaskTime {
   id: string;
   name: string;
   now: number;
   subtasks: Array<{
     subtask: number;
-    host: string;
+    endpoint: string;
     duration: number;
     timestamps: {
       CREATED: number;

@@ -24,9 +24,10 @@ import org.apache.flink.configuration.IllegalConfigurationException;
 import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.configuration.NettyShuffleEnvironmentOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
-import org.apache.flink.runtime.blob.BlobCacheService;
-import org.apache.flink.runtime.blob.VoidBlobStore;
+import org.apache.flink.core.testutils.AllCallbackWrapper;
+import org.apache.flink.runtime.blob.NoOpTaskExecutorBlobService;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
+import org.apache.flink.runtime.entrypoint.WorkingDirectory;
 import org.apache.flink.runtime.externalresource.ExternalResourceInfoProvider;
 import org.apache.flink.runtime.heartbeat.TestingHeartbeatServices;
 import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
@@ -37,25 +38,27 @@ import org.apache.flink.runtime.metrics.NoOpMetricRegistry;
 import org.apache.flink.runtime.metrics.scope.ScopeFormats;
 import org.apache.flink.runtime.metrics.util.TestingMetricRegistry;
 import org.apache.flink.runtime.rpc.RpcService;
-import org.apache.flink.runtime.rpc.TestingRpcServiceResource;
+import org.apache.flink.runtime.rpc.TestingRpcServiceExtension;
+import org.apache.flink.runtime.security.token.DelegationTokenReceiverRepository;
+import org.apache.flink.runtime.testutils.WorkingDirectoryExtension;
+import org.apache.flink.testutils.junit.utils.TempDirUtils;
 import org.apache.flink.util.IOUtils;
-import org.apache.flink.util.TestLogger;
 
-import org.apache.flink.shaded.guava18.com.google.common.collect.Sets;
+import org.apache.flink.shaded.guava33.com.google.common.collect.Sets;
 
 import org.apache.commons.io.FileUtils;
-import org.junit.After;
-import org.junit.Assume;
-import org.junit.Before;
-import org.junit.ClassRule;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -63,38 +66,46 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static org.hamcrest.collection.IsIn.isIn;
-import static org.hamcrest.core.Every.everyItem;
-import static org.junit.Assert.assertThat;
-import static org.junit.Assert.fail;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests that check how the {@link TaskManagerRunner} behaves when encountering startup problems.
  */
-public class TaskManagerRunnerStartupTest extends TestLogger {
+class TaskManagerRunnerStartupTest {
 
     private static final String LOCAL_HOST = "localhost";
 
-    @ClassRule
-    public static final TestingRpcServiceResource RPC_SERVICE_RESOURCE =
-            new TestingRpcServiceResource();
+    @RegisterExtension
+    public static final AllCallbackWrapper<TestingRpcServiceExtension>
+            RPC_SERVICE_EXTENSION_WRAPPER =
+                    new AllCallbackWrapper<>(new TestingRpcServiceExtension());
 
-    @Rule public final TemporaryFolder tempFolder = new TemporaryFolder();
+    @TempDir public Path tempFolder;
 
-    private final RpcService rpcService = RPC_SERVICE_RESOURCE.getTestingRpcService();
+    @TempDir public static File workingDirectoryFolder;
+
+    @RegisterExtension
+    private static final AllCallbackWrapper<WorkingDirectoryExtension>
+            WORKING_DIRECTORY_EXTENSION_WRAPPER =
+                    new AllCallbackWrapper<>(
+                            new WorkingDirectoryExtension(() -> workingDirectoryFolder));
+
+    private final RpcService rpcService =
+            RPC_SERVICE_EXTENSION_WRAPPER.getCustomExtension().getTestingRpcService();
 
     private TestingHighAvailabilityServices highAvailabilityServices;
 
-    @Before
-    public void setupTest() {
+    @BeforeEach
+    void setupTest() {
         highAvailabilityServices = new TestingHighAvailabilityServices();
         highAvailabilityServices.setResourceManagerLeaderRetriever(
                 new SettableLeaderRetrievalService());
     }
 
-    @After
-    public void tearDownTest() throws Exception {
-        highAvailabilityServices.closeAndCleanupAllData();
+    @AfterEach
+    void tearDownTest() throws Exception {
+        highAvailabilityServices.closeWithOptionalClean(true);
         highAvailabilityServices = null;
     }
 
@@ -103,24 +114,27 @@ public class TaskManagerRunnerStartupTest extends TestLogger {
      * writable.
      */
     @Test
-    public void testIODirectoryNotWritable() throws Exception {
-        File nonWritable = tempFolder.newFolder();
-        Assume.assumeTrue(
-                "Cannot create non-writable temporary file directory. Skipping test.",
-                nonWritable.setWritable(false, false));
+    void testIODirectoryNotWritable() throws Exception {
+        File nonWritable = TempDirUtils.newFolder(tempFolder);
+        Assumptions.assumeTrue(
+                nonWritable.setWritable(false, false),
+                "Cannot create non-writable temporary file directory. Skipping test.");
 
         try {
             Configuration cfg = createFlinkConfiguration();
-            cfg.setString(CoreOptions.TMP_DIRS, nonWritable.getAbsolutePath());
+            cfg.set(CoreOptions.TMP_DIRS, nonWritable.getAbsolutePath());
 
-            try {
-
-                startTaskManager(cfg, rpcService, highAvailabilityServices);
-
-                fail("Should fail synchronously with an IOException");
-            } catch (IOException e) {
-                // splendid!
-            }
+            assertThatThrownBy(
+                            () ->
+                                    startTaskManager(
+                                            cfg,
+                                            rpcService,
+                                            highAvailabilityServices,
+                                            WORKING_DIRECTORY_EXTENSION_WRAPPER
+                                                    .getCustomExtension()
+                                                    .createNewWorkingDirectory()),
+                            "Should fail synchronously with an IOException")
+                    .isInstanceOf(IOException.class);
         } finally {
             // noinspection ResultOfMethodCallIgnored
             nonWritable.setWritable(true, false);
@@ -136,33 +150,48 @@ public class TaskManagerRunnerStartupTest extends TestLogger {
      * Tests that the TaskManagerRunner startup fails synchronously when the memory configuration is
      * wrong.
      */
-    @Test(expected = IllegalConfigurationException.class)
-    public void testMemoryConfigWrong() throws Exception {
+    @Test
+    void testMemoryConfigWrong() {
         Configuration cfg = createFlinkConfiguration();
 
         // something invalid
         cfg.set(TaskManagerOptions.NETWORK_MEMORY_MIN, MemorySize.parse("100m"));
         cfg.set(TaskManagerOptions.NETWORK_MEMORY_MAX, MemorySize.parse("10m"));
-        startTaskManager(cfg, rpcService, highAvailabilityServices);
+        assertThatThrownBy(
+                        () ->
+                                startTaskManager(
+                                        cfg,
+                                        rpcService,
+                                        highAvailabilityServices,
+                                        WORKING_DIRECTORY_EXTENSION_WRAPPER
+                                                .getCustomExtension()
+                                                .createNewWorkingDirectory()))
+                .isInstanceOf(IllegalConfigurationException.class);
     }
 
     /**
      * Tests that the TaskManagerRunner startup fails if the network stack cannot be initialized.
      */
     @Test
-    public void testStartupWhenNetworkStackFailsToInitialize() throws Exception {
+    void testStartupWhenNetworkStackFailsToInitialize() throws Exception {
         final ServerSocket blocker = new ServerSocket(0, 50, InetAddress.getByName(LOCAL_HOST));
 
         try {
             final Configuration cfg = createFlinkConfiguration();
-            cfg.setInteger(NettyShuffleEnvironmentOptions.DATA_PORT, blocker.getLocalPort());
-            cfg.setString(TaskManagerOptions.BIND_HOST, LOCAL_HOST);
+            cfg.set(NettyShuffleEnvironmentOptions.DATA_PORT, blocker.getLocalPort());
+            cfg.set(TaskManagerOptions.BIND_HOST, LOCAL_HOST);
 
-            startTaskManager(cfg, rpcService, highAvailabilityServices);
-
-            fail("Should throw IOException when the network stack cannot be initialized.");
-        } catch (IOException e) {
-            // ignored
+            assertThatThrownBy(
+                            () ->
+                                    startTaskManager(
+                                            cfg,
+                                            rpcService,
+                                            highAvailabilityServices,
+                                            WORKING_DIRECTORY_EXTENSION_WRAPPER
+                                                    .getCustomExtension()
+                                                    .createNewWorkingDirectory()),
+                            "Should throw IOException when the network stack cannot be initialized.")
+                    .isInstanceOf(IOException.class);
         } finally {
             IOUtils.closeQuietly(blocker);
         }
@@ -170,7 +199,7 @@ public class TaskManagerRunnerStartupTest extends TestLogger {
 
     /** Checks that all expected metrics are initialized. */
     @Test
-    public void testMetricInitialization() throws Exception {
+    void testMetricInitialization() throws Exception {
         Configuration cfg = createFlinkConfiguration();
 
         List<String> registeredMetrics = new ArrayList<>();
@@ -178,6 +207,9 @@ public class TaskManagerRunnerStartupTest extends TestLogger {
                 cfg,
                 rpcService,
                 highAvailabilityServices,
+                WORKING_DIRECTORY_EXTENSION_WRAPPER
+                        .getCustomExtension()
+                        .createNewWorkingDirectory(),
                 TestingMetricRegistry.builder()
                         .setRegisterConsumer(
                                 (metric, metricName, group) ->
@@ -208,8 +240,6 @@ public class TaskManagerRunnerStartupTest extends TestLogger {
                         ".taskmanager..Status.JVM.Threads.Count",
                         ".taskmanager..Status.JVM.CPU.Load",
                         ".taskmanager..Status.JVM.CPU.Time",
-                        ".taskmanager..Status.Network.TotalMemorySegments",
-                        ".taskmanager..Status.Network.AvailableMemorySegments",
                         ".taskmanager..Status.Shuffle.Netty.TotalMemorySegments",
                         ".taskmanager..Status.Shuffle.Netty.TotalMemory",
                         ".taskmanager..Status.Shuffle.Netty.AvailableMemorySegments",
@@ -230,9 +260,8 @@ public class TaskManagerRunnerStartupTest extends TestLogger {
                                                 : Stream.empty())
                         .collect(Collectors.toSet());
 
-        assertThat(
-                expectedTaskManagerMetricsWithoutTaskManagerId,
-                everyItem(isIn(registeredMetricsWithoutTaskManagerId)));
+        assertThat(expectedTaskManagerMetricsWithoutTaskManagerId)
+                .allSatisfy(ele -> assertThat(ele).isIn(registeredMetricsWithoutTaskManagerId));
     }
 
     // -----------------------------------------------------------------------------------------------
@@ -244,16 +273,22 @@ public class TaskManagerRunnerStartupTest extends TestLogger {
     private static void startTaskManager(
             Configuration configuration,
             RpcService rpcService,
-            HighAvailabilityServices highAvailabilityServices)
+            HighAvailabilityServices highAvailabilityServices,
+            WorkingDirectory workingDirectory)
             throws Exception {
         startTaskManager(
-                configuration, rpcService, highAvailabilityServices, NoOpMetricRegistry.INSTANCE);
+                configuration,
+                rpcService,
+                highAvailabilityServices,
+                workingDirectory,
+                NoOpMetricRegistry.INSTANCE);
     }
 
     private static void startTaskManager(
             Configuration configuration,
             RpcService rpcService,
             HighAvailabilityServices highAvailabilityServices,
+            WorkingDirectory workingDirectory,
             MetricRegistry metricRegistry)
             throws Exception {
 
@@ -264,9 +299,11 @@ public class TaskManagerRunnerStartupTest extends TestLogger {
                 highAvailabilityServices,
                 new TestingHeartbeatServices(),
                 metricRegistry,
-                new BlobCacheService(configuration, new VoidBlobStore(), null),
+                NoOpTaskExecutorBlobService.INSTANCE,
                 false,
                 ExternalResourceInfoProvider.NO_EXTERNAL_RESOURCES,
-                error -> {});
+                workingDirectory,
+                error -> {},
+                new DelegationTokenReceiverRepository(configuration, null));
     }
 }

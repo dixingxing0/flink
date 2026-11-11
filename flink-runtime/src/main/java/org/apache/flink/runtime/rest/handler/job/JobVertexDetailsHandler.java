@@ -19,7 +19,6 @@
 package org.apache.flink.runtime.rest.handler.job;
 
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.executiongraph.AccessExecution;
 import org.apache.flink.runtime.executiongraph.AccessExecutionGraph;
 import org.apache.flink.runtime.executiongraph.AccessExecutionJobVertex;
@@ -29,6 +28,7 @@ import org.apache.flink.runtime.rest.NotFoundException;
 import org.apache.flink.runtime.rest.handler.HandlerRequest;
 import org.apache.flink.runtime.rest.handler.legacy.ExecutionGraphCache;
 import org.apache.flink.runtime.rest.handler.legacy.metrics.MetricFetcher;
+import org.apache.flink.runtime.rest.handler.legacy.metrics.MetricStore;
 import org.apache.flink.runtime.rest.messages.EmptyRequestBody;
 import org.apache.flink.runtime.rest.messages.JobIDPathParameter;
 import org.apache.flink.runtime.rest.messages.JobVertexDetailsInfo;
@@ -39,12 +39,13 @@ import org.apache.flink.runtime.rest.messages.ResponseBody;
 import org.apache.flink.runtime.rest.messages.job.SubtaskExecutionAttemptDetailsInfo;
 import org.apache.flink.runtime.webmonitor.RestfulGateway;
 import org.apache.flink.runtime.webmonitor.history.ArchivedJson;
-import org.apache.flink.runtime.webmonitor.history.JsonArchivist;
+import org.apache.flink.runtime.webmonitor.history.OnlyExecutionGraphJsonArchivist;
 import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -53,13 +54,14 @@ import java.util.concurrent.Executor;
 
 /** Request handler for the job vertex details. */
 public class JobVertexDetailsHandler
-        extends AbstractExecutionGraphHandler<JobVertexDetailsInfo, JobVertexMessageParameters>
-        implements JsonArchivist {
+        extends AbstractAccessExecutionGraphHandler<
+                JobVertexDetailsInfo, JobVertexMessageParameters>
+        implements OnlyExecutionGraphJsonArchivist {
     private final MetricFetcher metricFetcher;
 
     public JobVertexDetailsHandler(
             GatewayRetriever<? extends RestfulGateway> leaderRetriever,
-            Time timeout,
+            Duration timeout,
             Map<String, String> responseHeaders,
             MessageHeaders<EmptyRequestBody, JobVertexDetailsInfo, JobVertexMessageParameters>
                     messageHeaders,
@@ -78,8 +80,7 @@ public class JobVertexDetailsHandler
 
     @Override
     protected JobVertexDetailsInfo handleRequest(
-            HandlerRequest<EmptyRequestBody, JobVertexMessageParameters> request,
-            AccessExecutionGraph executionGraph)
+            HandlerRequest<EmptyRequestBody> request, AccessExecutionGraph executionGraph)
             throws NotFoundException {
         JobID jobID = request.getPathParameter(JobIDPathParameter.class);
         JobVertexID jobVertexID = request.getPathParameter(JobVertexIdPathParameter.class);
@@ -89,7 +90,9 @@ public class JobVertexDetailsHandler
             throw new NotFoundException(String.format("JobVertex %s not found", jobVertexID));
         }
 
-        return createJobVertexDetailsInfo(jobVertex, jobID, metricFetcher);
+        metricFetcher.update();
+        return createJobVertexDetailsInfo(
+                jobVertex, jobID, metricFetcher.getMetricStore().getJobs());
     }
 
     @Override
@@ -114,21 +117,37 @@ public class JobVertexDetailsHandler
     private static JobVertexDetailsInfo createJobVertexDetailsInfo(
             AccessExecutionJobVertex jobVertex,
             JobID jobID,
-            @Nullable MetricFetcher metricFetcher) {
+            @Nullable MetricStore.JobMetricStoreSnapshot jobMetrics) {
         List<SubtaskExecutionAttemptDetailsInfo> subtasks = new ArrayList<>();
         final long now = System.currentTimeMillis();
         for (AccessExecutionVertex vertex : jobVertex.getTaskVertices()) {
             final AccessExecution execution = vertex.getCurrentExecutionAttempt();
             final JobVertexID jobVertexID = jobVertex.getJobVertexId();
+
+            final Collection<AccessExecution> attempts = vertex.getCurrentExecutions();
+            List<SubtaskExecutionAttemptDetailsInfo> otherConcurrentAttempts = null;
+
+            if (attempts.size() > 1) {
+                otherConcurrentAttempts = new ArrayList<>();
+                for (AccessExecution attempt : attempts) {
+                    if (attempt.getAttemptNumber() != execution.getAttemptNumber()) {
+                        otherConcurrentAttempts.add(
+                                SubtaskExecutionAttemptDetailsInfo.create(
+                                        attempt, jobMetrics, jobID, jobVertexID, null));
+                    }
+                }
+            }
+
             subtasks.add(
                     SubtaskExecutionAttemptDetailsInfo.create(
-                            execution, metricFetcher, jobID, jobVertexID));
+                            execution, jobMetrics, jobID, jobVertexID, otherConcurrentAttempts));
         }
 
         return new JobVertexDetailsInfo(
                 jobVertex.getJobVertexId(),
                 jobVertex.getName(),
                 jobVertex.getParallelism(),
+                jobVertex.getMaxParallelism(),
                 now,
                 subtasks);
     }

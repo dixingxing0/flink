@@ -18,14 +18,18 @@
 
 package org.apache.flink.formats.avro;
 
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.serialization.SerializationSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.formats.avro.AvroFormatOptions.AvroEncoding;
 import org.apache.flink.table.connector.ChangelogMode;
+import org.apache.flink.table.connector.Projection;
 import org.apache.flink.table.connector.format.DecodingFormat;
 import org.apache.flink.table.connector.format.EncodingFormat;
+import org.apache.flink.table.connector.format.ProjectableDecodingFormat;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.data.RowData;
@@ -37,12 +41,17 @@ import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
 
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Set;
+
+import static org.apache.flink.formats.avro.AvroFormatOptions.AVRO_ENCODING;
+import static org.apache.flink.formats.avro.AvroFormatOptions.AVRO_TIMESTAMP_LEGACY_MAPPING;
 
 /**
  * Table format factory for providing configured instances of Avro to RowData {@link
  * SerializationSchema} and {@link DeserializationSchema}.
  */
+@Internal
 public class AvroFormatFactory implements DeserializationFormatFactory, SerializationFormatFactory {
 
     public static final String IDENTIFIER = "avro";
@@ -52,14 +61,22 @@ public class AvroFormatFactory implements DeserializationFormatFactory, Serializ
             DynamicTableFactory.Context context, ReadableConfig formatOptions) {
         FactoryUtil.validateFactoryOptions(this, formatOptions);
 
-        return new DecodingFormat<DeserializationSchema<RowData>>() {
+        AvroEncoding encoding = formatOptions.get(AVRO_ENCODING);
+        boolean legacyTimestampMapping = formatOptions.get(AVRO_TIMESTAMP_LEGACY_MAPPING);
+
+        return new ProjectableDecodingFormat<DeserializationSchema<RowData>>() {
             @Override
             public DeserializationSchema<RowData> createRuntimeDecoder(
-                    DynamicTableSource.Context context, DataType producedDataType) {
+                    DynamicTableSource.Context context,
+                    DataType physicalDataType,
+                    int[][] projections) {
+                final DataType producedDataType =
+                        Projection.of(projections).project(physicalDataType);
                 final RowType rowType = (RowType) producedDataType.getLogicalType();
                 final TypeInformation<RowData> rowDataTypeInfo =
                         context.createTypeInformation(producedDataType);
-                return new AvroRowDataDeserializationSchema(rowType, rowDataTypeInfo);
+                return new AvroRowDataDeserializationSchema(
+                        rowType, rowDataTypeInfo, encoding, legacyTimestampMapping);
             }
 
             @Override
@@ -74,12 +91,16 @@ public class AvroFormatFactory implements DeserializationFormatFactory, Serializ
             DynamicTableFactory.Context context, ReadableConfig formatOptions) {
         FactoryUtil.validateFactoryOptions(this, formatOptions);
 
+        AvroEncoding encoding = formatOptions.get(AVRO_ENCODING);
+        boolean legacyTimestampMapping = formatOptions.get(AVRO_TIMESTAMP_LEGACY_MAPPING);
+
         return new EncodingFormat<SerializationSchema<RowData>>() {
             @Override
             public SerializationSchema<RowData> createRuntimeEncoder(
                     DynamicTableSink.Context context, DataType consumedDataType) {
                 final RowType rowType = (RowType) consumedDataType.getLogicalType();
-                return new AvroRowDataSerializationSchema(rowType);
+                return new AvroRowDataSerializationSchema(
+                        rowType, encoding, legacyTimestampMapping);
             }
 
             @Override
@@ -101,6 +122,9 @@ public class AvroFormatFactory implements DeserializationFormatFactory, Serializ
 
     @Override
     public Set<ConfigOption<?>> optionalOptions() {
-        return Collections.emptySet();
+        Set<ConfigOption<?>> options = new HashSet<>();
+        options.add(AVRO_ENCODING);
+        options.add(AVRO_TIMESTAMP_LEGACY_MAPPING);
+        return options;
     }
 }

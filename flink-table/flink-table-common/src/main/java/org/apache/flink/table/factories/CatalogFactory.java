@@ -19,22 +19,52 @@
 package org.apache.flink.table.factories;
 
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.table.catalog.Catalog;
+import org.apache.flink.table.legacy.factories.TableFactory;
 
 import java.util.Map;
 
 /**
  * A factory to create configured catalog instances based on string-based properties. See also
- * {@link TableFactory} for more information.
+ * {@link Factory} for more information.
+ *
+ * <p>Note that this interface supports the {@link TableFactory} stack for compatibility purposes.
+ * This is deprecated, however, and new implementations should implement the {@link Factory} stack
+ * instead.
  */
 @PublicEvolving
-public interface CatalogFactory extends TableFactory {
+public interface CatalogFactory extends Factory {
 
     /**
-     * Creates and configures a {@link Catalog} using the given properties.
+     * Creates and configures a {@link Catalog} using the given context.
      *
-     * @param properties normalized properties describing an external catalog.
-     * @return the configured catalog.
+     * <p>An implementation should perform validation and the discovery of further (nested)
+     * factories in this method.
      */
-    Catalog createCatalog(String name, Map<String, String> properties);
+    Catalog createCatalog(Context context);
+
+    /** Context provided when a catalog is created. */
+    @PublicEvolving
+    interface Context {
+        /** Returns the name with which the catalog is created. */
+        String getName();
+
+        /**
+         * Returns the options with which the catalog is created.
+         *
+         * <p>An implementation should perform validation of these options.
+         */
+        Map<String, String> getOptions();
+
+        /** Gives read-only access to the configuration of the current session. */
+        ReadableConfig getConfiguration();
+
+        /**
+         * Returns the class loader of the current session.
+         *
+         * <p>The class loader is in particular useful for discovering further (nested) factories.
+         */
+        ClassLoader getClassLoader();
+    }
 }

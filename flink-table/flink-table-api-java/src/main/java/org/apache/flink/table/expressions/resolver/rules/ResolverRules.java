@@ -20,17 +20,25 @@ package org.apache.flink.table.expressions.resolver.rules;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.api.ApiExpression;
+import org.apache.flink.table.expressions.SqlCallExpression;
 import org.apache.flink.table.expressions.UnresolvedReferenceExpression;
+import org.apache.flink.table.types.UnresolvedDataType;
 
 /** Contains instances of {@link ResolverRule}. */
 @Internal
 public final class ResolverRules {
 
+    /** Resolves {@link UnresolvedDataType}. See {@link TypeResolverRule} for details. */
+    public static final ResolverRule RESOLVE_TYPE = new TypeResolverRule();
+
     /**
      * Resolves {@link UnresolvedReferenceExpression}. See {@link ReferenceResolverRule} for
      * details.
      */
-    public static final ResolverRule FIELD_RESOLVE = new ReferenceResolverRule();
+    public static final ResolverRule RESOLVE_FIELD = new ReferenceResolverRule();
+
+    /** Resolves {@link SqlCallExpression}s. */
+    public static final ResolverRule RESOLVE_SQL_CALL = new ResolveSqlCallRule();
 
     /**
      * Resolves call based on argument types. See {@link ResolveCallByArgumentsRule} for details.

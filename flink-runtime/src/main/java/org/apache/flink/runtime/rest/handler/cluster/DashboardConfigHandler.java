@@ -18,7 +18,6 @@
 
 package org.apache.flink.runtime.rest.handler.cluster;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.rest.handler.AbstractRestHandler;
 import org.apache.flink.runtime.rest.handler.HandlerRequest;
 import org.apache.flink.runtime.rest.messages.DashboardConfiguration;
@@ -30,6 +29,7 @@ import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 
 import javax.annotation.Nonnull;
 
+import java.time.Duration;
 import java.time.ZonedDateTime;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -43,22 +43,29 @@ public class DashboardConfigHandler
 
     public DashboardConfigHandler(
             GatewayRetriever<? extends RestfulGateway> leaderRetriever,
-            Time timeout,
+            Duration timeout,
             Map<String, String> responseHeaders,
             MessageHeaders<EmptyRequestBody, DashboardConfiguration, EmptyMessageParameters>
                     messageHeaders,
             long refreshInterval,
-            boolean webSubmitEnabled) {
+            boolean webSubmitEnabled,
+            boolean webCancelEnabled,
+            boolean webRescaleEnabled) {
         super(leaderRetriever, timeout, responseHeaders, messageHeaders);
 
         dashboardConfiguration =
-                DashboardConfiguration.from(refreshInterval, ZonedDateTime.now(), webSubmitEnabled);
+                DashboardConfiguration.from(
+                        refreshInterval,
+                        ZonedDateTime.now(),
+                        webSubmitEnabled,
+                        webCancelEnabled,
+                        webRescaleEnabled,
+                        false);
     }
 
     @Override
     public CompletableFuture<DashboardConfiguration> handleRequest(
-            @Nonnull HandlerRequest<EmptyRequestBody, EmptyMessageParameters> request,
-            @Nonnull RestfulGateway gateway) {
+            @Nonnull HandlerRequest<EmptyRequestBody> request, @Nonnull RestfulGateway gateway) {
         return CompletableFuture.completedFuture(dashboardConfiguration);
     }
 }

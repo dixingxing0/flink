@@ -26,10 +26,12 @@ import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.metrics.MetricRegistry;
 import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
 import org.apache.flink.runtime.metrics.scope.ScopeFormat;
+import org.apache.flink.runtime.metrics.util.MetricUtils;
 import org.apache.flink.util.AbstractID;
 
 import javax.annotation.Nullable;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -43,9 +45,7 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 @Internal
 public class TaskMetricGroup extends ComponentMetricGroup<TaskManagerJobMetricGroup> {
 
-    private final Map<String, OperatorMetricGroup> operators = new HashMap<>();
-
-    static final int METRICS_OPERATOR_NAME_MAX_LENGTH = 80;
+    private final Map<String, InternalOperatorMetricGroup> operators = new HashMap<>();
 
     private final TaskIOMetricGroup ioMetrics;
 
@@ -54,9 +54,9 @@ public class TaskMetricGroup extends ComponentMetricGroup<TaskManagerJobMetricGr
      */
     private final ExecutionAttemptID executionId;
 
-    @Nullable protected final JobVertexID vertexId;
+    protected final JobVertexID vertexId;
 
-    @Nullable private final String taskName;
+    private final String taskName;
 
     protected final int subtaskIndex;
 
@@ -64,32 +64,29 @@ public class TaskMetricGroup extends ComponentMetricGroup<TaskManagerJobMetricGr
 
     // ------------------------------------------------------------------------
 
-    public TaskMetricGroup(
+    TaskMetricGroup(
             MetricRegistry registry,
             TaskManagerJobMetricGroup parent,
-            @Nullable JobVertexID vertexId,
             ExecutionAttemptID executionId,
-            @Nullable String taskName,
-            int subtaskIndex,
-            int attemptNumber) {
+            String taskName) {
         super(
                 registry,
                 registry.getScopeFormats()
                         .getTaskFormat()
                         .formatScope(
                                 checkNotNull(parent),
-                                vertexId,
+                                checkNotNull(executionId).getJobVertexId(),
                                 checkNotNull(executionId),
                                 taskName,
-                                subtaskIndex,
-                                attemptNumber),
+                                checkNotNull(executionId).getSubtaskIndex(),
+                                checkNotNull(executionId).getAttemptNumber()),
                 parent);
 
         this.executionId = checkNotNull(executionId);
-        this.vertexId = vertexId;
-        this.taskName = taskName;
-        this.subtaskIndex = subtaskIndex;
-        this.attemptNumber = attemptNumber;
+        this.vertexId = executionId.getJobVertexId();
+        this.taskName = checkNotNull(taskName);
+        this.subtaskIndex = executionId.getSubtaskIndex();
+        this.attemptNumber = executionId.getAttemptNumber();
 
         this.ioMetrics = new TaskIOMetricGroup(this);
     }
@@ -137,38 +134,39 @@ public class TaskMetricGroup extends ComponentMetricGroup<TaskManagerJobMetricGr
     protected QueryScopeInfo.TaskQueryScopeInfo createQueryServiceMetricInfo(
             CharacterFilter filter) {
         return new QueryScopeInfo.TaskQueryScopeInfo(
-                this.parent.jobId.toString(), String.valueOf(this.vertexId), this.subtaskIndex);
+                this.parent.jobId.toString(),
+                String.valueOf(this.vertexId),
+                this.subtaskIndex,
+                this.attemptNumber);
     }
 
     // ------------------------------------------------------------------------
     //  operators and cleanup
     // ------------------------------------------------------------------------
 
-    public OperatorMetricGroup getOrAddOperator(String name) {
-        return getOrAddOperator(OperatorID.fromJobVertexID(vertexId), name);
+    public InternalOperatorMetricGroup getOrAddOperator(String operatorName) {
+        return getOrAddOperator(
+                OperatorID.fromJobVertexID(vertexId), operatorName, Collections.emptyMap());
     }
 
-    public OperatorMetricGroup getOrAddOperator(OperatorID operatorID, String name) {
-        final String metricName;
-        if (name != null && name.length() > METRICS_OPERATOR_NAME_MAX_LENGTH) {
-            LOG.warn(
-                    "The operator name {} exceeded the {} characters length limit and was truncated.",
-                    name,
-                    METRICS_OPERATOR_NAME_MAX_LENGTH);
-            metricName = name.substring(0, METRICS_OPERATOR_NAME_MAX_LENGTH);
-        } else {
-            metricName = name;
-        }
+    public InternalOperatorMetricGroup getOrAddOperator(
+            OperatorID operatorID, String operatorName, Map<String, String> additionalVariables) {
+        final String truncatedOperatorName = MetricUtils.truncateOperatorName(operatorName);
 
         // unique OperatorIDs only exist in streaming, so we have to rely on the name for batch
         // operators
-        final String key = operatorID + metricName;
+        final String key = operatorID + truncatedOperatorName;
 
         synchronized (this) {
             return operators.computeIfAbsent(
                     key,
                     operator ->
-                            new OperatorMetricGroup(this.registry, this, operatorID, metricName));
+                            new InternalOperatorMetricGroup(
+                                    this.registry,
+                                    this,
+                                    operatorID,
+                                    truncatedOperatorName,
+                                    additionalVariables));
         }
     }
 
@@ -193,7 +191,7 @@ public class TaskMetricGroup extends ComponentMetricGroup<TaskManagerJobMetricGr
     }
 
     @Override
-    protected Iterable<? extends ComponentMetricGroup> subComponents() {
+    protected Iterable<? extends ComponentMetricGroup<?>> subComponents() {
         return operators.values();
     }
 

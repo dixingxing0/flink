@@ -26,19 +26,17 @@ import org.apache.flink.table.expressions.FieldReferenceExpression;
 import org.apache.flink.table.expressions.ResolvedExpression;
 import org.apache.flink.table.expressions.utils.ResolvedExpressionDefaultVisitor;
 import org.apache.flink.table.functions.BuiltInFunctionDefinitions;
-import org.apache.flink.table.operations.CalculatedQueryOperation;
+import org.apache.flink.table.operations.CorrelatedFunctionQueryOperation;
 import org.apache.flink.table.operations.JoinQueryOperation;
 import org.apache.flink.table.operations.JoinQueryOperation.JoinType;
 import org.apache.flink.table.operations.QueryOperation;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.LogicalType;
-import org.apache.flink.table.types.logical.LogicalTypeRoot;
-import org.apache.flink.table.types.logical.utils.LogicalTypeChecks;
 
 import java.util.HashSet;
 import java.util.Set;
 
-import static java.util.Arrays.asList;
+import static org.apache.flink.table.types.logical.LogicalTypeRoot.BOOLEAN;
 
 /** Utility class for creating a valid {@link JoinQueryOperation} operation. */
 @Internal
@@ -82,14 +80,29 @@ final class JoinOperationFactory {
             JoinType joinType,
             ResolvedExpression condition,
             boolean correlated) {
-        boolean alwaysTrue = ExpressionUtils.extractValue(condition, Boolean.class).orElse(false);
+        // Unlike other lateral joins with a table function (which only allow an empty/literal-true
+        // condition), a lateral SNAPSHOT join supports an ON predicate.
+        final boolean isLateralSnapshot =
+                correlated
+                        && right instanceof CorrelatedFunctionQueryOperation
+                        && CorrelatedFunctionTableFactory.isSnapshot(
+                                ((CorrelatedFunctionQueryOperation) right)
+                                        .getResolvedFunction()
+                                        .getDefinition());
+        if (isLateralSnapshot) {
+            return;
+        }
 
+        final boolean alwaysTrue =
+                ExpressionUtils.extractValue(condition, Boolean.class).orElse(false);
         if (alwaysTrue) {
             return;
         }
 
         Boolean equiJoinExists = condition.accept(equiJoinExistsChecker);
-        if (correlated && right instanceof CalculatedQueryOperation && joinType != JoinType.INNER) {
+        if (correlated
+                && right instanceof CorrelatedFunctionQueryOperation
+                && joinType != JoinType.INNER) {
             throw new ValidationException(
                     "Predicate for lateral left outer join with table function can only be empty or literal true.");
         } else if (!equiJoinExists) {
@@ -103,7 +116,7 @@ final class JoinOperationFactory {
     private void verifyConditionType(ResolvedExpression condition) {
         DataType conditionType = condition.getOutputDataType();
         LogicalType logicalType = conditionType.getLogicalType();
-        if (!LogicalTypeChecks.hasRoot(logicalType, LogicalTypeRoot.BOOLEAN)) {
+        if (!logicalType.is(BOOLEAN)) {
             throw new ValidationException(
                     String.format(
                             "Filter operator requires a boolean expression as input, "
@@ -113,8 +126,8 @@ final class JoinOperationFactory {
     }
 
     private void validateNamesAmbiguity(QueryOperation left, QueryOperation right) {
-        Set<String> leftNames = new HashSet<>(asList(left.getTableSchema().getFieldNames()));
-        Set<String> rightNames = new HashSet<>(asList(right.getTableSchema().getFieldNames()));
+        Set<String> leftNames = new HashSet<>(left.getResolvedSchema().getColumnNames());
+        Set<String> rightNames = new HashSet<>(right.getResolvedSchema().getColumnNames());
         leftNames.retainAll(rightNames);
         if (!leftNames.isEmpty()) {
             throw new ValidationException(

@@ -18,12 +18,9 @@
 
 package org.apache.flink.runtime.jobmaster.slotpool;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
-import org.apache.flink.runtime.jobmanager.slots.TaskManagerGateway;
-import org.apache.flink.runtime.jobmaster.JobMasterId;
-import org.apache.flink.runtime.jobmaster.RpcTaskManagerGateway;
+import org.apache.flink.runtime.jobmaster.SlotInfo;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.slots.ResourceRequirement;
 import org.apache.flink.runtime.taskexecutor.TaskExecutorGateway;
@@ -31,21 +28,26 @@ import org.apache.flink.runtime.taskexecutor.TestingTaskExecutorGateway;
 import org.apache.flink.runtime.taskexecutor.TestingTaskExecutorGatewayBuilder;
 import org.apache.flink.runtime.taskexecutor.slot.SlotOffer;
 import org.apache.flink.runtime.taskmanager.LocalTaskManagerLocation;
+import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
+import org.apache.flink.runtime.util.ResourceCounter;
+import org.apache.flink.testutils.junit.extensions.parameterized.ParameterizedTestExtension;
 import org.apache.flink.util.FlinkException;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.util.function.QuadConsumer;
 
-import org.apache.flink.shaded.guava18.com.google.common.collect.Iterables;
+import org.apache.flink.shaded.guava33.com.google.common.collect.Iterables;
 
-import org.hamcrest.Description;
-import org.hamcrest.TypeSafeMatcher;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -55,57 +57,69 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
-import static org.hamcrest.CoreMatchers.hasItems;
-import static org.hamcrest.CoreMatchers.is;
-import static org.hamcrest.CoreMatchers.not;
-import static org.hamcrest.CoreMatchers.sameInstance;
-import static org.hamcrest.Matchers.containsInAnyOrder;
-import static org.hamcrest.Matchers.empty;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertThat;
-import static org.junit.Assert.assertTrue;
+import static org.apache.flink.runtime.jobmaster.slotpool.SlotPoolTestUtils.createSlotOffersForResourceRequirements;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for the {@link DefaultDeclarativeSlotPool}. */
-public class DefaultDeclarativeSlotPoolTest extends TestLogger {
+@ExtendWith(ParameterizedTestExtension.class)
+class DefaultDeclarativeSlotPoolTest extends DefaultDeclarativeSlotPoolTestBase {
 
     private static final ResourceProfile RESOURCE_PROFILE_1 =
             ResourceProfile.newBuilder().setCpuCores(1.7).build();
     private static final ResourceProfile RESOURCE_PROFILE_2 =
             ResourceProfile.newBuilder().setManagedMemoryMB(100).build();
 
-    @Test
-    public void testIncreasingResourceRequirementsWillSendResourceRequirementNotification()
+    @TestTemplate
+    void testIncreasingResourceRequirementsWillSendResourceRequirementNotification()
             throws InterruptedException {
         final NewResourceRequirementsService requirementsListener =
                 new NewResourceRequirementsService();
-        final DeclarativeSlotPool slotPool = createDefaultDeclarativeSlotPool(requirementsListener);
+        final DefaultDeclarativeSlotPool slotPool =
+                createDefaultDeclarativeSlotPool(requirementsListener, slotRequestMaxInterval);
 
         final ResourceCounter increment1 = ResourceCounter.withResource(RESOURCE_PROFILE_1, 1);
         final ResourceCounter increment2 = createResourceRequirements();
         slotPool.increaseResourceRequirementsBy(increment1);
         slotPool.increaseResourceRequirementsBy(increment2);
 
-        assertThat(
-                requirementsListener.takeResourceRequirements(),
-                is(toResourceRequirements(increment1)));
+        slotPool.tryWaitSlotRequestIsDone();
 
-        final ResourceCounter totalResources = increment1.add(increment2);
-        assertThat(
-                requirementsListener.takeResourceRequirements(),
-                is(toResourceRequirements(totalResources)));
-        assertThat(requirementsListener.hasNextResourceRequirements(), is(false));
+        assertThat(requirementsListener.takeResourceRequirements())
+                .isEqualTo(
+                        toResourceRequirements(getExpectedResourceCounter(increment1, increment2)));
+
+        if (slotRequestMaxInterval.toMillis() <= 0L) {
+            final ResourceCounter totalResources = increment1.add(increment2);
+            assertThat(requirementsListener.takeResourceRequirements())
+                    .isEqualTo(toResourceRequirements(totalResources));
+            assertThat(requirementsListener.hasNextResourceRequirements()).isFalse();
+        }
     }
 
-    @Test
-    public void testDecreasingResourceRequirementsWillSendResourceRequirementNotification()
+    private ResourceCounter getExpectedResourceCounter(ResourceCounter... resourceCounters) {
+        ResourceCounter result = ResourceCounter.empty();
+        if (slotRequestMaxInterval.toMillis() > 0L) {
+            for (ResourceCounter resourceCounter : resourceCounters) {
+                result = result.add(resourceCounter);
+            }
+            return result;
+        } else {
+            return resourceCounters[0];
+        }
+    }
+
+    @TestTemplate
+    void testDecreasingResourceRequirementsWillSendResourceRequirementNotification()
             throws InterruptedException {
         final NewResourceRequirementsService requirementsListener =
                 new NewResourceRequirementsService();
         final DefaultDeclarativeSlotPool slotPool =
-                createDefaultDeclarativeSlotPool(requirementsListener);
+                createDefaultDeclarativeSlotPool(requirementsListener, slotRequestMaxInterval);
 
         final ResourceCounter increment = ResourceCounter.withResource(RESOURCE_PROFILE_1, 3);
         slotPool.increaseResourceRequirementsBy(increment);
+
+        slotPool.tryWaitSlotRequestIsDone();
 
         requirementsListener.takeResourceRequirements();
 
@@ -113,32 +127,29 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
         slotPool.decreaseResourceRequirementsBy(decrement);
 
         final ResourceCounter totalResources = increment.subtract(decrement);
-        assertThat(
-                requirementsListener.takeResourceRequirements(),
-                is(toResourceRequirements(totalResources)));
-        assertThat(requirementsListener.hasNextResourceRequirements(), is(false));
+        assertThat(requirementsListener.takeResourceRequirements())
+                .isEqualTo(toResourceRequirements(totalResources));
+        assertThat(requirementsListener.hasNextResourceRequirements()).isFalse();
     }
 
-    @Test
-    public void testGetResourceRequirements() {
-        final DefaultDeclarativeSlotPool slotPool =
-                DefaultDeclarativeSlotPoolBuilder.builder().build();
+    @TestTemplate
+    void testGetResourceRequirements() {
+        final DefaultDeclarativeSlotPool slotPool = createDefaultDeclarativeSlotPool();
 
-        assertThat(
-                slotPool.getResourceRequirements(),
-                is(toResourceRequirements(ResourceCounter.empty())));
+        assertThat(slotPool.getResourceRequirements()).isEmpty();
 
         final ResourceCounter resourceRequirements = createResourceRequirements();
 
         slotPool.increaseResourceRequirementsBy(resourceRequirements);
 
-        assertThat(
-                slotPool.getResourceRequirements(),
-                is(toResourceRequirements(resourceRequirements)));
+        slotPool.tryWaitSlotRequestIsDone();
+
+        assertThat(slotPool.getResourceRequirements())
+                .isEqualTo(toResourceRequirements(resourceRequirements));
     }
 
-    @Test
-    public void testOfferSlots() throws InterruptedException {
+    @TestTemplate
+    void testOfferSlots() throws InterruptedException {
         final NewSlotsService notifyNewSlots = new NewSlotsService();
         final DefaultDeclarativeSlotPool slotPool =
                 createDefaultDeclarativeSlotPoolWithNewSlotsListener(notifyNewSlots);
@@ -146,32 +157,55 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
         final ResourceCounter resourceRequirements = createResourceRequirements();
 
         slotPool.increaseResourceRequirementsBy(resourceRequirements);
+
+        slotPool.tryWaitSlotRequestIsDone();
 
         Collection<SlotOffer> slotOffers =
                 createSlotOffersForResourceRequirements(resourceRequirements);
 
-        final Collection<SlotOffer> acceptedSlots = offerSlots(slotPool, slotOffers);
+        final Collection<SlotOffer> acceptedSlots =
+                SlotPoolTestUtils.offerSlots(slotPool, slotOffers);
 
-        assertThat(acceptedSlots, containsInAnyOrder(slotOffers.toArray()));
+        assertThat(acceptedSlots).containsExactlyInAnyOrderElementsOf(slotOffers);
 
-        final Collection<PhysicalSlot> newSlots = drainNewSlotService(notifyNewSlots);
+        final Map<AllocationID, PhysicalSlot> newSlotsById =
+                drainNewSlotService(notifyNewSlots).stream()
+                        .collect(
+                                Collectors.toMap(
+                                        PhysicalSlot::getAllocationId, Function.identity()));
 
-        assertThat(
-                newSlots,
-                containsInAnyOrder(
-                        slotOffers.stream()
-                                .map(DefaultDeclarativeSlotPoolTest::matchesSlotOffer)
-                                .collect(Collectors.toList())));
-        assertThat(
-                slotPool.getAllSlotsInformation(),
-                containsInAnyOrder(
-                        newSlots.stream()
-                                .map(DefaultAllocatedSlotPoolTest::matchesPhysicalSlot)
-                                .collect(Collectors.toList())));
+        assertThat(slotOffers)
+                .hasSize(newSlotsById.size())
+                .allSatisfy(
+                        slotOffer -> {
+                            PhysicalSlot slot = newSlotsById.get(slotOffer.getAllocationId());
+                            assertThat(slot).isNotNull();
+                            assertThat(slotOffer.getAllocationId())
+                                    .isEqualTo(slot.getAllocationId());
+                            assertThat(slotOffer.getSlotIndex())
+                                    .isEqualTo(slot.getPhysicalSlotNumber());
+                            assertThat(slotOffer.getResourceProfile())
+                                    .isEqualTo(slot.getResourceProfile());
+                        });
+        assertThat(slotPool.getAllSlotsInformation())
+                .hasSize(newSlotsById.size())
+                .allSatisfy(
+                        slotInfo -> {
+                            PhysicalSlot slot = newSlotsById.get(slotInfo.getAllocationId());
+                            assertThat(slot).isNotNull();
+                            assertThat(slotInfo.getAllocationId())
+                                    .isEqualTo(slot.getAllocationId());
+                            assertThat(slotInfo.getPhysicalSlotNumber())
+                                    .isEqualTo(slot.getPhysicalSlotNumber());
+                            assertThat(slotInfo.getResourceProfile())
+                                    .isEqualTo(slot.getResourceProfile());
+                            assertThat(slotInfo.getTaskManagerLocation())
+                                    .isEqualTo(slot.getTaskManagerLocation());
+                        });
     }
 
-    @Test
-    public void testDuplicateSlotOfferings() throws InterruptedException {
+    @TestTemplate
+    void testDuplicateSlotOfferings() throws InterruptedException {
         final NewSlotsService notifyNewSlots = new NewSlotsService();
         final DefaultDeclarativeSlotPool slotPool =
                 createDefaultDeclarativeSlotPoolWithNewSlotsListener(notifyNewSlots);
@@ -179,23 +213,26 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
         final ResourceCounter resourceRequirements = createResourceRequirements();
 
         slotPool.increaseResourceRequirementsBy(resourceRequirements);
+
+        slotPool.tryWaitSlotRequestIsDone();
 
         final Collection<SlotOffer> slotOffers =
                 createSlotOffersForResourceRequirements(resourceRequirements);
 
-        offerSlots(slotPool, slotOffers);
+        SlotPoolTestUtils.offerSlots(slotPool, slotOffers);
 
         drainNewSlotService(notifyNewSlots);
 
-        final Collection<SlotOffer> acceptedSlots = offerSlots(slotPool, slotOffers);
+        final Collection<SlotOffer> acceptedSlots =
+                SlotPoolTestUtils.offerSlots(slotPool, slotOffers);
 
-        assertThat(acceptedSlots, containsInAnyOrder(slotOffers.toArray()));
+        assertThat(acceptedSlots).containsExactlyInAnyOrderElementsOf(slotOffers);
         // duplicate slots should not trigger notify new slots
-        assertFalse(notifyNewSlots.hasNextNewSlots());
+        assertThat(notifyNewSlots.hasNextNewSlots()).isFalse();
     }
 
-    @Test
-    public void testOfferingTooManySlots() {
+    @TestTemplate
+    void testOfferingTooManySlotsWillRejectSuperfluousSlots() {
         final NewSlotsService notifyNewSlots = new NewSlotsService();
         final DefaultDeclarativeSlotPool slotPool =
                 createDefaultDeclarativeSlotPoolWithNewSlotsListener(notifyNewSlots);
@@ -203,6 +240,8 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
         final ResourceCounter resourceRequirements = createResourceRequirements();
 
         slotPool.increaseResourceRequirementsBy(resourceRequirements);
+
+        slotPool.tryWaitSlotRequestIsDone();
 
         final ResourceCounter increasedRequirements =
                 resourceRequirements.add(RESOURCE_PROFILE_1, 2);
@@ -210,28 +249,30 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
         final Collection<SlotOffer> slotOffers =
                 createSlotOffersForResourceRequirements(increasedRequirements);
 
-        final Collection<SlotOffer> acceptedSlots = offerSlots(slotPool, slotOffers);
+        final Collection<SlotOffer> acceptedSlots =
+                SlotPoolTestUtils.offerSlots(slotPool, slotOffers);
 
         final Map<ResourceProfile, Long> resourceProfileCount =
                 acceptedSlots.stream()
                         .map(SlotOffer::getResourceProfile)
                         .collect(Collectors.groupingBy(Function.identity(), Collectors.counting()));
 
-        for (Map.Entry<ResourceProfile, Integer> resourceCount :
-                resourceRequirements.getResourcesWithCount()) {
-            assertThat(
-                    resourceProfileCount.getOrDefault(resourceCount.getKey(), 0L),
-                    is((long) resourceCount.getValue()));
-        }
+        assertThat(resourceRequirements.getResourcesWithCount())
+                .allSatisfy(
+                        resourceCount ->
+                                assertThat(
+                                                resourceProfileCount.getOrDefault(
+                                                        resourceCount.getKey(), 0L))
+                                        .isEqualTo((long) resourceCount.getValue()));
     }
 
-    @Test
-    public void testReleaseSlotsRemovesSlots() throws InterruptedException {
+    @TestTemplate
+    void testReleaseSlotsRemovesSlots() throws InterruptedException {
         final NewResourceRequirementsService notifyNewResourceRequirements =
                 new NewResourceRequirementsService();
         final DefaultDeclarativeSlotPool slotPool =
-                createDefaultDeclarativeSlotPool(notifyNewResourceRequirements);
-
+                createDefaultDeclarativeSlotPool(
+                        notifyNewResourceRequirements, slotRequestMaxInterval);
         final LocalTaskManagerLocation taskManagerLocation = new LocalTaskManagerLocation();
         increaseRequirementsAndOfferSlotsToSlotPool(
                 slotPool, createResourceRequirements(), taskManagerLocation);
@@ -240,14 +281,12 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
 
         slotPool.releaseSlots(
                 taskManagerLocation.getResourceID(), new FlinkException("Test failure"));
-        assertThat(slotPool.getAllSlotsInformation(), is(empty()));
+        assertThat(slotPool.getAllSlotsInformation()).isEmpty();
     }
 
-    @Test
-    public void testReleaseSlotsReturnsSlot() {
-        final DefaultDeclarativeSlotPool slotPool =
-                DefaultDeclarativeSlotPoolBuilder.builder().build();
-
+    @TestTemplate
+    void testReleaseSlotsReturnsSlot() {
+        final DefaultDeclarativeSlotPool slotPool = createDefaultDeclarativeSlotPool();
         final ResourceCounter resourceRequirements = createResourceRequirements();
 
         final LocalTaskManagerLocation taskManagerLocation = new LocalTaskManagerLocation();
@@ -269,14 +308,94 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
 
         final Collection<AllocationID> freedSlots = freeSlotConsumer.drainFreedSlots();
 
-        assertThat(
-                freedSlots,
-                containsInAnyOrder(slotOffers.stream().map(SlotOffer::getAllocationId).toArray()));
+        assertThat(freedSlots)
+                .containsExactlyInAnyOrderElementsOf(
+                        slotOffers.stream()
+                                .map(SlotOffer::getAllocationId)
+                                .collect(Collectors.toList()));
     }
 
-    @Test
-    public void testReleaseSlotDecreasesFulfilledResourceRequirements()
-            throws InterruptedException {
+    @TestTemplate
+    void testReleaseSlotsOnlyReturnsFulfilledRequirementsOfReservedSlots() {
+        withSlotPoolContainingOneTaskManagerWithTwoSlotsWithUniqueResourceProfiles(
+                (slotPool, freeSlot, slotToReserve, taskManagerLocation) -> {
+                    slotPool.reserveFreeSlot(
+                                    slotToReserve.getAllocationId(),
+                                    slotToReserve.getResourceProfile())
+                            .tryAssignPayload(new TestingPhysicalSlotPayload());
+
+                    final ResourceCounter fulfilledRequirements =
+                            slotPool.releaseSlots(
+                                    taskManagerLocation.getResourceID(),
+                                    new FlinkException("Test failure"));
+
+                    assertThat(
+                                    fulfilledRequirements.getResourceCount(
+                                            freeSlot.getResourceProfile()))
+                            .isEqualTo(0);
+                    assertThat(
+                                    fulfilledRequirements.getResourceCount(
+                                            slotToReserve.getResourceProfile()))
+                            .isEqualTo(1);
+                });
+    }
+
+    @TestTemplate
+    void testReleaseSlotOnlyReturnsFulfilledRequirementsOfReservedSlots() {
+        withSlotPoolContainingOneTaskManagerWithTwoSlotsWithUniqueResourceProfiles(
+                (slotPool, freeSlot, slotToReserve, ignored) -> {
+                    slotPool.reserveFreeSlot(
+                                    slotToReserve.getAllocationId(),
+                                    slotToReserve.getResourceProfile())
+                            .tryAssignPayload(new TestingPhysicalSlotPayload());
+
+                    final ResourceCounter fulfilledRequirementsOfFreeSlot =
+                            slotPool.releaseSlot(
+                                    freeSlot.getAllocationId(), new FlinkException("Test failure"));
+                    final ResourceCounter fulfilledRequirementsOfReservedSlot =
+                            slotPool.releaseSlot(
+                                    slotToReserve.getAllocationId(),
+                                    new FlinkException("Test failure"));
+
+                    assertThat(fulfilledRequirementsOfFreeSlot.getResources()).isEmpty();
+                    assertThat(
+                                    fulfilledRequirementsOfReservedSlot.getResourceCount(
+                                            slotToReserve.getResourceProfile()))
+                            .isEqualTo(1);
+                });
+    }
+
+    private void withSlotPoolContainingOneTaskManagerWithTwoSlotsWithUniqueResourceProfiles(
+            QuadConsumer<DefaultDeclarativeSlotPool, SlotOffer, SlotOffer, TaskManagerLocation>
+                    test) {
+        final DefaultDeclarativeSlotPool slotPool = createDefaultDeclarativeSlotPool();
+
+        final ResourceCounter resourceRequirements =
+                ResourceCounter.withResource(RESOURCE_PROFILE_1, 1).add(RESOURCE_PROFILE_2, 1);
+
+        final LocalTaskManagerLocation taskManagerLocation = new LocalTaskManagerLocation();
+        final FreeSlotConsumer freeSlotConsumer = new FreeSlotConsumer();
+        final TestingTaskExecutorGateway testingTaskExecutorGateway =
+                new TestingTaskExecutorGatewayBuilder()
+                        .setFreeSlotFunction(freeSlotConsumer)
+                        .createTestingTaskExecutorGateway();
+
+        final Iterator<SlotOffer> slotOffers =
+                increaseRequirementsAndOfferSlotsToSlotPool(
+                                slotPool,
+                                resourceRequirements,
+                                taskManagerLocation,
+                                testingTaskExecutorGateway)
+                        .iterator();
+
+        final SlotOffer slot1 = slotOffers.next();
+        final SlotOffer slot2 = slotOffers.next();
+
+        test.accept(slotPool, slot1, slot2, taskManagerLocation);
+    }
+
+    @TestTemplate
+    void testReleaseSlotDecreasesFulfilledResourceRequirements() throws InterruptedException {
         final NewSlotsService notifyNewSlots = new NewSlotsService();
         final DefaultDeclarativeSlotPool slotPool =
                 createDefaultDeclarativeSlotPoolWithNewSlotsListener(notifyNewSlots);
@@ -292,11 +411,12 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
 
         final ResourceCounter finalResourceRequirements =
                 resourceRequirements.subtract(physicalSlot.getResourceProfile(), 1);
-        assertThat(slotPool.getFulfilledResourceRequirements(), is(finalResourceRequirements));
+        assertThat(slotPool.getFulfilledResourceRequirements())
+                .isEqualTo(finalResourceRequirements);
     }
 
-    @Test
-    public void testReleaseSlotReturnsSlot() throws InterruptedException {
+    @TestTemplate
+    void testReleaseSlotReturnsSlot() throws InterruptedException {
         final NewSlotsService notifyNewSlots = new NewSlotsService();
         final DefaultDeclarativeSlotPool slotPool =
                 createDefaultDeclarativeSlotPoolWithNewSlotsListener(notifyNewSlots);
@@ -322,16 +442,17 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
 
         final AllocationID freedSlot = Iterables.getOnlyElement(freeSlotConsumer.drainFreedSlots());
 
-        assertThat(freedSlot, is(physicalSlot.getAllocationId()));
+        assertThat(freedSlot).isEqualTo(physicalSlot.getAllocationId());
     }
 
-    @Test
-    public void testReturnIdleSlotsAfterTimeout() {
-        final Time idleSlotTimeout = Time.seconds(10);
+    @TestTemplate
+    void testReturnIdleSlotsAfterTimeout() {
+        final Duration idleSlotTimeout = Duration.ofSeconds(10);
         final long offerTime = 0;
         final DefaultDeclarativeSlotPool slotPool =
                 DefaultDeclarativeSlotPoolBuilder.builder()
                         .setIdleSlotTimeout(idleSlotTimeout)
+                        .setComponentMainThreadExecutor(componentMainThreadExecutor)
                         .build();
 
         final ResourceCounter resourceRequirements = createResourceRequirements();
@@ -351,31 +472,32 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
         // decrease the resource requirements so that slots are no longer needed
         slotPool.decreaseResourceRequirementsBy(resourceRequirements);
 
-        slotPool.releaseIdleSlots(offerTime + idleSlotTimeout.toMilliseconds());
+        slotPool.releaseIdleSlots(offerTime + idleSlotTimeout.toMillis());
 
         final Collection<AllocationID> freedSlots = freeSlotConsumer.drainFreedSlots();
 
-        assertThat(acceptedSlots, is(not(empty())));
-        assertThat(
-                freedSlots,
-                containsInAnyOrder(
-                        acceptedSlots.stream().map(SlotOffer::getAllocationId).toArray()));
+        assertThat(freedSlots)
+                .containsExactlyInAnyOrderElementsOf(
+                        acceptedSlots.stream()
+                                .map(SlotOffer::getAllocationId)
+                                .collect(Collectors.toList()));
         assertNoAvailableAndRequiredResources(slotPool);
     }
 
     private void assertNoAvailableAndRequiredResources(DefaultDeclarativeSlotPool slotPool) {
-        assertTrue(slotPool.getFulfilledResourceRequirements().isEmpty());
-        assertTrue(slotPool.getResourceRequirements().isEmpty());
-        assertThat(slotPool.getAllSlotsInformation(), is(empty()));
+        assertThat(slotPool.getFulfilledResourceRequirements().isEmpty()).isTrue();
+        assertThat(slotPool.getResourceRequirements()).isEmpty();
+        assertThat(slotPool.getAllSlotsInformation()).isEmpty();
     }
 
-    @Test
-    public void testOnlyReturnExcessIdleSlots() {
-        final Time idleSlotTimeout = Time.seconds(10);
+    @TestTemplate
+    void testOnlyReturnExcessIdleSlots() {
+        final Duration idleSlotTimeout = Duration.ofSeconds(10);
         final long offerTime = 0;
         final DefaultDeclarativeSlotPool slotPool =
                 DefaultDeclarativeSlotPoolBuilder.builder()
                         .setIdleSlotTimeout(idleSlotTimeout)
+                        .setComponentMainThreadExecutor(componentMainThreadExecutor)
                         .build();
 
         final ResourceCounter resourceRequirements = createResourceRequirements();
@@ -383,21 +505,25 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
                 createSlotOffersForResourceRequirements(resourceRequirements);
 
         slotPool.increaseResourceRequirementsBy(resourceRequirements);
-        final Collection<SlotOffer> acceptedSlots = offerSlots(slotPool, slotOffers);
+
+        slotPool.tryWaitSlotRequestIsDone();
+
+        final Collection<SlotOffer> acceptedSlots =
+                SlotPoolTestUtils.offerSlots(slotPool, slotOffers);
 
         final ResourceCounter requiredResources =
                 ResourceCounter.withResource(RESOURCE_PROFILE_1, 1);
         final ResourceCounter excessRequirements = resourceRequirements.subtract(requiredResources);
         slotPool.decreaseResourceRequirementsBy(excessRequirements);
 
-        slotPool.releaseIdleSlots(offerTime + idleSlotTimeout.toMilliseconds());
+        slotPool.releaseIdleSlots(offerTime + idleSlotTimeout.toMillis());
 
-        assertThat(acceptedSlots, is(not(empty())));
-        assertThat(slotPool.getFulfilledResourceRequirements(), is(requiredResources));
+        assertThat(acceptedSlots).isNotEmpty();
+        assertThat(slotPool.getFulfilledResourceRequirements()).isEqualTo(requiredResources);
     }
 
-    @Test
-    public void testFreedSlotWillBeUsedToFulfillOutstandingResourceRequirementsOfSameProfile()
+    @TestTemplate
+    void testFreedSlotWillBeUsedToFulfillOutstandingResourceRequirementsOfSameProfile()
             throws InterruptedException {
         final NewSlotsService notifyNewSlots = new NewSlotsService();
         final DefaultDeclarativeSlotPool slotPool =
@@ -416,7 +542,7 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
 
         final Collection<PhysicalSlot> recycledSlots = drainNewSlotService(notifyNewSlots);
 
-        assertThat(Iterables.getOnlyElement(recycledSlots), sameInstance(newSlot));
+        assertThat(Iterables.getOnlyElement(recycledSlots)).isEqualTo(newSlot);
 
         final Collection<SlotOffer> newSlotOffers =
                 createSlotOffersForResourceRequirements(initialRequirements);
@@ -427,16 +553,42 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
                 slotPool.offerSlots(
                         newSlotOffers,
                         new LocalTaskManagerLocation(),
-                        createTaskManagerGateway(null),
+                        SlotPoolTestUtils.createTaskManagerGateway(null),
                         0);
 
-        assertThat(acceptedSlots, is(empty()));
-        assertTrue(slotPool.calculateUnfulfilledResources().isEmpty());
+        assertThat(acceptedSlots).isEmpty();
+        assertThat(slotPool.calculateUnfulfilledResources().isEmpty()).isTrue();
     }
 
     @Test
-    public void testFreedSlotWillRemainAssignedToMatchedResourceProfile() {
-        final DefaultDeclarativeSlotPool slotPool = new DefaultDeclarativeSlotPoolBuilder().build();
+    void testRegisterSlotsAcceptsAllSlots() {
+        final DefaultDeclarativeSlotPool declarativeSlotPool = createDefaultDeclarativeSlotPool();
+        final int numberSlots = 10;
+        final Collection<SlotOffer> slots =
+                createSlotOffersForResourceRequirements(
+                        ResourceCounter.withResource(RESOURCE_PROFILE_1, numberSlots));
+
+        declarativeSlotPool.registerSlots(
+                slots,
+                new LocalTaskManagerLocation(),
+                SlotPoolTestUtils.createTaskManagerGateway(null),
+                0);
+
+        final Collection<? extends SlotInfo> allSlotsInformation =
+                declarativeSlotPool.getAllSlotsInformation();
+
+        assertThat(allSlotsInformation).hasSize(numberSlots);
+
+        assertThat(allSlotsInformation)
+                .allSatisfy(
+                        slotInfo ->
+                                assertThat(slotInfo.getResourceProfile())
+                                        .isEqualTo(RESOURCE_PROFILE_1));
+    }
+
+    @TestTemplate
+    void testFreedSlotWillRemainAssignedToMatchedResourceProfile() {
+        final DefaultDeclarativeSlotPool slotPool = createDefaultDeclarativeSlotPool();
 
         final ResourceProfile largeResourceProfile =
                 ResourceProfile.newBuilder().setManagedMemoryMB(1024).build();
@@ -445,20 +597,28 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
 
         slotPool.increaseResourceRequirementsBy(
                 ResourceCounter.withResource(largeResourceProfile, 1));
-        offerSlots(
+
+        slotPool.tryWaitSlotRequestIsDone();
+
+        SlotPoolTestUtils.offerSlots(
                 slotPool,
                 createSlotOffersForResourceRequirements(
                         ResourceCounter.withResource(ResourceProfile.ANY, 1)));
 
-        final SlotInfoWithUtilization slot = slotPool.getFreeSlotsInformation().iterator().next();
+        final PhysicalSlot slot =
+                slotPool.getFreeSlotTracker().getFreeSlotsInformation().iterator().next();
 
         slotPool.reserveFreeSlot(slot.getAllocationId(), largeResourceProfile);
         assertThat(
-                slotPool.getFulfilledResourceRequirements().getResourceCount(largeResourceProfile),
-                is(1));
+                        slotPool.getFulfilledResourceRequirements()
+                                .getResourceCount(largeResourceProfile))
+                .isEqualTo(1);
 
         slotPool.increaseResourceRequirementsBy(
                 ResourceCounter.withResource(smallResourceProfile, 1));
+
+        slotPool.tryWaitSlotRequestIsDone();
+
         slotPool.decreaseResourceRequirementsBy(
                 ResourceCounter.withResource(largeResourceProfile, 1));
 
@@ -468,33 +628,39 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
         // profile
         slotPool.freeReservedSlot(slot.getAllocationId(), null, 1);
         assertThat(
-                slotPool.getFulfilledResourceRequirements().getResourceCount(largeResourceProfile),
-                is(1));
+                        slotPool.getFulfilledResourceRequirements()
+                                .getResourceCount(largeResourceProfile))
+                .isEqualTo(1);
         assertThat(
-                slotPool.getFulfilledResourceRequirements().getResourceCount(smallResourceProfile),
-                is(0));
+                        slotPool.getFulfilledResourceRequirements()
+                                .getResourceCount(smallResourceProfile))
+                .isEqualTo(0);
     }
 
-    @Test
-    public void testReserveFreeSlotForResourceUpdatesAvailableResourcesAndRequirements() {
-        final DefaultDeclarativeSlotPool slotPool = new DefaultDeclarativeSlotPoolBuilder().build();
+    @TestTemplate
+    void testReserveFreeSlotForResourceUpdatesAvailableResourcesAndRequirements() {
+        final DefaultDeclarativeSlotPool slotPool = createDefaultDeclarativeSlotPool();
 
         final ResourceProfile largeResourceProfile =
                 ResourceProfile.newBuilder().setManagedMemoryMB(1024).build();
-        final ResourceProfile smallResourceProfile =
-                ResourceProfile.newBuilder().setManagedMemoryMB(512).build();
+        final ResourceProfile smallResourceProfile = ResourceProfile.UNKNOWN;
 
         slotPool.increaseResourceRequirementsBy(
                 ResourceCounter.withResource(largeResourceProfile, 1));
-        offerSlots(
+
+        slotPool.tryWaitSlotRequestIsDone();
+
+        SlotPoolTestUtils.offerSlots(
                 slotPool,
                 createSlotOffersForResourceRequirements(
                         ResourceCounter.withResource(largeResourceProfile, 1)));
         slotPool.increaseResourceRequirementsBy(
                 ResourceCounter.withResource(smallResourceProfile, 1));
 
-        final SlotInfoWithUtilization largeSlot =
-                slotPool.getFreeSlotsInformation().stream()
+        slotPool.tryWaitSlotRequestIsDone();
+
+        final PhysicalSlot largeSlot =
+                slotPool.getFreeSlotTracker().getFreeSlotsInformation().stream()
                         .filter(slot -> slot.getResourceProfile().equals(largeResourceProfile))
                         .findFirst()
                         .get();
@@ -502,48 +668,82 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
         slotPool.reserveFreeSlot(largeSlot.getAllocationId(), smallResourceProfile);
 
         ResourceCounter availableResources = slotPool.getFulfilledResourceRequirements();
-        assertThat(availableResources.getResourceCount(smallResourceProfile), is(1));
-        assertThat(availableResources.getResourceCount(largeResourceProfile), is(0));
+        assertThat(availableResources.getResourceCount(smallResourceProfile)).isEqualTo(1);
+        assertThat(availableResources.getResourceCount(largeResourceProfile)).isEqualTo(0);
 
         Collection<ResourceRequirement> currentResourceRequirements =
                 slotPool.getResourceRequirements();
         // since we used one of the large slots for fulfilling another profile, we now need another
         // large slot for fulfill the original requirement
         // conversely we no longer need the small slot, because we are now using another slot for it
-        assertThat(
-                currentResourceRequirements,
-                hasItems(ResourceRequirement.create(largeResourceProfile, 2)));
+        assertThat(currentResourceRequirements)
+                .containsExactly(ResourceRequirement.create(largeResourceProfile, 2));
+    }
+
+    @Test
+    void testSetResourceRequirementsForInitialResourceRequirements() {
+        final DefaultDeclarativeSlotPool slotPool = createDefaultDeclarativeSlotPool();
+
+        final ResourceCounter resourceRequirements =
+                ResourceCounter.withResource(RESOURCE_PROFILE_1, 2);
+
+        slotPool.setResourceRequirements(resourceRequirements);
+
+        assertThat(slotPool.getResourceRequirements())
+                .isEqualTo(toResourceRequirements(resourceRequirements));
+    }
+
+    @Test
+    void testSetResourceRequirementsOverwritesPreviousValue() {
+        final DefaultDeclarativeSlotPool slotPool = createDefaultDeclarativeSlotPool();
+
+        slotPool.setResourceRequirements(ResourceCounter.withResource(RESOURCE_PROFILE_1, 1));
+
+        final ResourceCounter resourceRequirements =
+                ResourceCounter.withResource(RESOURCE_PROFILE_2, 1);
+        slotPool.setResourceRequirements(resourceRequirements);
+
+        assertThat(slotPool.getResourceRequirements())
+                .isEqualTo(toResourceRequirements(resourceRequirements));
+    }
+
+    @TestTemplate
+    void testRegisterSlotsDoesNotAffectRequirements() {
+        final DefaultDeclarativeSlotPool slotPool = createDefaultDeclarativeSlotPool();
+
+        final ResourceProfile slotProfile = RESOURCE_PROFILE_1;
+        final ResourceProfile requestedProfile = ResourceProfile.UNKNOWN;
+
+        slotPool.registerSlots(
+                createSlotOffersForResourceRequirements(
+                        ResourceCounter.withResource(slotProfile, 1)),
+                new LocalTaskManagerLocation(),
+                SlotPoolTestUtils.createTaskManagerGateway(null),
+                0L);
+
+        final AllocationID allocationId =
+                slotPool.getFreeSlotTracker().getAvailableSlots().iterator().next();
+
+        assertThat(slotPool.getResourceRequirements()).isEmpty();
+
+        slotPool.increaseResourceRequirementsBy(ResourceCounter.withResource(requestedProfile, 1));
+
+        slotPool.tryWaitSlotRequestIsDone();
+
+        slotPool.reserveFreeSlot(allocationId, requestedProfile);
+        slotPool.freeReservedSlot(allocationId, null, 1L);
+        slotPool.decreaseResourceRequirementsBy(ResourceCounter.withResource(requestedProfile, 1));
+
+        assertThat(slotPool.getResourceRequirements()).isEmpty();
     }
 
     @Nonnull
-    private static ResourceCounter createResourceRequirements() {
+    static ResourceCounter createResourceRequirements() {
         final Map<ResourceProfile, Integer> requirements = new HashMap<>();
         requirements.put(RESOURCE_PROFILE_1, 2);
         requirements.put(RESOURCE_PROFILE_2, 1);
 
         return ResourceCounter.withResources(requirements);
-    }
-
-    @Nonnull
-    private static Collection<SlotOffer> createSlotOffersForResourceRequirements(
-            ResourceCounter resourceRequirements) {
-        Collection<SlotOffer> slotOffers = new ArrayList<>();
-        int slotIndex = 0;
-
-        for (Map.Entry<ResourceProfile, Integer> resourceWithCount :
-                resourceRequirements.getResourcesWithCount()) {
-            for (int i = 0; i < resourceWithCount.getValue(); i++) {
-                ResourceProfile slotProfile = resourceWithCount.getKey();
-                slotOffers.add(
-                        new SlotOffer(
-                                new AllocationID(),
-                                slotIndex++,
-                                slotProfile == ResourceProfile.UNKNOWN
-                                        ? ResourceProfile.ANY
-                                        : slotProfile));
-            }
-        }
-        return slotOffers;
     }
 
     @Nonnull
@@ -558,15 +758,17 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
     }
 
     @Nonnull
-    private static DefaultDeclarativeSlotPool createDefaultDeclarativeSlotPool(
-            NewResourceRequirementsService requirementsListener) {
+    private DefaultDeclarativeSlotPool createDefaultDeclarativeSlotPool(
+            NewResourceRequirementsService requirementsListener, Duration slotRequestMaxInterval) {
         return DefaultDeclarativeSlotPoolBuilder.builder()
+                .setSlotRequestMaxInterval(slotRequestMaxInterval)
                 .setNotifyNewResourceRequirements(requirementsListener)
+                .setComponentMainThreadExecutor(componentMainThreadExecutor)
                 .build();
     }
 
     @Nonnull
-    private static DefaultDeclarativeSlotPool createDefaultDeclarativeSlotPoolWithNewSlotsListener(
+    private DefaultDeclarativeSlotPool createDefaultDeclarativeSlotPoolWithNewSlotsListener(
             DeclarativeSlotPool.NewSlotsListener newSlotsListener) {
         final DefaultDeclarativeSlotPool declarativeSlotPool = createDefaultDeclarativeSlotPool();
 
@@ -575,15 +777,10 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
     }
 
     @Nonnull
-    private static DefaultDeclarativeSlotPool createDefaultDeclarativeSlotPool() {
-        return DefaultDeclarativeSlotPoolBuilder.builder().build();
-    }
-
-    @Nonnull
-    static Collection<SlotOffer> offerSlots(
-            DeclarativeSlotPool slotPool, Collection<SlotOffer> slotOffers) {
-        return slotPool.offerSlots(
-                slotOffers, new LocalTaskManagerLocation(), createTaskManagerGateway(null), 0);
+    private DefaultDeclarativeSlotPool createDefaultDeclarativeSlotPool() {
+        return DefaultDeclarativeSlotPoolBuilder.builder()
+                .setComponentMainThreadExecutor(componentMainThreadExecutor)
+                .build();
     }
 
     @Nonnull
@@ -596,7 +793,7 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
     }
 
     @Nonnull
-    private static Collection<SlotOffer> increaseRequirementsAndOfferSlotsToSlotPool(
+    static Collection<SlotOffer> increaseRequirementsAndOfferSlotsToSlotPool(
             DefaultDeclarativeSlotPool slotPool,
             ResourceCounter resourceRequirements,
             @Nullable LocalTaskManagerLocation taskManagerLocation,
@@ -606,15 +803,17 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
 
         slotPool.increaseResourceRequirementsBy(resourceRequirements);
 
+        slotPool.tryWaitSlotRequestIsDone();
+
         return slotPool.offerSlots(
                 slotOffers,
                 taskManagerLocation == null ? new LocalTaskManagerLocation() : taskManagerLocation,
-                createTaskManagerGateway(taskExecutorGateway),
+                SlotPoolTestUtils.createTaskManagerGateway(taskExecutorGateway),
                 0);
     }
 
     @Nonnull
-    private static Collection<PhysicalSlot> drainNewSlotService(NewSlotsService notifyNewSlots)
+    static Collection<PhysicalSlot> drainNewSlotService(NewSlotsService notifyNewSlots)
             throws InterruptedException {
         final Collection<PhysicalSlot> newSlots = new ArrayList<>();
 
@@ -622,19 +821,6 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
             newSlots.addAll(notifyNewSlots.takeNewSlots());
         }
         return newSlots;
-    }
-
-    private static TypeSafeMatcher<PhysicalSlot> matchesSlotOffer(SlotOffer slotOffer) {
-        return new PhysicalSlotSlotOfferMatcher(slotOffer);
-    }
-
-    private static TaskManagerGateway createTaskManagerGateway(
-            @Nullable TaskExecutorGateway taskExecutorGateway) {
-        return new RpcTaskManagerGateway(
-                taskExecutorGateway == null
-                        ? new TestingTaskExecutorGatewayBuilder().createTestingTaskExecutorGateway()
-                        : taskExecutorGateway,
-                JobMasterId.generate());
     }
 
     private static final class NewResourceRequirementsService
@@ -658,7 +844,7 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
         }
     }
 
-    private static final class NewSlotsService implements DeclarativeSlotPool.NewSlotsListener {
+    static final class NewSlotsService implements DeclarativeSlotPool.NewSlotsListener {
 
         private final BlockingQueue<Collection<? extends PhysicalSlot>> physicalSlotsQueue =
                 new ArrayBlockingQueue<>(2);
@@ -678,34 +864,7 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
         }
     }
 
-    private static class PhysicalSlotSlotOfferMatcher extends TypeSafeMatcher<PhysicalSlot> {
-        private final SlotOffer slotOffer;
-
-        public PhysicalSlotSlotOfferMatcher(SlotOffer slotOffer) {
-            this.slotOffer = slotOffer;
-        }
-
-        @Override
-        protected boolean matchesSafely(PhysicalSlot item) {
-            return item.getAllocationId().equals(slotOffer.getAllocationId())
-                    && item.getResourceProfile().equals(slotOffer.getResourceProfile())
-                    && item.getPhysicalSlotNumber() == slotOffer.getSlotIndex();
-        }
-
-        @Override
-        public void describeTo(Description description) {
-            description.appendText("SlotOffer: ");
-            description.appendValueList(
-                    "{",
-                    ",",
-                    "}",
-                    slotOffer.getAllocationId(),
-                    slotOffer.getResourceProfile(),
-                    slotOffer.getSlotIndex());
-        }
-    }
-
-    private static class FreeSlotConsumer
+    static class FreeSlotConsumer
             implements BiFunction<AllocationID, Throwable, CompletableFuture<Acknowledge>> {
 
         final BlockingQueue<AllocationID> freedSlots = new ArrayBlockingQueue<>(10);
@@ -717,7 +876,7 @@ public class DefaultDeclarativeSlotPoolTest extends TestLogger {
             return CompletableFuture.completedFuture(Acknowledge.get());
         }
 
-        private Collection<AllocationID> drainFreedSlots() {
+        Collection<AllocationID> drainFreedSlots() {
             final Collection<AllocationID> result = new ArrayList<>();
 
             freedSlots.drainTo(result);

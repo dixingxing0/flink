@@ -18,6 +18,7 @@
 
 package org.apache.flink.runtime.io.network.util;
 
+import org.apache.flink.core.memory.MemorySegment;
 import org.apache.flink.core.memory.MemorySegmentFactory;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.BufferRecycler;
@@ -51,14 +52,18 @@ public class TestBufferFactory {
         this.bufferRecycler = checkNotNull(bufferRecycler);
     }
 
-    public synchronized Buffer create() {
+    public synchronized MemorySegment createMemorySegment() {
         if (numberOfCreatedBuffers >= poolSize) {
             return null;
         }
 
         numberOfCreatedBuffers++;
-        return new NetworkBuffer(
-                MemorySegmentFactory.allocateUnpooledSegment(bufferSize), bufferRecycler);
+        return MemorySegmentFactory.allocateUnpooledSegment(bufferSize);
+    }
+
+    public synchronized Buffer create() {
+        MemorySegment memorySegment = createMemorySegment();
+        return memorySegment == null ? null : new NetworkBuffer(memorySegment, bufferRecycler);
     }
 
     public synchronized int getNumberOfCreatedBuffers() {
@@ -88,10 +93,26 @@ public class TestBufferFactory {
      * @return a new buffer instance
      */
     public static Buffer createBuffer(int bufferSize, int dataSize) {
+        return createBuffer(bufferSize, dataSize, Buffer.DataType.DATA_BUFFER);
+    }
+
+    /**
+     * Creates a (network) buffer with default size, i.e. {@link #BUFFER_SIZE}, and unspecified data
+     * of the given size.
+     *
+     * @param dataSize size of the data in the buffer, i.e. the new writer index
+     * @param dataType type of the data in the buffer
+     * @return a new buffer instance
+     */
+    public static Buffer createBuffer(int dataSize, Buffer.DataType dataType) {
+        return createBuffer(BUFFER_SIZE, dataSize, dataType);
+    }
+
+    private static Buffer createBuffer(int bufferSize, int dataSize, Buffer.DataType dataType) {
         return new NetworkBuffer(
                 MemorySegmentFactory.allocateUnpooledSegment(bufferSize),
                 RECYCLER,
-                Buffer.DataType.DATA_BUFFER,
+                dataType,
                 dataSize);
     }
 }

@@ -21,9 +21,10 @@ package org.apache.flink.util;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.configuration.IllegalConfigurationException;
 
+import org.apache.flink.shaded.guava33.com.google.common.net.InetAddresses;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import sun.net.util.IPAddressUtil;
 
 import java.io.IOException;
 import java.net.Inet4Address;
@@ -32,6 +33,9 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.MalformedURLException;
 import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketOptions;
+import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.net.UnknownHostException;
 import java.util.Arrays;
@@ -99,8 +103,15 @@ public class NetUtils {
      * @return URL object for accessing host and port
      */
     private static URL validateHostPortString(String hostPort) {
+        if (StringUtils.isNullOrWhitespaceOnly(hostPort)) {
+            throw new IllegalArgumentException("hostPort should not be null or empty");
+        }
         try {
-            URL u = new URL("http://" + hostPort);
+            URL u =
+                    (hostPort.toLowerCase().startsWith("http://")
+                                    || hostPort.toLowerCase().startsWith("https://"))
+                            ? new URL(hostPort)
+                            : new URL("http://" + hostPort);
             if (u.getHost() == null) {
                 throw new IllegalArgumentException(
                         "The given host:port ('" + hostPort + "') doesn't contain a valid host");
@@ -116,6 +127,57 @@ public class NetUtils {
         }
     }
 
+    /**
+     * Converts an InetSocketAddress to a URL. This method assigns the "http://" schema to the URL
+     * by default.
+     *
+     * @param socketAddress the InetSocketAddress to be converted
+     * @return a URL object representing the provided socket address with "http://" schema
+     */
+    public static URL socketToUrl(InetSocketAddress socketAddress) {
+        String hostString = socketAddress.getHostString();
+        // If the hostString is an IPv6 address, it needs to be enclosed in square brackets
+        // at the beginning and end.
+        if (socketAddress.getAddress() != null
+                && socketAddress.getAddress() instanceof Inet6Address
+                && hostString.equals(socketAddress.getAddress().getHostAddress())) {
+            hostString = "[" + hostString + "]";
+        }
+        String hostPort = hostString + ":" + socketAddress.getPort();
+
+        return validateHostPortString(hostPort);
+    }
+
+    /**
+     * Calls {@link ServerSocket#accept()} on the provided server socket, suppressing any thrown
+     * {@link SocketTimeoutException}s. This is a workaround for the underlying JDK-8237858 bug in
+     * JDK 11 that can cause errant SocketTimeoutExceptions to be thrown at unexpected times.
+     *
+     * <p>This method expects the provided ServerSocket has no timeout set (SO_TIMEOUT of 0),
+     * indicating an infinite timeout. It will suppress all SocketTimeoutExceptions, even if a
+     * ServerSocket with a non-zero timeout is passed in.
+     *
+     * @param serverSocket a ServerSocket with {@link SocketOptions#SO_TIMEOUT SO_TIMEOUT} set to 0;
+     *     if SO_TIMEOUT is greater than 0, then this method will suppress SocketTimeoutException;
+     *     must not be null; SO_TIMEOUT option must be set to 0
+     * @return the new Socket
+     * @throws IOException see {@link ServerSocket#accept()}
+     * @see <a href="https://bugs.openjdk.java.net/browse/JDK-8237858">JDK-8237858</a>
+     */
+    public static Socket acceptWithoutTimeout(ServerSocket serverSocket) throws IOException {
+        Preconditions.checkArgument(
+                serverSocket.getSoTimeout() == 0, "serverSocket SO_TIMEOUT option must be 0");
+        while (true) {
+            try {
+                return serverSocket.accept();
+            } catch (SocketTimeoutException exception) {
+                // This should be impossible given that the socket timeout is set to zero
+                // which indicates an infinite timeout. This is due to the underlying JDK-8237858
+                // bug. We retry the accept call indefinitely to replicate the expected behavior.
+            }
+        }
+    }
+
     // ------------------------------------------------------------------------
     //  Lookup of to free ports
     // ------------------------------------------------------------------------
@@ -125,12 +187,17 @@ public class NetUtils {
      *
      * @return A non-occupied port.
      */
-    public static int getAvailablePort() {
+    public static Port getAvailablePort() {
         for (int i = 0; i < 50; i++) {
             try (ServerSocket serverSocket = new ServerSocket(0)) {
                 int port = serverSocket.getLocalPort();
                 if (port != 0) {
-                    return port;
+                    FileLock fileLock = new FileLock(NetUtils.class.getName() + port);
+                    if (fileLock.tryLock()) {
+                        return new Port(port, fileLock);
+                    } else {
+                        fileLock.unlockAndDestroy();
+                    }
                 }
             } catch (IOException ignored) {
             }
@@ -144,8 +211,8 @@ public class NetUtils {
     // ------------------------------------------------------------------------
 
     /**
-     * Returns an address in a normalized format for Akka. When an IPv6 address is specified, it
-     * normalizes the IPv6 address to avoid complications with the exact URL match policy of Akka.
+     * Returns an address in a normalized format for Pekko. When an IPv6 address is specified, it
+     * normalizes the IPv6 address to avoid complications with the exact URL match policy of Pekko.
      *
      * @param host The hostname, IPv4 or IPv6 address
      * @return host which will be normalized if it is an IPv6 address
@@ -159,17 +226,20 @@ public class NetUtils {
             host = host.trim().toLowerCase();
             if (host.startsWith("[") && host.endsWith("]")) {
                 String address = host.substring(1, host.length() - 1);
-                if (IPAddressUtil.isIPv6LiteralAddress(address)) {
+                if (InetAddresses.isInetAddress(address)) {
                     host = address;
                 }
             }
         }
 
         // normalize and valid address
-        if (IPAddressUtil.isIPv6LiteralAddress(host)) {
-            byte[] ipV6Address = IPAddressUtil.textToNumericFormatV6(host);
-            host = getIPv6UrlRepresentation(ipV6Address);
-        } else if (!IPAddressUtil.isIPv4LiteralAddress(host)) {
+        if (InetAddresses.isInetAddress(host)) {
+            InetAddress inetAddress = InetAddresses.forString(host);
+            if (inetAddress instanceof Inet6Address) {
+                byte[] ipV6Address = inetAddress.getAddress();
+                host = getIPv6UrlRepresentation(ipV6Address);
+            }
+        } else {
             try {
                 // We don't allow these in hostnames
                 Preconditions.checkArgument(!host.startsWith("."));
@@ -184,9 +254,9 @@ public class NetUtils {
     }
 
     /**
-     * Returns a valid address for Akka. It returns a String of format 'host:port'. When an IPv6
+     * Returns a valid address for Pekko. It returns a String of format 'host:port'. When an IPv6
      * address is specified, it normalizes the IPv6 address to avoid complications with the exact
-     * URL match policy of Akka.
+     * URL match policy of Pekko.
      *
      * @param host The hostname, IPv4 or IPv6 address
      * @param port The port
@@ -350,7 +420,7 @@ public class NetUtils {
             int dashIdx = range.indexOf('-');
             if (dashIdx == -1) {
                 // only one port in range:
-                final int port = Integer.valueOf(range);
+                final int port = Integer.parseInt(range);
                 if (!isValidHostPort(port)) {
                     throw new IllegalConfigurationException(
                             "Invalid port configuration. Port must be between 0"
@@ -361,21 +431,29 @@ public class NetUtils {
                 rangeIterator = Collections.singleton(Integer.valueOf(range)).iterator();
             } else {
                 // evaluate range
-                final int start = Integer.valueOf(range.substring(0, dashIdx));
+                final int start = Integer.parseInt(range.substring(0, dashIdx));
                 if (!isValidHostPort(start)) {
                     throw new IllegalConfigurationException(
                             "Invalid port configuration. Port must be between 0"
-                                    + "and 65535, but was "
+                                    + "and 65535, but range start was "
                                     + start
                                     + ".");
                 }
-                final int end = Integer.valueOf(range.substring(dashIdx + 1, range.length()));
+                final int end = Integer.parseInt(range.substring(dashIdx + 1));
                 if (!isValidHostPort(end)) {
                     throw new IllegalConfigurationException(
                             "Invalid port configuration. Port must be between 0"
-                                    + "and 65535, but was "
+                                    + "and 65535, but range end was "
                                     + end
                                     + ".");
+                }
+                if (start >= end) {
+                    throw new IllegalConfigurationException(
+                            "Invalid port configuration."
+                                    + " Port range end must be bigger than port range start."
+                                    + " If you wish to use single port please provide the value directly, not as a range."
+                                    + " Given range: "
+                                    + range);
                 }
                 rangeIterator =
                         new Iterator<Integer>() {
@@ -464,5 +542,30 @@ public class NetUtils {
      */
     public static boolean isValidHostPort(int port) {
         return 0 <= port && port <= 65535;
+    }
+
+    /**
+     * Port wrapper class which holds a {@link FileLock} until it releases. Used to avoid race
+     * condition among multiple threads/processes.
+     */
+    public static class Port implements AutoCloseable {
+        private final int port;
+        private final FileLock fileLock;
+
+        public Port(int port, FileLock fileLock) throws IOException {
+            Preconditions.checkNotNull(fileLock, "FileLock should not be null");
+            Preconditions.checkState(fileLock.isValid(), "FileLock should be locked");
+            this.port = port;
+            this.fileLock = fileLock;
+        }
+
+        public int getPort() {
+            return port;
+        }
+
+        @Override
+        public void close() throws Exception {
+            fileLock.unlockAndDestroy();
+        }
     }
 }

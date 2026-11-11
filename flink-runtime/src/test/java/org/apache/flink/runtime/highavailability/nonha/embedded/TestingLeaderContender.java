@@ -18,8 +18,8 @@
 
 package org.apache.flink.runtime.highavailability.nonha.embedded;
 
-import org.apache.flink.runtime.concurrent.FutureUtils;
 import org.apache.flink.runtime.leaderelection.LeaderContender;
+import org.apache.flink.util.concurrent.FutureUtils;
 
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -53,11 +53,6 @@ final class TestingLeaderContender implements LeaderContender {
                 leaderSessionFuture = new CompletableFuture<>();
             }
         }
-    }
-
-    @Override
-    public String getDescription() {
-        return "foobar";
     }
 
     @Override

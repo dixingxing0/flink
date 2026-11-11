@@ -16,11 +16,13 @@
  * limitations under the License.
  */
 
-flink-monaco-editor {
-  height: calc(~"100vh - 160px");
-}
-
 :host {
   position: relative;
-  display: block;
+  display: flex;
+  flex: 1;
+
+  nz-code-editor {
+    position: absolute;
+    inset: 0;
+  }
 }

@@ -63,18 +63,33 @@ public abstract class EncodingUtils {
         return "`" + escapeBackticks(s) + "`";
     }
 
-    public static String encodeObjectToString(Serializable obj) {
+    public static String encodeObjectToString(Object serializable) {
         try {
-            final byte[] bytes = InstantiationUtil.serializeObject(obj);
+            final byte[] bytes = InstantiationUtil.serializeObject(serializable);
             return new String(BASE64_ENCODER.encode(bytes), UTF_8);
         } catch (Exception e) {
             throw new ValidationException(
                     "Unable to serialize object '"
-                            + obj.toString()
+                            + serializable.toString()
                             + "' of class '"
-                            + obj.getClass().getName()
+                            + serializable.getClass().getName()
                             + "'.",
                     e);
+        }
+    }
+
+    public static String encodeObjectToString(Serializable obj) {
+        return encodeObjectToString((Object) obj);
+    }
+
+    public static <T> T decodeStringToObject(String encodedStr, ClassLoader classLoader)
+            throws IOException {
+        final byte[] bytes = BASE64_DECODER.decode(encodedStr.getBytes(UTF_8));
+        try {
+            return InstantiationUtil.deserializeObject(bytes, classLoader);
+        } catch (ClassNotFoundException e) {
+            throw new ValidationException(
+                    "Unable to deserialize string '" + encodedStr + "' to object.", e);
         }
     }
 
@@ -124,6 +139,11 @@ public abstract class EncodingUtils {
         }
     }
 
+    /**
+     * @deprecated Use {@link #loadClass(String, ClassLoader)} instead, in order to explicitly
+     *     provide the correct classloader.
+     */
+    @Deprecated
     public static Class<?> loadClass(String qualifiedName) {
         return loadClass(qualifiedName, Thread.currentThread().getContextClassLoader());
     }
@@ -165,6 +185,100 @@ public abstract class EncodingUtils {
             hexChars[j * 2 + 1] = HEX_CHARS[v & 0x0F];
         }
         return new String(hexChars);
+    }
+
+    /**
+     * Converts an array of characters representing hexadecimal values into an array of bytes of
+     * those same values. E.g. {@code unhex("12".getBytes())} returns {@code new byte[]{0x12}}.
+     *
+     * <p>The returned array will be half the length of the passed array, as it takes two characters
+     * to represent any given byte. If the input array has an odd length, the first byte is handled
+     * separately and set to 0.
+     *
+     * <p>Unlike {@link #decodeHex(String)}, this method does not throw an exception for odd-length
+     * inputs or invalid characters. Instead, it returns null if invalid characters are encountered.
+     *
+     * @param bytes An array of characters containing hexadecimal digits.
+     * @return A byte array containing the binary data decoded from the supplied char array, or null
+     *     if the input contains invalid hexadecimal characters.
+     */
+    public static byte[] unhex(final byte[] bytes) {
+        final byte[] out = new byte[(bytes.length + 1) >> 1];
+
+        int i = bytes.length - 2;
+        int j = out.length - 1;
+        while (i >= 0) {
+            int l = Character.digit(bytes[i], 16);
+            int r = Character.digit(bytes[i + 1], 16);
+            if (l == -1 || r == -1) {
+                return null;
+            }
+            i -= 2;
+            out[j--] = (byte) (((l << 4) | r) & 0xFF);
+        }
+
+        // length is odd and first byte is invalid
+        if (i == -1 && Character.digit(bytes[0], 16) == -1) {
+            return null;
+        }
+
+        return out;
+    }
+
+    /**
+     * Converts an array of characters representing hexadecimal values into an array of bytes of
+     * those same values. The returned array will be half the length of the passed array, as it
+     * takes two characters to represent any given byte. An exception is thrown if the passed char
+     * array has an odd number of elements.
+     *
+     * <p>Copied from
+     * https://github.com/apache/commons-codec/blob/master/src/main/java/org/apache/commons/codec/binary/Hex.java.
+     *
+     * @param str An array of characters containing hexadecimal digits
+     * @return A byte array to contain the binary data decoded from the supplied char array.
+     * @throws TableException Thrown if an odd number of characters or illegal characters are
+     *     supplied
+     */
+    public static byte[] decodeHex(final String str) throws TableException {
+        final int len = str.length();
+
+        if ((len & 0x01) != 0) {
+            throw new TableException("Odd number of characters.");
+        }
+
+        final int outLen = len >> 1;
+        final byte[] out = new byte[outLen];
+
+        // two characters form the hex value.
+        for (int i = 0, j = 0; j < len; i++) {
+            int f = toDigit(str.charAt(j), j) << 4;
+            j++;
+            f = f | toDigit(str.charAt(j), j);
+            j++;
+            out[i] = (byte) (f & 0xFF);
+        }
+
+        return out;
+    }
+
+    /**
+     * Converts a hexadecimal character to an integer.
+     *
+     * <p>Copied from
+     * https://github.com/apache/commons-codec/blob/master/src/main/java/org/apache/commons/codec/binary/Hex.java.
+     *
+     * @param ch A character to convert to an integer digit
+     * @param idx The index of the character in the source
+     * @return An integer
+     * @throws TableException Thrown if ch is an illegal hex character
+     */
+    private static int toDigit(final char ch, final int idx) throws TableException {
+        final int digit = Character.digit(ch, 16);
+        if (digit == -1) {
+            throw new TableException(
+                    "Illegal hexadecimal character: [" + ch + "] at index: [" + idx + "]");
+        }
+        return digit;
     }
 
     // --------------------------------------------------------------------------------------------
@@ -374,11 +488,11 @@ public abstract class EncodingUtils {
                         out.write('\\');
                         out.write('\\');
                         break;
-                        // MODIFICATION: Flink removes invalid escaping of forward slashes!
-                        // case '/':
-                        //	out.write('\\');
-                        //	out.write('/');
-                        //	break;
+                    // MODIFICATION: Flink removes invalid escaping of forward slashes!
+                    // case '/':
+                    //	out.write('\\');
+                    //	out.write('/');
+                    //	break;
                     default:
                         out.write(ch);
                         break;

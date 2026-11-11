@@ -20,27 +20,39 @@ package org.apache.flink.test.util;
 
 import org.apache.flink.api.dag.Pipeline;
 import org.apache.flink.client.deployment.executors.PipelineExecutorUtils;
+import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigUtils;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.DeploymentOptions;
 import org.apache.flink.configuration.PipelineOptions;
+import org.apache.flink.core.execution.CacheSupportedPipelineExecutor;
 import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.core.execution.JobStatusChangedListener;
+import org.apache.flink.core.execution.JobStatusChangedListenerUtils;
 import org.apache.flink.core.execution.PipelineExecutor;
 import org.apache.flink.core.execution.PipelineExecutorFactory;
 import org.apache.flink.core.execution.PipelineExecutorServiceLoader;
 import org.apache.flink.core.fs.FileSystem;
 import org.apache.flink.core.fs.Path;
-import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.jobgraph.SavepointRestoreSettings;
 import org.apache.flink.runtime.minicluster.MiniCluster;
 import org.apache.flink.runtime.minicluster.MiniClusterJobClient;
 import org.apache.flink.streaming.api.graph.StreamGraph;
+import org.apache.flink.util.AbstractID;
+import org.apache.flink.util.concurrent.ExecutorThreadFactory;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.Collection;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.stream.Stream;
 
 /**
@@ -48,6 +60,10 @@ import java.util.stream.Stream;
  * PipelineExecutors} that use a given {@link MiniCluster}.
  */
 public class MiniClusterPipelineExecutorServiceLoader implements PipelineExecutorServiceLoader {
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(MiniClusterPipelineExecutorServiceLoader.class);
+
     public static final String NAME = "minicluster";
 
     private final MiniCluster miniCluster;
@@ -60,9 +76,14 @@ public class MiniClusterPipelineExecutorServiceLoader implements PipelineExecuto
      * Populates a {@link Configuration} that is compatible with this {@link
      * MiniClusterPipelineExecutorServiceLoader}.
      */
-    public static Configuration createConfiguration(
-            Collection<Path> jarFiles, Collection<URL> classPaths) {
-        Configuration config = new Configuration();
+    public static Configuration updateConfigurationForMiniCluster(
+            Configuration config, Collection<Path> jarFiles, Collection<URL> classPaths) {
+
+        checkOverridesOption(config, PipelineOptions.JARS);
+        checkOverridesOption(config, PipelineOptions.CLASSPATHS);
+        checkOverridesOption(config, DeploymentOptions.TARGET);
+        checkOverridesOption(config, DeploymentOptions.ATTACHED);
+
         ConfigUtils.encodeCollectionToConfig(
                 config,
                 PipelineOptions.JARS,
@@ -73,6 +94,12 @@ public class MiniClusterPipelineExecutorServiceLoader implements PipelineExecuto
         config.set(DeploymentOptions.TARGET, MiniClusterPipelineExecutorServiceLoader.NAME);
         config.set(DeploymentOptions.ATTACHED, true);
         return config;
+    }
+
+    private static void checkOverridesOption(Configuration config, ConfigOption<?> option) {
+        if (config.contains(option)) {
+            LOG.warn("Overriding config setting '{}' for MiniCluster.", option.key());
+        }
     }
 
     private static String getAbsoluteURL(Path path) {
@@ -122,26 +149,47 @@ public class MiniClusterPipelineExecutorServiceLoader implements PipelineExecuto
         }
     }
 
-    private static class MiniClusterExecutor implements PipelineExecutor {
-
+    private static class MiniClusterExecutor implements CacheSupportedPipelineExecutor {
+        private final ExecutorService executorService =
+                Executors.newFixedThreadPool(
+                        1, new ExecutorThreadFactory("Flink-MiniClusterExecutor-IO"));
         private final MiniCluster miniCluster;
+        private final List<JobStatusChangedListener> jobStatusChangedListeners;
 
         public MiniClusterExecutor(MiniCluster miniCluster) {
             this.miniCluster = miniCluster;
+            this.jobStatusChangedListeners =
+                    JobStatusChangedListenerUtils.createJobStatusChangedListeners(
+                            Thread.currentThread().getContextClassLoader(),
+                            miniCluster.getConfiguration(),
+                            executorService);
         }
 
         @Override
         public CompletableFuture<JobClient> execute(
                 Pipeline pipeline, Configuration configuration, ClassLoader userCodeClassLoader)
                 throws Exception {
-            final JobGraph jobGraph = PipelineExecutorUtils.getJobGraph(pipeline, configuration);
-            if (jobGraph.getSavepointRestoreSettings() == SavepointRestoreSettings.none()
-                    && pipeline instanceof StreamGraph) {
-                jobGraph.setSavepointRestoreSettings(
-                        ((StreamGraph) pipeline).getSavepointRestoreSettings());
+            SavepointRestoreSettings savepointRestoreSettings =
+                    ((StreamGraph) pipeline).getSavepointRestoreSettings();
+            final StreamGraph streamGraph =
+                    PipelineExecutorUtils.getStreamGraph(pipeline, configuration);
+            if (streamGraph.getSavepointRestoreSettings() == SavepointRestoreSettings.none()) {
+                streamGraph.setSavepointRestoreSettings(savepointRestoreSettings);
             }
+
             return miniCluster
-                    .submitJob(jobGraph)
+                    .submitJob(streamGraph)
+                    .whenComplete(
+                            (ignored, throwable) -> {
+                                if (throwable == null) {
+                                    PipelineExecutorUtils.notifyJobStatusListeners(
+                                            pipeline, streamGraph, jobStatusChangedListeners);
+                                } else {
+                                    LOG.error(
+                                            "Failed to submit job graph to mini cluster.",
+                                            throwable);
+                                }
+                            })
                     .thenApply(
                             result ->
                                     new MiniClusterJobClient(
@@ -149,6 +197,21 @@ public class MiniClusterPipelineExecutorServiceLoader implements PipelineExecuto
                                             miniCluster,
                                             userCodeClassLoader,
                                             MiniClusterJobClient.JobFinalizationBehavior.NOTHING));
+        }
+
+        @Override
+        public CompletableFuture<Set<AbstractID>> listCompletedClusterDatasetIds(
+                Configuration configuration, ClassLoader userCodeClassloader) throws Exception {
+            return miniCluster.listCompletedClusterDatasetIds();
+        }
+
+        @Override
+        public CompletableFuture<Void> invalidateClusterDataset(
+                AbstractID clusterDatasetId,
+                Configuration configuration,
+                ClassLoader userCodeClassloader)
+                throws Exception {
+            return miniCluster.invalidateClusterDataset(clusterDatasetId);
         }
     }
 }

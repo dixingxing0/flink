@@ -30,10 +30,10 @@ import org.apache.flink.api.common.typeutils.base.ListSerializer;
 import org.apache.flink.api.common.typeutils.base.LongSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.cep.EventComparator;
+import org.apache.flink.cep.configuration.SharedBufferCacheConfig;
 import org.apache.flink.cep.functions.PatternProcessFunction;
 import org.apache.flink.cep.functions.TimedOutPartialMatchHandler;
 import org.apache.flink.cep.nfa.NFA;
-import org.apache.flink.cep.nfa.NFA.MigratedNFA;
 import org.apache.flink.cep.nfa.NFAState;
 import org.apache.flink.cep.nfa.NFAStateSerializer;
 import org.apache.flink.cep.nfa.aftermatch.AfterMatchSkipStrategy;
@@ -42,8 +42,8 @@ import org.apache.flink.cep.nfa.sharedbuffer.SharedBuffer;
 import org.apache.flink.cep.nfa.sharedbuffer.SharedBufferAccessor;
 import org.apache.flink.cep.time.TimerService;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.metrics.Counter;
-import org.apache.flink.runtime.state.KeyedStateFunction;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.VoidNamespace;
 import org.apache.flink.runtime.state.VoidNamespaceSerializer;
@@ -162,7 +162,12 @@ public class CepOperator<IN, KEY, OUT>
     }
 
     @Override
-    public void setup(
+    public boolean useInterruptibleTimers(ReadableConfig config) {
+        return true;
+    }
+
+    @Override
+    protected void setup(
             StreamTask<?, ?> containingTask,
             StreamConfig config,
             Output<StreamRecord<OUT>> output) {
@@ -182,7 +187,11 @@ public class CepOperator<IN, KEY, OUT>
                                 new ValueStateDescriptor<>(
                                         NFA_STATE_NAME, new NFAStateSerializer()));
 
-        partialMatches = new SharedBuffer<>(context.getKeyedStateStore(), inputSerializer);
+        partialMatches =
+                new SharedBuffer<>(
+                        context.getKeyedStateStore(),
+                        inputSerializer,
+                        SharedBufferCacheConfig.of(getOperatorConfig().getConfiguration()));
 
         elementQueueState =
                 context.getKeyedStateStore()
@@ -191,33 +200,6 @@ public class CepOperator<IN, KEY, OUT>
                                         EVENT_QUEUE_STATE_NAME,
                                         LongSerializer.INSTANCE,
                                         new ListSerializer<>(inputSerializer)));
-
-        if (context.isRestored()) {
-            migrateOldState();
-        }
-    }
-
-    private void migrateOldState() throws Exception {
-        getKeyedStateBackend()
-                .applyToAllKeys(
-                        VoidNamespace.INSTANCE,
-                        VoidNamespaceSerializer.INSTANCE,
-                        new ValueStateDescriptor<>(
-                                "nfaOperatorStateName", new NFA.NFASerializer<>(inputSerializer)),
-                        new KeyedStateFunction<Object, ValueState<MigratedNFA<IN>>>() {
-                            @Override
-                            public void process(Object key, ValueState<MigratedNFA<IN>> state)
-                                    throws Exception {
-                                MigratedNFA<IN> oldState = state.value();
-                                computationStates.update(
-                                        new NFAState(oldState.getComputationStates()));
-                                org.apache.flink.cep.nfa.SharedBuffer<IN> sharedBuffer =
-                                        oldState.getSharedBuffer();
-                                partialMatches.init(
-                                        sharedBuffer.getEventsBuffer(), sharedBuffer.getPages());
-                                state.clear();
-                            }
-                        });
     }
 
     @Override
@@ -244,6 +226,9 @@ public class CepOperator<IN, KEY, OUT>
         if (nfa != null) {
             nfa.close();
         }
+        if (partialMatches != null) {
+            partialMatches.releaseCacheStatisticsTimer();
+        }
     }
 
     @Override
@@ -259,9 +244,6 @@ public class CepOperator<IN, KEY, OUT>
             } else {
                 long currentTime = timerService.currentProcessingTime();
                 bufferEvent(element.getValue(), currentTime);
-
-                // register a timer for the next millisecond to sort and emit buffered data
-                timerService.registerProcessingTimeTimer(VoidNamespace.INSTANCE, currentTime + 1);
             }
 
         } else {
@@ -279,8 +261,6 @@ public class CepOperator<IN, KEY, OUT>
                 // we have an event with a valid timestamp, so
                 // we buffer it until we receive the proper watermark.
 
-                saveRegisterWatermarkTimer();
-
                 bufferEvent(value, timestamp);
 
             } else if (lateDataOutputTag != null) {
@@ -291,16 +271,11 @@ public class CepOperator<IN, KEY, OUT>
         }
     }
 
-    /**
-     * Registers a timer for {@code current watermark + 1}, this means that we get triggered
-     * whenever the watermark advances, which is what we want for working off the queue of buffered
-     * elements.
-     */
-    private void saveRegisterWatermarkTimer() {
-        long currentWatermark = timerService.currentWatermark();
-        // protect against overflow
-        if (currentWatermark + 1 > currentWatermark) {
-            timerService.registerEventTimeTimer(VoidNamespace.INSTANCE, currentWatermark + 1);
+    private void registerTimer(long timestamp) {
+        if (isProcessingTime) {
+            timerService.registerProcessingTimeTimer(VoidNamespace.INSTANCE, timestamp + 1);
+        } else {
+            timerService.registerEventTimeTimer(VoidNamespace.INSTANCE, timestamp);
         }
     }
 
@@ -308,6 +283,7 @@ public class CepOperator<IN, KEY, OUT>
         List<IN> elementsForTimestamp = elementQueueState.get(currentTime);
         if (elementsForTimestamp == null) {
             elementsForTimestamp = new ArrayList<>();
+            registerTimer(currentTime);
         }
 
         elementsForTimestamp.add(event);
@@ -353,8 +329,9 @@ public class CepOperator<IN, KEY, OUT>
         // STEP 4
         updateNFA(nfaState);
 
-        if (!sortedTimestamps.isEmpty() || !partialMatches.isEmpty()) {
-            saveRegisterWatermarkTimer();
+        // In order to remove dangling partial matches.
+        if (nfaState.getPartialMatches().size() == 1 && nfaState.getCompletedMatches().isEmpty()) {
+            computationStates.clear();
         }
     }
 
@@ -388,6 +365,9 @@ public class CepOperator<IN, KEY, OUT>
         }
 
         // STEP 3
+        advanceTime(nfa, timerService.currentProcessingTime());
+
+        // STEP 4
         updateNFA(nfa);
     }
 
@@ -404,6 +384,7 @@ public class CepOperator<IN, KEY, OUT>
     private void updateNFA(NFAState nfaState) throws IOException {
         if (nfaState.isStateChanged()) {
             nfaState.resetStateChanged();
+            nfaState.resetNewStartPartialMatch();
             computationStates.update(nfaState);
         }
     }
@@ -434,6 +415,9 @@ public class CepOperator<IN, KEY, OUT>
                             timestamp,
                             afterMatchSkipStrategy,
                             cepTimerService);
+            if (nfa.getWindowTime() > 0 && nfaState.isNewStartPartialMatch()) {
+                registerTimer(timestamp + nfa.getWindowTime());
+            }
             processMatchedSequences(patterns, timestamp);
         }
     }
@@ -445,8 +429,22 @@ public class CepOperator<IN, KEY, OUT>
      */
     private void advanceTime(NFAState nfaState, long timestamp) throws Exception {
         try (SharedBufferAccessor<IN> sharedBufferAccessor = partialMatches.getAccessor()) {
-            Collection<Tuple2<Map<String, List<IN>>, Long>> timedOut =
-                    nfa.advanceTime(sharedBufferAccessor, nfaState, timestamp);
+            Tuple2<
+                            Collection<Map<String, List<IN>>>,
+                            Collection<Tuple2<Map<String, List<IN>>, Long>>>
+                    pendingMatchesAndTimeout =
+                            nfa.advanceTime(
+                                    sharedBufferAccessor,
+                                    nfaState,
+                                    timestamp,
+                                    afterMatchSkipStrategy);
+
+            Collection<Map<String, List<IN>>> pendingMatches = pendingMatchesAndTimeout.f0;
+            Collection<Tuple2<Map<String, List<IN>>, Long>> timedOut = pendingMatchesAndTimeout.f1;
+
+            if (!pendingMatches.isEmpty()) {
+                processMatchedSequences(pendingMatches, timestamp);
+            }
             if (!timedOut.isEmpty()) {
                 processTimedOutSequences(timedOut);
             }

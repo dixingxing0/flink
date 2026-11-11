@@ -20,20 +20,22 @@ package org.apache.flink.formats.avro;
 
 import org.apache.flink.api.common.io.InputFormat;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.java.DataSet;
-import org.apache.flink.api.java.ExecutionEnvironment;
 import org.apache.flink.api.java.typeutils.PojoTypeInfo;
 import org.apache.flink.api.java.typeutils.TypeExtractor;
 import org.apache.flink.core.fs.Path;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.fail;
 
 /** Tests for the type extraction of the {@link AvroInputFormat}. */
-public class AvroInputFormatTypeExtractionTest {
+class AvroInputFormatTypeExtractionTest {
 
     @Test
-    public void testTypeExtraction() {
+    void testTypeExtraction() {
         try {
             InputFormat<MyAvroType, ?> format =
                     new AvroInputFormat<MyAvroType>(
@@ -41,18 +43,18 @@ public class AvroInputFormatTypeExtractionTest {
 
             TypeInformation<?> typeInfoDirect = TypeExtractor.getInputFormatTypes(format);
 
-            ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
-            DataSet<MyAvroType> input = env.createInput(format);
+            StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+            DataStream<MyAvroType> input = env.createInput(format);
             TypeInformation<?> typeInfoDataSet = input.getType();
 
-            Assert.assertTrue(typeInfoDirect instanceof PojoTypeInfo);
-            Assert.assertTrue(typeInfoDataSet instanceof PojoTypeInfo);
+            assertThat(typeInfoDirect).isInstanceOf(PojoTypeInfo.class);
+            assertThat(typeInfoDataSet).isInstanceOf(PojoTypeInfo.class);
 
-            Assert.assertEquals(MyAvroType.class, typeInfoDirect.getTypeClass());
-            Assert.assertEquals(MyAvroType.class, typeInfoDataSet.getTypeClass());
+            assertThat(typeInfoDirect.getTypeClass()).isEqualTo(MyAvroType.class);
+            assertThat(typeInfoDataSet.getTypeClass()).isEqualTo(MyAvroType.class);
         } catch (Exception e) {
             e.printStackTrace();
-            Assert.fail(e.getMessage());
+            fail(e.getMessage());
         }
     }
 

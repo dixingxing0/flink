@@ -18,22 +18,31 @@
 
 package org.apache.flink.table.api;
 
+import org.apache.flink.annotation.Experimental;
 import org.apache.flink.annotation.PublicEvolving;
-import org.apache.flink.api.common.JobExecutionResult;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.table.annotation.ArgumentTrait;
+import org.apache.flink.table.api.config.TableConfigOptions;
 import org.apache.flink.table.api.internal.TableEnvironmentImpl;
 import org.apache.flink.table.catalog.Catalog;
-import org.apache.flink.table.descriptors.ConnectTableDescriptor;
-import org.apache.flink.table.descriptors.ConnectorDescriptor;
+import org.apache.flink.table.catalog.CatalogDescriptor;
+import org.apache.flink.table.catalog.CatalogModel;
+import org.apache.flink.table.catalog.CatalogStore;
+import org.apache.flink.table.catalog.CatalogTable;
 import org.apache.flink.table.expressions.Expression;
+import org.apache.flink.table.functions.ProcessTableFunction;
 import org.apache.flink.table.functions.ScalarFunction;
 import org.apache.flink.table.functions.UserDefinedFunction;
 import org.apache.flink.table.module.Module;
-import org.apache.flink.table.sinks.TableSink;
-import org.apache.flink.table.sources.TableSource;
+import org.apache.flink.table.module.ModuleEntry;
+import org.apache.flink.table.resource.ResourceUri;
 import org.apache.flink.table.types.AbstractDataType;
+
+import javax.annotation.Nullable;
 
 import java.io.Serializable;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -52,12 +61,13 @@ import java.util.Optional;
  *   <li>Offering further configuration options.
  * </ul>
  *
- * <p>The syntax for path in methods such as {@link #createTemporaryView(String, Table)}is following
- * [[catalog-name.]database-name.]object-name, where the catalog name and database are optional. For
- * path resolution see {@link #useCatalog(String)} and {@link #useDatabase(String)}.
+ * <p>The syntax for path in methods such as {@link #createTemporaryView(String, Table)} is
+ * following {@code [[catalog-name.]database-name.]object-name}, where the catalog name and database
+ * are optional. For path resolution see {@link #useCatalog(String)} and {@link
+ * #useDatabase(String)}.
  *
- * <p>Example: `cat.1`.`db`.`Table` resolves to an object named 'Table' in a catalog named 'cat.1'
- * and database named 'db'.
+ * <p>Example: {@code `cat.1`.`db`.`Table`} resolves to an object named 'Table' in a catalog named
+ * 'cat.1' and database named 'db'.
  *
  * <p>Note: This environment is meant for pure table programs. If you would like to convert from or
  * to other Flink APIs, it might be necessary to use one of the available language-specific table
@@ -90,6 +100,33 @@ public interface TableEnvironment {
      */
     static TableEnvironment create(EnvironmentSettings settings) {
         return TableEnvironmentImpl.create(settings);
+    }
+
+    /**
+     * Creates a table environment that is the entry point and central context for creating Table
+     * and SQL API programs.
+     *
+     * <p>It is unified both on a language level for all JVM-based languages (i.e. there is no
+     * distinction between Scala and Java API) and for bounded and unbounded data processing.
+     *
+     * <p>A table environment is responsible for:
+     *
+     * <ul>
+     *   <li>Connecting to external systems.
+     *   <li>Registering and retrieving {@link Table}s and other meta objects from a catalog.
+     *   <li>Executing SQL statements.
+     *   <li>Offering further configuration options.
+     * </ul>
+     *
+     * <p>Note: This environment is meant for pure table programs. If you would like to convert from
+     * or to other Flink APIs, it might be necessary to use one of the available language-specific
+     * table environments in the corresponding bridging modules.
+     *
+     * @param configuration The specified options are used to instantiate the {@link
+     *     TableEnvironment}.
+     */
+    static TableEnvironment create(Configuration configuration) {
+        return TableEnvironmentImpl.create(configuration);
     }
 
     /**
@@ -350,21 +387,27 @@ public interface TableEnvironment {
     Table fromValues(AbstractDataType<?> rowType, Iterable<?> values);
 
     /**
-     * Creates a table from a table source.
-     *
-     * @param source table source used as table
-     */
-    @Deprecated
-    Table fromTableSource(TableSource<?> source);
-
-    /**
      * Registers a {@link Catalog} under a unique name. All tables registered in the {@link Catalog}
      * can be accessed.
      *
      * @param catalogName The name under which the catalog will be registered.
      * @param catalog The catalog to register.
+     * @deprecated Use {@link #createCatalog(String, CatalogDescriptor)} instead. The new method
+     *     uses a {@link CatalogDescriptor} to initialize the catalog instance and store the {@link
+     *     CatalogDescriptor} to the {@link CatalogStore}.
      */
+    @Deprecated
     void registerCatalog(String catalogName, Catalog catalog);
+
+    /**
+     * Creates a {@link Catalog} using the provided {@link CatalogDescriptor}. All table registered
+     * in the {@link Catalog} can be accessed. The {@link CatalogDescriptor} will be persisted into
+     * the {@link CatalogStore}.
+     *
+     * @param catalogName The name under which the catalog will be created
+     * @param catalogDescriptor The catalog descriptor for creating catalog
+     */
+    void createCatalog(String catalogName, CatalogDescriptor catalogDescriptor);
 
     /**
      * Gets a registered {@link Catalog} by name.
@@ -382,6 +425,14 @@ public interface TableEnvironment {
      * @param module the module instance
      */
     void loadModule(String moduleName, Module module);
+
+    /**
+     * Enable modules in use with declared name order. Modules that have been loaded but not exist
+     * in names varargs will become unused.
+     *
+     * @param moduleNames module names to be used
+     */
+    void useModules(String... moduleNames);
 
     /**
      * Unloads a {@link Module} with given name. ValidationException is thrown when there is no
@@ -488,13 +539,85 @@ public interface TableEnvironment {
             boolean ignoreIfExists);
 
     /**
-     * Drops a catalog function registered in the given path.
+     * Registers a {@link UserDefinedFunction} class as a catalog function in the given path by the
+     * specific class name and user defined resource uri.
      *
-     * @param path The path under which the function has been registered. See also the {@link
+     * <p>Compared to {@link #createFunction(String, Class)}, this method allows registering a user
+     * defined function by only providing a full path class name and a list of resources that
+     * contain the implementation of the function along with its dependencies. Users don't need to
+     * initialize the function instance in advance. The resource file can be a local or remote JAR
+     * file.
+     *
+     * <p>Compared to system functions with a globally defined name, catalog functions are always
+     * (implicitly or explicitly) identified by a catalog and database.
+     *
+     * <p>There must not be another function (temporary or permanent) registered under the same
+     * path.
+     *
+     * @param path The path under which the function will be registered. See also the {@link
      *     TableEnvironment} class description for the format of the path.
-     * @return true if a function existed in the given path and was removed
+     * @param className The class name of UDF to be registered.
+     * @param resourceUris The list of udf resource uris in local or remote.
      */
-    boolean dropFunction(String path);
+    void createFunction(String path, String className, List<ResourceUri> resourceUris);
+
+    /**
+     * Creates a catalog function in the given path described by a {@link FunctionDescriptor}.
+     *
+     * <p>Compared to system functions with a globally defined name, catalog functions are always
+     * (implicitly or explicitly) identified by a catalog and database.
+     *
+     * <p>There must not be another function (temporary or permanent) registered under the same
+     * path.
+     *
+     * @param path The path under which the function will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param functionDescriptor The descriptor of the function to create.
+     */
+    void createFunction(String path, FunctionDescriptor functionDescriptor);
+
+    /**
+     * Registers a {@link UserDefinedFunction} class as a catalog function in the given path by the
+     * specific class name and user defined resource uri.
+     *
+     * <p>Compared to {@link #createFunction(String, Class)}, this method allows registering a user
+     * defined function by only providing a full path class name and a list of resources that
+     * contain the implementation of the function along with its dependencies. Users don't need to
+     * initialize the function instance in advance. The resource file can be a local or remote JAR
+     * file.
+     *
+     * <p>Compared to system functions with a globally defined name, catalog functions are always
+     * (implicitly or explicitly) identified by a catalog and database.
+     *
+     * <p>There must not be another function (temporary or permanent) registered under the same
+     * path.
+     *
+     * @param path The path under which the function will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param className The class name of UDF to be registered.
+     * @param resourceUris The list of udf resource uris in local or remote.
+     * @param ignoreIfExists If a function exists under the given path and this flag is set, no
+     *     operation is executed. An exception is thrown otherwise.
+     */
+    void createFunction(
+            String path, String className, List<ResourceUri> resourceUris, boolean ignoreIfExists);
+
+    /**
+     * Creates a catalog function in the given path described by a {@link FunctionDescriptor}.
+     *
+     * <p>Compared to system functions with a globally defined name, catalog functions are always
+     * (implicitly or explicitly) identified by a catalog and database.
+     *
+     * <p>There must not be another function (temporary or permanent) registered under the same
+     * path.
+     *
+     * @param path The path under which the function will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param functionDescriptor The descriptor of the function to create.
+     * @param ignoreIfExists If a function exists under the given path and this flag is set, no
+     *     operation is executed. An exception is thrown otherwise.
+     */
+    void createFunction(String path, FunctionDescriptor functionDescriptor, boolean ignoreIfExists);
 
     /**
      * Registers a {@link UserDefinedFunction} class as a temporary catalog function.
@@ -536,6 +659,92 @@ public interface TableEnvironment {
     void createTemporaryFunction(String path, UserDefinedFunction functionInstance);
 
     /**
+     * Registers a {@link UserDefinedFunction} class as a temporary catalog function in the given
+     * path by the specific class name and user defined resource uri.
+     *
+     * <p>Compared to {@link #createTemporaryFunction(String, Class)}, this method allows
+     * registering a user defined function by only providing a full path class name and a list of
+     * resources that contain the implementation of the function along with its dependencies. Users
+     * don't need to initialize the function instance in advance. The resource file can be a local
+     * or remote JAR file.
+     *
+     * <p>Compared to {@link #createTemporarySystemFunction(String, String, List)} with a globally
+     * defined name, catalog functions are always (implicitly or explicitly) identified by a catalog
+     * and database.
+     *
+     * <p>Temporary functions can shadow permanent ones. If a permanent function under a given name
+     * exists, it will be inaccessible in the current session. To make the permanent function
+     * available again one can drop the corresponding temporary function.
+     *
+     * @param path The path under which the function will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param className The class name of UDF to be registered.
+     * @param resourceUris The list udf resource uri in local or remote.
+     */
+    void createTemporaryFunction(String path, String className, List<ResourceUri> resourceUris);
+
+    /**
+     * Creates a temporary catalog function using a {@link FunctionDescriptor} to describe the
+     * function.
+     *
+     * <p>Compared to {@link #createTemporarySystemFunction(String, String, List)} with a globally
+     * defined name, catalog functions are always (implicitly or explicitly) identified by a catalog
+     * and database.
+     *
+     * <p>Temporary functions can shadow permanent ones. If a permanent function under a given name
+     * exists, it will be inaccessible in the current session. To make the permanent function
+     * available again one can drop the corresponding temporary function.
+     *
+     * @param path The path under which the function will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param functionDescriptor The descriptor of the function to create.
+     */
+    void createTemporaryFunction(String path, FunctionDescriptor functionDescriptor);
+
+    /**
+     * Registers a {@link UserDefinedFunction} class as a temporary system function by the specific
+     * class name and user defined resource uri.
+     *
+     * <p>Compared to {@link #createTemporaryFunction(String, Class)}, this method allows
+     * registering a user defined function by only providing a full path class name and a list of
+     * resources that contain the implementation of the function along with its dependencies. Users
+     * don't need to initialize the function instance in advance. The resource file can be a local
+     * or remote JAR file.
+     *
+     * <p>Temporary functions can shadow permanent ones. If a permanent function under a given name
+     * exists, it will be inaccessible in the current session. To make the permanent function
+     * available again one can drop the corresponding temporary system function.
+     *
+     * @param name The name under which the function will be registered globally.
+     * @param className The class name of UDF to be registered.
+     * @param resourceUris The list of udf resource uris in local or remote.
+     */
+    void createTemporarySystemFunction(
+            String name, String className, List<ResourceUri> resourceUris);
+
+    /**
+     * Creates a temporary system function using a {@link FunctionDescriptor} to describe the
+     * function.
+     *
+     * <p>Temporary functions can shadow permanent ones. If a permanent function under a given name
+     * exists, it will be inaccessible in the current session. To make the permanent function
+     * available again one can drop the corresponding temporary system function.
+     *
+     * @param name The name under which the function will be registered globally.
+     * @param functionDescriptor The descriptor of the function to create.
+     */
+    void createTemporarySystemFunction(String name, FunctionDescriptor functionDescriptor);
+
+    /**
+     * Drops a catalog function registered in the given path.
+     *
+     * @param path The path under which the function has been registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @return true if a function existed in the given path and was removed
+     */
+    boolean dropFunction(String path);
+
+    /**
      * Drops a temporary catalog function registered in the given path.
      *
      * <p>If a permanent function with the given path exists, it will be used from now on for any
@@ -546,6 +755,124 @@ public interface TableEnvironment {
      * @return true if a function existed in the given path and was removed
      */
     boolean dropTemporaryFunction(String path);
+
+    /**
+     * Registers the given {@link TableDescriptor} as a temporary catalog table.
+     *
+     * <p>The {@link TableDescriptor descriptor} is converted into a {@link CatalogTable} and stored
+     * in the catalog.
+     *
+     * <p>Temporary objects can shadow permanent ones. If a permanent object in a given path exists,
+     * it will be inaccessible in the current session. To make the permanent object available again
+     * one can drop the corresponding temporary object.
+     *
+     * <p>Examples:
+     *
+     * <pre>{@code
+     * tEnv.createTemporaryTable("MyTable", TableDescriptor.forConnector("datagen")
+     *   .schema(Schema.newBuilder()
+     *     .column("f0", DataTypes.STRING())
+     *     .build())
+     *   .option(DataGenOptions.ROWS_PER_SECOND, 10)
+     *   .option("fields.f0.kind", "random")
+     *   .build());
+     * }</pre>
+     *
+     * @param path The path under which the table will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param descriptor Template for creating a {@link CatalogTable} instance.
+     */
+    void createTemporaryTable(String path, TableDescriptor descriptor);
+
+    /**
+     * Registers the given {@link TableDescriptor} as a temporary catalog table.
+     *
+     * <p>The {@link TableDescriptor descriptor} is converted into a {@link CatalogTable} and stored
+     * in the catalog.
+     *
+     * <p>Temporary objects can shadow permanent ones. If a permanent object in a given path exists,
+     * it will be inaccessible in the current session. To make the permanent object available again
+     * one can drop the corresponding temporary object.
+     *
+     * <p>Examples:
+     *
+     * <pre>{@code
+     * tEnv.createTemporaryTable("MyTable", TableDescriptor.forConnector("datagen")
+     *   .schema(Schema.newBuilder()
+     *     .column("f0", DataTypes.STRING())
+     *     .build())
+     *   .option(DataGenOptions.ROWS_PER_SECOND, 10)
+     *   .option("fields.f0.kind", "random")
+     *   .build(),
+     *  true);
+     * }</pre>
+     *
+     * @param path The path under which the table will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param descriptor Template for creating a {@link CatalogTable} instance.
+     * @param ignoreIfExists If a table exists under the given path and this flag is set, no
+     *     operation is executed. An exception is thrown otherwise.
+     */
+    void createTemporaryTable(String path, TableDescriptor descriptor, boolean ignoreIfExists);
+
+    /**
+     * Registers the given {@link TableDescriptor} as a catalog table.
+     *
+     * <p>The {@link TableDescriptor descriptor} is converted into a {@link CatalogTable} and stored
+     * in the catalog.
+     *
+     * <p>If the table should not be permanently stored in a catalog, use {@link
+     * #createTemporaryTable(String, TableDescriptor)} instead.
+     *
+     * <p>Examples:
+     *
+     * <pre>{@code
+     * tEnv.createTable("MyTable", TableDescriptor.forConnector("datagen")
+     *   .schema(Schema.newBuilder()
+     *     .column("f0", DataTypes.STRING())
+     *     .build())
+     *   .option(DataGenOptions.ROWS_PER_SECOND, 10)
+     *   .option("fields.f0.kind", "random")
+     *   .build());
+     * }</pre>
+     *
+     * @param path The path under which the table will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param descriptor Template for creating a {@link CatalogTable} instance.
+     */
+    void createTable(String path, TableDescriptor descriptor);
+
+    /**
+     * Registers the given {@link TableDescriptor} as a catalog table.
+     *
+     * <p>The {@link TableDescriptor descriptor} is converted into a {@link CatalogTable} and stored
+     * in the catalog.
+     *
+     * <p>If the table should not be permanently stored in a catalog, use {@link
+     * #createTemporaryTable(String, TableDescriptor, boolean)} instead.
+     *
+     * <p>Examples:
+     *
+     * <pre>{@code
+     * tEnv.createTable("MyTable", TableDescriptor.forConnector("datagen")
+     *   .schema(Schema.newBuilder()
+     *     .column("f0", DataTypes.STRING())
+     *     .build())
+     *   .option(DataGenOptions.ROWS_PER_SECOND, 10)
+     *   .option("fields.f0.kind", "random")
+     *   .build(),
+     *  true);
+     * }</pre>
+     *
+     * @param path The path under which the table will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param descriptor Template for creating a {@link CatalogTable} instance.
+     * @param ignoreIfExists If a table exists under the given path and this flag is set, no
+     *     operation is executed. An exception is thrown otherwise.
+     * @return true if table was created in the given path, false if a permanent object already
+     *     exists in the given path.
+     */
+    boolean createTable(String path, TableDescriptor descriptor, boolean ignoreIfExists);
 
     /**
      * Registers a {@link Table} under a unique name in the TableEnvironment's catalog. Registered
@@ -574,6 +901,112 @@ public interface TableEnvironment {
      * @param view The view to register.
      */
     void createTemporaryView(String path, Table view);
+
+    /**
+     * Registers a {@link Table} API object as a view similar to SQL views.
+     *
+     * <p>Temporary objects can shadow permanent ones. If a temporary object in a given path exists,
+     * the permanent one will be inaccessible in the current session. To make the permanent object
+     * available again one can drop the corresponding temporary object.
+     *
+     * @param path The path under which the view will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param view The view to register.
+     */
+    void createView(String path, Table view);
+
+    /**
+     * Registers a {@link Table} API object as a view similar to SQL views.
+     *
+     * <p>Temporary objects can shadow permanent ones. If a temporary object in a given path exists,
+     * the permanent one will be inaccessible in the current session. To make the permanent object
+     * available again one can drop the corresponding temporary object.
+     *
+     * @param path The path under which the view will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param view The view to register.
+     * @param ignoreIfExists If a view or a table exists and the given flag is set, no operation is
+     *     executed. An exception is thrown otherwise.
+     * @return true if view was created in the given path, false if a permanent object already
+     *     exists in the given path.
+     */
+    boolean createView(String path, Table view, boolean ignoreIfExists);
+
+    /**
+     * Registers the given {@link ModelDescriptor} as a catalog model similar to SQL models.
+     *
+     * <p>The {@link ModelDescriptor descriptor} is converted into a {@link CatalogModel} and stored
+     * in the catalog.
+     *
+     * <p>If the model should not be permanently stored in a catalog, use {@link
+     * #createTemporaryModel(String, ModelDescriptor)} instead.
+     *
+     * <p>Temporary objects can shadow permanent ones. If a temporary object in a given path exists,
+     * the permanent one will be inaccessible in the current session. To make the permanent object
+     * available again one can drop the corresponding temporary object.
+     *
+     * @param path The path under which the model will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param descriptor The descriptor of the model to register.
+     */
+    void createModel(String path, ModelDescriptor descriptor);
+
+    /**
+     * Registers the given {@link ModelDescriptor} as a catalog model similar to SQL models.
+     *
+     * <p>The {@link ModelDescriptor descriptor} is converted into a {@link CatalogModel} and stored
+     * in the catalog.
+     *
+     * <p>If the model should not be permanently stored in a catalog, use {@link
+     * #createTemporaryModel(String, ModelDescriptor)} instead.
+     *
+     * <p>Temporary objects can shadow permanent ones. If a temporary object in a given path exists,
+     * the permanent one will be inaccessible in the current session. To make the permanent object
+     * available again one can drop the corresponding temporary object.
+     *
+     * @param path The path under which the model will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param descriptor Template for creating a {@link CatalogModel} instance.
+     * @param ignoreIfExists If a model exists and the given flag is set, no operation is executed.
+     *     An exception is thrown otherwise.
+     */
+    void createModel(String path, ModelDescriptor descriptor, boolean ignoreIfExists);
+
+    /**
+     * Registers the given {@link ModelDescriptor} as a temporary catalog model similar to SQL
+     * models.
+     *
+     * <p>The {@link ModelDescriptor descriptor} is converted into a {@link CatalogModel} and stored
+     * in the catalog.
+     *
+     * <p>Temporary objects can shadow permanent ones. If a permanent object in a given path exists,
+     * it will be inaccessible in the current session. To make the permanent object available again
+     * one can drop the corresponding temporary object.
+     *
+     * @param path The path under which the model will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param descriptor Template for creating a {@link CatalogModel} instance.
+     */
+    void createTemporaryModel(String path, ModelDescriptor descriptor);
+
+    /**
+     * Registers the given {@link ModelDescriptor} as a temporary catalog model similar to SQL
+     * models.
+     *
+     * <p>The {@link ModelDescriptor descriptor} is converted into a {@link CatalogModel} and stored
+     * in the catalog.
+     *
+     * <p>Temporary objects can shadow permanent ones. If a permanent object in a given path exists,
+     * it will be inaccessible in the current session. To make the permanent object available again
+     * one can drop the corresponding temporary object.
+     *
+     * @param path The path under which the model will be registered. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param descriptor Template for creating a {@link CatalogModel} instance.
+     * @param ignoreIfExists If a model exists and the given flag is set, no operation is executed.
+     *     An exception is thrown otherwise.
+     */
+    void createTemporaryModel(String path, ModelDescriptor descriptor, boolean ignoreIfExists);
 
     /**
      * Scans a registered table and returns the resulting {@link Table}.
@@ -636,79 +1069,154 @@ public interface TableEnvironment {
      * Table tab = tableEnv.from("catalogName.`db.Name`.Table");
      * }</pre>
      *
+     * <p>Note that the returned {@link Table} is an API object and only contains a pipeline
+     * description. It actually corresponds to a <i>view</i> in SQL terms. Call {@link
+     * Table#execute()} to trigger an execution.
+     *
      * @param path The path of a table API object to scan.
-     * @return Either a table or virtual table (=view).
+     * @return The {@link Table} object describing the pipeline for further transformations.
      * @see TableEnvironment#useCatalog(String)
      * @see TableEnvironment#useDatabase(String)
      */
     Table from(String path);
 
     /**
-     * Writes the {@link Table} to a {@link TableSink} that was registered under the specified name.
+     * Returns a {@link Table} backed by the given {@link TableDescriptor descriptor}.
      *
-     * <p>See the documentation of {@link TableEnvironment#useDatabase(String)} or {@link
-     * TableEnvironment#useCatalog(String)} for the rules on the path resolution.
+     * <p>The {@link TableDescriptor descriptor} won't be registered in the catalog, but it will be
+     * propagated directly in the operation tree. Note that calling this method multiple times, even
+     * with the same descriptor, results in multiple temporary tables. In such cases, it is
+     * recommended to register it under a name using {@link #createTemporaryTable(String,
+     * TableDescriptor)} and reference it via {@link #from(String)}.
      *
-     * @param table The Table to write to the sink.
-     * @param sinkPath The first part of the path of the registered {@link TableSink} to which the
-     *     {@link Table} is written. This is to ensure at least the name of the {@link TableSink} is
-     *     provided.
-     * @param sinkPathContinued The remaining part of the path of the registered {@link TableSink}
-     *     to which the {@link Table} is written.
-     * @deprecated use {@link Table#executeInsert(String)} for single sink, use {@link
-     *     TableEnvironment#createStatementSet()} for multiple sinks.
-     */
-    @Deprecated
-    void insertInto(Table table, String sinkPath, String... sinkPathContinued);
-
-    /**
-     * Instructs to write the content of a {@link Table} API object into a table.
-     *
-     * <p>See the documentation of {@link TableEnvironment#useDatabase(String)} or {@link
-     * TableEnvironment#useCatalog(String)} for the rules on the path resolution.
-     *
-     * @param targetPath The path of the registered {@link TableSink} to which the {@link Table} is
-     *     written.
-     * @param table The Table to write to the sink.
-     * @deprecated use {@link Table#executeInsert(String)} for single sink, use {@link
-     *     TableEnvironment#createStatementSet()} for multiple sinks.
-     */
-    @Deprecated
-    void insertInto(String targetPath, Table table);
-
-    /**
-     * Creates a temporary table from a descriptor.
-     *
-     * <p>Descriptors allow for declaring the communication to external systems in an
-     * implementation-agnostic way. The classpath is scanned for suitable table factories that match
-     * the desired configuration.
-     *
-     * <p>The following example shows how to read from a connector using a JSON format and register
-     * a temporary table as "MyTable":
+     * <p>Examples:
      *
      * <pre>{@code
-     * tableEnv
-     *   .connect(
-     *     new ExternalSystemXYZ()
-     *       .version("0.11"))
-     *   .withFormat(
-     *     new Json()
-     *       .jsonSchema("{...}")
-     *       .failOnMissingField(false))
-     *   .withSchema(
-     *     new Schema()
-     *       .field("user-name", "VARCHAR").from("u_name")
-     *       .field("count", "DECIMAL")
-     *   .createTemporaryTable("MyTable");
+     * Table table = tEnv.from(TableDescriptor.forConnector("datagen")
+     *   .schema(Schema.newBuilder()
+     *     .column("f0", DataTypes.STRING())
+     *     .build())
+     *   .build());
      * }</pre>
      *
-     * @param connectorDescriptor connector descriptor describing the external system
-     * @deprecated The SQL {@code CREATE TABLE} DDL is richer than this part of the API. This method
-     *     might be refactored in the next versions. Please use {@link #executeSql(String)
-     *     executeSql(ddl)} to register a table instead.
+     * <p>Note that the returned {@link Table} is an API object and only contains a pipeline
+     * description. It actually corresponds to a <i>view</i> in SQL terms. Call {@link
+     * Table#execute()} to trigger an execution.
+     *
+     * @return The {@link Table} object describing the pipeline for further transformations.
      */
-    @Deprecated
-    ConnectTableDescriptor connect(ConnectorDescriptor connectorDescriptor);
+    Table from(TableDescriptor descriptor);
+
+    /**
+     * Returns a {@link Table} backed by a call to a process table function (PTF).
+     *
+     * <p>A PTF maps zero, one, or multiple tables to a new table. PTFs are the most powerful
+     * function kind for Flink SQL and Table API. They enable implementing user-defined operators
+     * that can be as feature-rich as built-in operations. PTFs have access to Flink's managed
+     * state, event-time and timer services, underlying table changelogs, and can take multiple
+     * partitioned tables to produce a new table.
+     *
+     * <p>This method assumes a call to a previously registered function.
+     *
+     * <p>Example:
+     *
+     * <pre>{@code
+     * env.createFunction("MyPTF", MyPTF.class);
+     *
+     * Table table = env.fromCall(
+     *   "MyPTF",
+     *   table.partitionBy($("key")).asArgument("input_table"),
+     *   lit("Bob").asArgument("default_name"),
+     *   lit(42).asArgument("default_threshold")
+     * );
+     * }</pre>
+     *
+     * <p>A PTF can digest tables either per row (with row semantics) or per set (with set
+     * semantics). For set semantics ({@link ArgumentTrait#SET_SEMANTIC_TABLE}), make sure to
+     * partition the table first using {@link Table#partitionBy(Expression...)}.
+     *
+     * @param path The path of a function.
+     * @param arguments Table and scalar argument {@link Expressions}.
+     * @return The {@link Table} object describing the pipeline for further transformations.
+     * @see Expressions#call(String, Object...)
+     * @see ProcessTableFunction
+     */
+    Table fromCall(String path, Object... arguments);
+
+    /**
+     * Returns a {@link Table} backed by a call to a process table function (PTF).
+     *
+     * <p>A PTF maps zero, one, or multiple tables to a new table. PTFs are the most powerful
+     * function kind for Flink SQL and Table API. They enable implementing user-defined operators
+     * that can be as feature-rich as built-in operations. PTFs have access to Flink's managed
+     * state, event-time and timer services, underlying table changelogs, and can take multiple
+     * partitioned tables to produce a new table.
+     *
+     * <p>This method assumes a call to an unregistered, inline function.
+     *
+     * <p>Example:
+     *
+     * <pre>{@code
+     * Table table = env.fromCall(
+     *   MyPTF.class,
+     *   table.partitionBy($("key")).asArgument("input_table")
+     * );
+     * }</pre>
+     *
+     * <p>A PTF can digest tables either per row (with row semantics) or per set (with set
+     * semantics). For set semantics ({@link ArgumentTrait#SET_SEMANTIC_TABLE}), make sure to
+     * partition the table first using {@link Table#partitionBy(Expression...)}.
+     *
+     * @param function The class containing the function's logic.
+     * @param arguments Table and scalar argument {@link Expressions}.
+     * @return The {@link Table} object describing the pipeline for further transformations.
+     * @see Expressions#call(Class, Object...)
+     * @see ProcessTableFunction
+     */
+    Table fromCall(Class<? extends UserDefinedFunction> function, Object... arguments);
+
+    /**
+     * Returns a {@link Model} object that is backed by the specified model path.
+     *
+     * <p>This method creates a {@link Model} object from a given model path in the catalog. The
+     * model path can be fully or partially qualified (e.g., "catalog.db.model" or just "model"),
+     * depending on the current catalog and database context.
+     *
+     * <p>The returned {@link Model} object can be used for further transformations or as input to
+     * other operations in the Table API.
+     *
+     * <p>Example:
+     *
+     * <pre>{@code
+     * Model model = tableEnv.fromModel("my_model");
+     * }</pre>
+     *
+     * @param modelPath The path of the model in the catalog.
+     * @return The {@link Model} object describing the model resource.
+     */
+    Model fromModel(String modelPath);
+
+    /**
+     * Returns a {@link Model} object that is backed by the specified {@link ModelDescriptor}.
+     *
+     * <p>This method creates a {@link Model} object using the provided {@link ModelDescriptor},
+     * which contains the necessary information to identify and configure the model resource in the
+     * catalog.
+     *
+     * <p>The returned {@link Model} object can be used for further transformations or as input to
+     * other operations in the Table API.
+     *
+     * <p>Example:
+     *
+     * <pre>{@code
+     * ModelDescriptor descriptor = ...;
+     * Model model = tableEnv.from(descriptor);
+     * }</pre>
+     *
+     * @param descriptor The {@link ModelDescriptor} describing the model resource.
+     * @return The {@link Model} object representing the model resource.
+     */
+    Model fromModel(ModelDescriptor descriptor);
 
     /**
      * Gets the names of all catalogs registered in this environment.
@@ -718,11 +1226,19 @@ public interface TableEnvironment {
     String[] listCatalogs();
 
     /**
-     * Gets an array of names of all modules in this environment in the loaded order.
+     * Gets an array of names of all used modules in this environment in resolution order.
      *
-     * @return A list of the names of all modules in the loaded order.
+     * @return A list of the names of used modules in resolution order.
      */
     String[] listModules();
+
+    /**
+     * Gets an array of all loaded modules with use status in this environment. Used modules are
+     * kept in resolution order.
+     *
+     * @return A list of name and use status entries of all loaded modules.
+     */
+    ModuleEntry[] listFullModules();
 
     /**
      * Gets the names of all databases registered in the current catalog.
@@ -743,6 +1259,17 @@ public interface TableEnvironment {
     String[] listTables();
 
     /**
+     * Gets the names of all tables available in the given namespace (the given database of the
+     * given catalog). It returns both temporary and permanent tables and views.
+     *
+     * @return A list of the names of all registered tables in the given database of the given
+     *     catalog.
+     * @see #listTemporaryTables()
+     * @see #listTemporaryViews()
+     */
+    String[] listTables(String catalogName, String databaseName);
+
+    /**
      * Gets the names of all views available in the current namespace (the current database of the
      * current catalog). It returns both temporary and permanent views.
      *
@@ -751,6 +1278,26 @@ public interface TableEnvironment {
      * @see #listTemporaryViews()
      */
     String[] listViews();
+
+    /**
+     * Gets the names of all materialized tables available in the current namespace (the current
+     * database of the current catalog).
+     *
+     * @return A list of the names of all registered materialized tables in the current database of
+     *     the current catalog.
+     * @see #listMaterializedTables(String, String)
+     */
+    String[] listMaterializedTables();
+
+    /**
+     * Gets the names of all materialized tables available in the given namespace (the given
+     * database of the given catalog).
+     *
+     * @return A list of the names of all registered materialized tables in the given database of
+     *     the given catalog.
+     * @see #listMaterializedTables()
+     */
+    String[] listMaterializedTables(String catalogName, String databaseName);
 
     /**
      * Gets the names of all temporary tables and views available in the current namespace (the
@@ -779,14 +1326,69 @@ public interface TableEnvironment {
     String[] listFunctions();
 
     /**
+     * Gets the names of all models available in the current namespace (the current database of the
+     * current catalog). It returns both temporary and permanent models.
+     *
+     * @return A list of the names of all registered models in the current database of the current
+     *     catalog.
+     * @see #listTemporaryModels()
+     */
+    String[] listModels();
+
+    /**
+     * Gets the names of all temporary Models available in the current namespace (the current
+     * database of the current catalog).
+     *
+     * @return A list of the names of all registered temporary models in the current database of the
+     *     current catalog.
+     * @see #listModels()
+     */
+    String[] listTemporaryModels();
+
+    /**
      * Drops a temporary table registered in the given path.
      *
      * <p>If a permanent table with a given path exists, it will be used from now on for any queries
      * that reference this path.
      *
+     * @param path The given path under which the temporary table will be dropped. See also the
+     *     {@link TableEnvironment} class description for the format of the path.
      * @return true if a table existed in the given path and was removed
      */
     boolean dropTemporaryTable(String path);
+
+    /**
+     * Drops a table registered in the given path.
+     *
+     * <p>This method can only drop permanent objects. Temporary objects can shadow permanent ones.
+     * If a temporary object exists in a given path, make sure to drop the temporary object first
+     * using {@link #dropTemporaryTable}.
+     *
+     * <p>Compared to SQL, this method will not throw an error if the table does not exist. Use
+     * {@link #dropTable(java.lang.String, boolean)} to change the default behavior.
+     *
+     * @param path The given path under which the table will be dropped. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @return true if table existed in the given path and was dropped, false if table didn't exist
+     *     in the given path.
+     */
+    boolean dropTable(String path);
+
+    /**
+     * Drops a table registered in the given path.
+     *
+     * <p>This method can only drop permanent objects. Temporary objects can shadow permanent ones.
+     * If a temporary object exists in a given path, make sure to drop the temporary object first
+     * using {@link #dropTemporaryTable}.
+     *
+     * @param path The given path under which the given table will be dropped. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param ignoreIfNotExists If false exception will be thrown if the view to drop does not
+     *     exist.
+     * @return true if table existed in the given path and was dropped, false if table didn't exist
+     *     in the given path.
+     */
+    boolean dropTable(String path, boolean ignoreIfNotExists);
 
     /**
      * Drops a temporary view registered in the given path.
@@ -794,40 +1396,86 @@ public interface TableEnvironment {
      * <p>If a permanent table or view with a given path exists, it will be used from now on for any
      * queries that reference this path.
      *
+     * @param path The given path under which the temporary view will be dropped. See also the
+     *     {@link TableEnvironment} class description for the format of the path.
      * @return true if a view existed in the given path and was removed
      */
     boolean dropTemporaryView(String path);
 
     /**
-     * Returns the AST of the specified Table API and SQL queries and the execution plan to compute
-     * the result of the given {@link Table}.
+     * Drops a view registered in the given path.
      *
-     * @param table The table for which the AST and execution plan will be returned.
-     * @deprecated use {@link Table#explain(ExplainDetail...)}.
+     * <p>This method can only drop permanent objects. Temporary objects can shadow permanent ones.
+     * If a temporary object exists in a given path, make sure to drop the temporary object first
+     * using {@link #dropTemporaryView}.
+     *
+     * <p>Compared to SQL, this method will not throw an error if the view does not exist. Use
+     * {@link #dropView(java.lang.String, boolean)} to change the default behavior.
+     *
+     * @param path The given path under which the view will be dropped. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @return true if view existed in the given path and was dropped, false if view didn't exist in
+     *     the given path.
      */
-    @Deprecated
-    String explain(Table table);
+    boolean dropView(String path);
 
     /**
-     * Returns the AST of the specified Table API and SQL queries and the execution plan to compute
-     * the result of the given {@link Table}.
+     * Drops a view registered in the given path.
      *
-     * @param table The table for which the AST and execution plan will be returned.
-     * @param extended if the plan should contain additional properties, e.g. estimated cost, traits
-     * @deprecated use {@link Table#explain(ExplainDetail...)}.
+     * <p>This method can only drop permanent objects. Temporary objects can shadow permanent ones.
+     * If a temporary object exists in a given path, make sure to drop the temporary object first
+     * using {@link #dropTemporaryView}.
+     *
+     * @param path The given path under which the view will be dropped. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param ignoreIfNotExists If false exception will be thrown if the view to drop does not
+     *     exist.
+     * @return true if view existed in the given path and was dropped, false if view didn't exist in
+     *     the given path and ignoreIfNotExists was true.
      */
-    @Deprecated
-    String explain(Table table, boolean extended);
+    boolean dropView(String path, boolean ignoreIfNotExists);
 
     /**
-     * Returns the AST of the specified Table API and SQL queries and the execution plan to compute
-     * the result of multiple-sinks plan.
+     * Drops a model registered in the given path.
      *
-     * @param extended if the plan should contain additional properties, e.g. estimated cost, traits
-     * @deprecated use {@link StatementSet#explain(ExplainDetail...)}.
+     * <p>This method can only drop permanent objects. Temporary objects can shadow permanent ones.
+     * If a temporary object exists in a given path, make sure to drop the temporary object first
+     * using {@link #dropTemporaryModel}.
+     *
+     * @param path The given path under which the model will be dropped. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @return true if model existed in the given path and was dropped, false if model didn't exist
+     *     in the given path.
      */
-    @Deprecated
-    String explain(boolean extended);
+    boolean dropModel(String path);
+
+    /**
+     * Drops a model registered in the given path.
+     *
+     * <p>This method can only drop permanent objects. Temporary objects can shadow permanent ones.
+     * If a temporary object exists in a given path, make sure to drop the temporary object first
+     * using {@link #dropTemporaryModel}.
+     *
+     * @param path The given path under which the model will be dropped. See also the {@link
+     *     TableEnvironment} class description for the format of the path.
+     * @param ignoreIfNotExists If false exception will be thrown if the model to drop does not
+     *     exist.
+     * @return true if model existed in the given path and was dropped, false if model didn't exist
+     *     in the given path.
+     */
+    boolean dropModel(String path, boolean ignoreIfNotExists);
+
+    /**
+     * Drops a temporary model registered in the given path.
+     *
+     * <p>If a permanent model with a given path exists, it will be used from now on for any queries
+     * that reference this path.
+     *
+     * @param path The given path under which the temporary model will be dropped. See also the
+     *     {@link TableEnvironment} class description for the format of the path.
+     * @return true if a model existed in the given path and was removed
+     */
+    boolean dropTemporaryModel(String path);
 
     /**
      * Returns the AST of the specified statement and the execution plan to compute the result of
@@ -838,7 +1486,21 @@ public interface TableEnvironment {
      *     estimated cost, changelog mode for streaming, displaying execution plan in json format
      * @return AST and the execution plan.
      */
-    String explainSql(String statement, ExplainDetail... extraDetails);
+    default String explainSql(String statement, ExplainDetail... extraDetails) {
+        return explainSql(statement, ExplainFormat.TEXT, extraDetails);
+    }
+
+    /**
+     * Returns the AST of the specified statement and the execution plan to compute the result of
+     * the given statement.
+     *
+     * @param statement The statement for which the AST and execution plan will be returned.
+     * @param format The output format of explained plan.
+     * @param extraDetails The extra explain details which the explain result should include, e.g.
+     *     estimated cost, changelog mode for streaming, displaying execution plan in json format
+     * @return AST and the execution plan.
+     */
+    String explainSql(String statement, ExplainFormat format, ExplainDetail... extraDetails);
 
     /**
      * Returns completion hints for the given statement at the given cursor position. The completion
@@ -853,117 +1515,52 @@ public interface TableEnvironment {
     String[] getCompletionHints(String statement, int position);
 
     /**
-     * Evaluates a SQL query on registered tables and retrieves the result as a {@link Table}.
+     * Evaluates a SQL query on registered tables and returns a {@link Table} object describing the
+     * pipeline for further transformations.
      *
-     * <p>All tables referenced by the query must be registered in the TableEnvironment. A {@link
-     * Table} is automatically registered when its {@link Table#toString()} method is called, for
-     * example when it is embedded into a String. Hence, SQL queries can directly reference a {@link
-     * Table} as follows:
+     * <p>All tables and other objects referenced by the query must be registered in the {@link
+     * TableEnvironment}. For example, use {@link #createTemporaryView(String, Table)}) for
+     * referencing a {@link Table} object or {@link #createTemporarySystemFunction(String, Class)}
+     * for functions.
+     *
+     * <p>Alternatively, a {@link Table} object is automatically registered when its {@link
+     * Table#toString()} method is called, for example when it is embedded into a string. Hence, SQL
+     * queries can directly reference a {@link Table} object inline (i.e. anonymous) as follows:
      *
      * <pre>{@code
      * Table table = ...;
      * String tableName = table.toString();
      * // the table is not registered to the table environment
-     * tEnv.sqlQuery("SELECT * FROM tableName");
+     * tEnv.sqlQuery("SELECT * FROM " + tableName + " WHERE a > 12");
      * }</pre>
      *
+     * <p>Note that the returned {@link Table} is an API object and only contains a pipeline
+     * description. It actually corresponds to a <i>view</i> in SQL terms. Call {@link
+     * Table#execute()} to trigger an execution or use {@link #executeSql(String)} directly.
+     *
      * @param query The SQL query to evaluate.
-     * @return The result of the query as Table
+     * @return The {@link Table} object describing the pipeline for further transformations.
      */
     Table sqlQuery(String query);
 
     /**
-     * Execute the given single statement, and return the execution result.
+     * Executes the given single statement and returns the execution result.
      *
      * <p>The statement can be DDL/DML/DQL/SHOW/DESCRIBE/EXPLAIN/USE. For DML and DQL, this method
-     * returns TableResult once the job has been submitted. For DDL and DCL statements, TableResult
-     * is returned once the operation has finished.
+     * returns {@link TableResult} once the job has been submitted. For DDL and DCL statements,
+     * {@link TableResult} is returned once the operation has finished.
+     *
+     * <p>If multiple pipelines should insert data into one or more sink tables as part of a single
+     * execution, use a {@link StatementSet} (see {@link TableEnvironment#createStatementSet()}).
+     *
+     * <p>By default, all DML operations are executed asynchronously. Use {@link
+     * TableResult#await()} or {@link TableResult#getJobClient()} to monitor the execution. Set
+     * {@link TableConfigOptions#TABLE_DML_SYNC} for always synchronous execution.
      *
      * @return content for DQL/SHOW/DESCRIBE/EXPLAIN, the affected row count for `DML` (-1 means
      *     unknown), or a string message ("OK") for other statements.
      */
     TableResult executeSql(String statement);
-
-    /**
-     * Evaluates a SQL statement such as INSERT, UPDATE or DELETE; or a DDL statement; NOTE:
-     * Currently only SQL INSERT statements and CREATE TABLE statements are supported.
-     *
-     * <p>All tables referenced by the query must be registered in the TableEnvironment. A {@link
-     * Table} is automatically registered when its {@link Table#toString()} method is called, for
-     * example when it is embedded into a String. Hence, SQL queries can directly reference a {@link
-     * Table} as follows:
-     *
-     * <pre>{@code
-     * // register the configured table sink into which the result is inserted.
-     * tEnv.registerTableSinkInternal("sinkTable", configuredSink);
-     * Table sourceTable = ...
-     * String tableName = sourceTable.toString();
-     * // sourceTable is not registered to the table environment
-     * tEnv.sqlUpdate(s"INSERT INTO sinkTable SELECT * FROM tableName");
-     * }</pre>
-     *
-     * <p>A DDL statement can also be executed to create a table: For example, the below DDL
-     * statement would create a CSV table named `tbl1` into the current catalog:
-     *
-     * <blockquote>
-     *
-     * <pre>
-     *    create table tbl1(
-     *      a int,
-     *      b bigint,
-     *      c varchar
-     *    ) with (
-     *      'connector.type' = 'filesystem',
-     *      'format.type' = 'csv',
-     *      'connector.path' = 'xxx'
-     *    )
-     * </pre>
-     *
-     * </blockquote>
-     *
-     * <p>SQL queries can directly execute as follows:
-     *
-     * <blockquote>
-     *
-     * <pre>
-     *    String sinkDDL = "create table sinkTable(
-     *                        a int,
-     *                        b varchar
-     *                      ) with (
-     *                        'connector.type' = 'filesystem',
-     *                        'format.type' = 'csv',
-     *                        'connector.path' = 'xxx'
-     *                      )";
-     *
-     *    String sourceDDL ="create table sourceTable(
-     *                        a int,
-     *                        b varchar
-     *                      ) with (
-     *                        'connector.type' = 'kafka',
-     *                        'update-mode' = 'append',
-     *                        'connector.topic' = 'xxx',
-     *                        'connector.properties.bootstrap.servers' = 'localhost:9092',
-     *                        ...
-     *                      )";
-     *
-     *    String query = "INSERT INTO sinkTable SELECT * FROM sourceTable";
-     *
-     *    tEnv.sqlUpdate(sourceDDL);
-     *    tEnv.sqlUpdate(sinkDDL);
-     *    tEnv.sqlUpdate(query);
-     *    tEnv.execute("MyJob");
-     * </pre>
-     *
-     * </blockquote>
-     *
-     * <p>This code snippet creates a job to read data from Kafka source into a CSV sink.
-     *
-     * @param stmt The SQL statement to evaluate.
-     * @deprecated use {@link #executeSql(String)} for single statement, use {@link
-     *     TableEnvironment#createStatementSet()} for multiple DML statements.
-     */
-    @Deprecated
-    void sqlUpdate(String stmt);
 
     /**
      * Gets the current default catalog name of the current session.
@@ -1029,10 +1626,13 @@ public interface TableEnvironment {
      *     </tbody>
      * </table>
      *
+     * <p>You can unset the current catalog by passing a null value. If the current catalog is
+     * unset, you need to use fully qualified identifiers.
+     *
      * @param catalogName The name of the catalog to set as the current default catalog.
      * @see TableEnvironment#useDatabase(String)
      */
-    void useCatalog(String catalogName);
+    void useCatalog(@Nullable String catalogName);
 
     /**
      * Gets the current default database name of the running session.
@@ -1098,43 +1698,70 @@ public interface TableEnvironment {
      *     </tbody>
      * </table>
      *
+     * <p>You can unset the current database by passing a null value. If the current database is
+     * unset, you need to qualify identifiers at least with the database name.
+     *
      * @param databaseName The name of the database to set as the current database.
      * @see TableEnvironment#useCatalog(String)
      */
-    void useDatabase(String databaseName);
+    void useDatabase(@Nullable String databaseName);
 
     /** Returns the table config that defines the runtime behavior of the Table API. */
     TableConfig getConfig();
 
     /**
-     * Triggers the program execution. The environment will execute all parts of the program.
-     *
-     * <p>The program execution will be logged and displayed with the provided name
-     *
-     * <p><b>NOTE:</b>It is highly advised to set all parameters in the {@link TableConfig} on the
-     * very beginning of the program. It is undefined what configurations values will be used for
-     * the execution if queries are mixed with config changes. It depends on the characteristic of
-     * the particular parameter. For some of them the value from the point in time of query
-     * construction (e.g. the currentCatalog) will be used. On the other hand some values might be
-     * evaluated according to the state from the time when this method is called (e.g. timeZone).
-     *
-     * <p>Once the execution finishes, any previously defined DMLs will be cleared, no matter
-     * whether the execution succeeds or not. Therefore, if you want to retry in case of failures,
-     * you have to re-define the DMLs, i.e. by calling {@link #sqlUpdate(String)}, before you call
-     * this method again.
-     *
-     * @param jobName Desired name of the job
-     * @return The result of the job execution, containing elapsed time and accumulators.
-     * @throws Exception which occurs during job execution.
-     * @deprecated use {@link #executeSql(String)} or {@link Table#executeInsert(String)} for single
-     *     sink, use {@link #createStatementSet()} for multiple sinks.
-     */
-    @Deprecated
-    JobExecutionResult execute(String jobName) throws Exception;
-
-    /**
-     * Create a {@link StatementSet} instance which accepts DML statements or Tables, the planner
-     * can optimize all added statements and Tables together and then submit as one job.
+     * Returns a {@link StatementSet} that accepts pipelines defined by DML statements or {@link
+     * Table} objects. The planner can optimize all added statements together and then submit them
+     * as one job.
      */
     StatementSet createStatementSet();
+
+    // --- Plan compilation and restore
+
+    /**
+     * Loads a plan from a {@link PlanReference} into a {@link CompiledPlan}.
+     *
+     * <p>Compiled plans can be persisted and reloaded across Flink versions. They describe static
+     * pipelines to ensure backwards compatibility and enable stateful streaming job upgrades. See
+     * {@link CompiledPlan} and the website documentation for more information.
+     *
+     * <p>This method will parse the input reference and will validate the plan. The returned
+     * instance can be executed via {@link CompiledPlan#execute()}.
+     *
+     * <p>Note: The compiled plan feature is not supported in batch mode.
+     *
+     * @throws TableException if the plan cannot be loaded from the filesystem, or from classpath
+     *     resources, or if the plan is invalid.
+     */
+    @Experimental
+    CompiledPlan loadPlan(PlanReference planReference) throws TableException;
+
+    /**
+     * Compiles a SQL DML statement into a {@link CompiledPlan}.
+     *
+     * <p>Compiled plans can be persisted and reloaded across Flink versions. They describe static
+     * pipelines to ensure backwards compatibility and enable stateful streaming job upgrades. See
+     * {@link CompiledPlan} and the website documentation for more information.
+     *
+     * <p>Note: Only {@code INSERT INTO} is supported at the moment.
+     *
+     * <p>Note: The compiled plan feature is not supported in batch mode.
+     *
+     * @see CompiledPlan#execute()
+     * @see #loadPlan(PlanReference)
+     * @throws TableException if the SQL statement is invalid or if the plan cannot be persisted.
+     */
+    @Experimental
+    CompiledPlan compilePlanSql(String stmt) throws TableException;
+
+    /**
+     * Shorthand for {@code tEnv.loadPlan(planReference).execute()}.
+     *
+     * @see #loadPlan(PlanReference)
+     * @see CompiledPlan#execute()
+     */
+    @Experimental
+    default TableResult executePlan(PlanReference planReference) throws TableException {
+        return loadPlan(planReference).execute();
+    }
 }

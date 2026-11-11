@@ -19,27 +19,25 @@
 package org.apache.flink.queryablestate.network;
 
 import org.apache.flink.configuration.ConfigConstants;
+import org.apache.flink.core.testutils.OneShotLatch;
 import org.apache.flink.queryablestate.network.messages.MessageBody;
 import org.apache.flink.queryablestate.network.messages.MessageDeserializer;
 import org.apache.flink.queryablestate.network.messages.MessageSerializer;
 import org.apache.flink.queryablestate.network.stats.AtomicKvStateRequestStats;
 import org.apache.flink.queryablestate.network.stats.DisabledKvStateRequestStats;
 import org.apache.flink.queryablestate.network.stats.KvStateRequestStats;
-import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.Preconditions;
-import org.apache.flink.util.TestLogger;
 
 import org.apache.flink.shaded.netty4.io.netty.buffer.ByteBuf;
+import org.apache.flink.shaded.netty4.io.netty.channel.Channel;
+import org.apache.flink.shaded.netty4.io.netty.channel.ChannelHandlerContext;
 
-import org.junit.Assert;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.ExpectedException;
+import org.junit.jupiter.api.Test;
 
 import java.net.InetAddress;
+import java.net.Socket;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -47,25 +45,20 @@ import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-/** Tests general behavior of the {@link AbstractServerBase}. */
-public class AbstractServerTest extends TestLogger {
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-    @Rule public ExpectedException expectedEx = ExpectedException.none();
+/** Tests general behavior of the {@link AbstractServerBase}. */
+class AbstractServerTest {
 
     /**
      * Tests that in case of port collision, a FlinkRuntimeException is thrown with a specific
      * message.
      */
     @Test
-    public void testServerInitializationFailure() throws Throwable {
+    void testServerInitializationFailure() throws Throwable {
 
-        // the expected exception along with the adequate message
-        expectedEx.expect(FlinkRuntimeException.class);
-        expectedEx.expectMessage(
-                "Unable to start Test Server 2. All ports in provided range are occupied.");
-
-        List<Integer> portList = new ArrayList<>();
-        portList.add(7777);
+        List<Integer> portList = Collections.singletonList(0);
 
         try (TestServer server1 =
                 new TestServer(
@@ -78,7 +71,10 @@ public class AbstractServerTest extends TestLogger {
                             new DisabledKvStateRequestStats(),
                             Collections.singletonList(server1.getServerAddress().getPort())
                                     .iterator())) {
-                server2.start();
+                // the expected exception along with the adequate message
+                assertThatThrownBy(() -> server2.start())
+                        .hasMessage(
+                                "Unable to start Test Server 2. All ports in provided range are occupied.");
             }
         }
     }
@@ -88,7 +84,7 @@ public class AbstractServerTest extends TestLogger {
      * to the next port in the range.
      */
     @Test
-    public void testPortRangeSuccess() throws Throwable {
+    void testPortRangeSuccess() throws Throwable {
 
         AtomicKvStateRequestStats serverStats1 = new AtomicKvStateRequestStats();
         AtomicKvStateRequestStats serverStats2 = new AtomicKvStateRequestStats();
@@ -114,39 +110,78 @@ public class AbstractServerTest extends TestLogger {
                                         new TestMessage.TestMessageDeserializer()),
                                 clientStats)) {
             server1.start();
-            Assert.assertTrue(
-                    server1.getServerAddress().getPort() >= portRangeStart
-                            && server1.getServerAddress().getPort() <= portRangeEnd);
+            assertThat(server1.getServerAddress().getPort()).isGreaterThanOrEqualTo(portRangeStart);
+            assertThat(server1.getServerAddress().getPort()).isLessThanOrEqualTo(portRangeEnd);
 
             server2.start();
-            Assert.assertTrue(
-                    server2.getServerAddress().getPort() >= portRangeStart
-                            && server2.getServerAddress().getPort() <= portRangeEnd);
+            assertThat(server2.getServerAddress().getPort()).isGreaterThanOrEqualTo(portRangeStart);
+            assertThat(server2.getServerAddress().getPort()).isLessThanOrEqualTo(portRangeEnd);
 
             TestMessage response1 =
                     client.sendRequest(server1.getServerAddress(), new TestMessage("ping")).join();
-            Assert.assertEquals(server1.getServerName() + "-ping", response1.getMessage());
+            assertThat(response1.getMessage()).isEqualTo(server1.getServerName() + "-ping");
 
             TestMessage response2 =
                     client.sendRequest(server2.getServerAddress(), new TestMessage("pong")).join();
-            Assert.assertEquals(server2.getServerName() + "-pong", response2.getMessage());
+            assertThat(response2.getMessage()).isEqualTo(server2.getServerName() + "-pong");
 
-            Assert.assertEquals(1L, serverStats1.getNumConnections());
-            Assert.assertEquals(1L, serverStats2.getNumConnections());
+            assertThat(serverStats1.getNumConnections()).isEqualTo(1L);
+            assertThat(serverStats2.getNumConnections()).isEqualTo(1L);
 
-            Assert.assertEquals(2L, clientStats.getNumConnections());
-            Assert.assertEquals(0L, clientStats.getNumFailed());
-            Assert.assertEquals(2L, clientStats.getNumSuccessful());
-            Assert.assertEquals(2L, clientStats.getNumRequests());
+            assertThat(clientStats.getNumConnections()).isEqualTo(2L);
+            assertThat(clientStats.getNumFailed()).isEqualTo(0L);
+            assertThat(clientStats.getNumSuccessful()).isEqualTo(2L);
+            assertThat(clientStats.getNumRequests()).isEqualTo(2L);
         }
 
-        Assert.assertEquals(0L, serverStats1.getNumConnections());
-        Assert.assertEquals(0L, serverStats2.getNumConnections());
+        assertThat(serverStats1.getNumConnections()).isEqualTo(0L);
+        assertThat(serverStats2.getNumConnections()).isEqualTo(0L);
 
-        Assert.assertEquals(0L, clientStats.getNumConnections());
-        Assert.assertEquals(0L, clientStats.getNumFailed());
-        Assert.assertEquals(2L, clientStats.getNumSuccessful());
-        Assert.assertEquals(2L, clientStats.getNumRequests());
+        assertThat(clientStats.getNumConnections()).isEqualTo(0L);
+        assertThat(clientStats.getNumFailed()).isEqualTo(0L);
+        assertThat(clientStats.getNumSuccessful()).isEqualTo(2L);
+        assertThat(clientStats.getNumRequests()).isEqualTo(2L);
+    }
+
+    /**
+     * Tests that shutting down the server closes the server channel and the accepted channels, also
+     * when the event loop is busy at the time of the shutdown.
+     */
+    @Test
+    void testShutdownClosesChannelsWhileEventLoopIsBusy() throws Throwable {
+        AtomicKvStateRequestStats serverStats = new AtomicKvStateRequestStats();
+
+        try (TestServer server =
+                        new TestServer(
+                                "Test Server",
+                                serverStats,
+                                Collections.singletonList(0).iterator());
+                Socket client = new Socket()) {
+            server.start();
+            client.connect(server.getServerAddress());
+
+            Channel acceptedChannel = server.getAcceptedChannel().get();
+            assertThat(serverStats.getNumConnections()).isEqualTo(1L);
+
+            OneShotLatch taskRunning = new OneShotLatch();
+            OneShotLatch releaseTask = new OneShotLatch();
+            acceptedChannel
+                    .eventLoop()
+                    .execute(
+                            () -> {
+                                taskRunning.trigger();
+                                releaseTask.awaitQuietly();
+                            });
+            taskRunning.await();
+
+            CompletableFuture<Void> shutdownFuture = server.shutdownServer();
+            releaseTask.trigger();
+            shutdownFuture.get();
+
+            assertThat(acceptedChannel.isOpen()).isFalse();
+            assertThat(acceptedChannel.parent().isOpen()).isFalse();
+            assertThat(serverStats.getNumConnections()).isEqualTo(0L);
+        }
     }
 
     private static class TestClient extends Client<TestMessage, TestMessage>
@@ -163,7 +198,7 @@ public class AbstractServerTest extends TestLogger {
         @Override
         public void close() throws Exception {
             shutdown().join();
-            Assert.assertTrue(isEventGroupShutdown());
+            assertThat(isEventGroupShutdown()).isTrue();
         }
     }
 
@@ -175,6 +210,8 @@ public class AbstractServerTest extends TestLogger {
             implements AutoCloseable {
 
         private final KvStateRequestStats requestStats;
+
+        private final CompletableFuture<Channel> acceptedChannel = new CompletableFuture<>();
 
         TestServer(String name, KvStateRequestStats stats, Iterator<Integer> bindPort)
                 throws UnknownHostException {
@@ -192,6 +229,12 @@ public class AbstractServerTest extends TestLogger {
                     requestStats) {
 
                 @Override
+                public void channelActive(ChannelHandlerContext ctx) throws Exception {
+                    super.channelActive(ctx);
+                    acceptedChannel.complete(ctx.channel());
+                }
+
+                @Override
                 public CompletableFuture<TestMessage> handleRequest(
                         long requestId, TestMessage request) {
                     TestMessage response =
@@ -206,11 +249,16 @@ public class AbstractServerTest extends TestLogger {
             };
         }
 
+        /** Returns the first channel that this server accepted. */
+        CompletableFuture<Channel> getAcceptedChannel() {
+            return acceptedChannel;
+        }
+
         @Override
         public void close() throws Exception {
             shutdownServer().get();
-            Assert.assertTrue(getQueryExecutor().isTerminated());
-            Assert.assertTrue(isEventGroupShutdown());
+            assertThat(getQueryExecutor().isTerminated()).isTrue();
+            assertThat(isEventGroupShutdown()).isTrue();
         }
     }
 

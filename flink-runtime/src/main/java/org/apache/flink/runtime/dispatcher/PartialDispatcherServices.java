@@ -19,6 +19,7 @@
 package org.apache.flink.runtime.dispatcher;
 
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.core.failure.FailureEnricher;
 import org.apache.flink.runtime.blob.BlobServer;
 import org.apache.flink.runtime.heartbeat.HeartbeatServices;
 import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
@@ -29,6 +30,7 @@ import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import java.util.Collection;
 import java.util.concurrent.Executor;
 
 /**
@@ -49,7 +51,7 @@ public class PartialDispatcherServices {
 
     @Nonnull private final JobManagerMetricGroupFactory jobManagerMetricGroupFactory;
 
-    @Nonnull private final ArchivedExecutionGraphStore archivedExecutionGraphStore;
+    @Nonnull private final ArchivedApplicationStore archivedApplicationStore;
 
     @Nonnull private final FatalErrorHandler fatalErrorHandler;
 
@@ -57,7 +59,11 @@ public class PartialDispatcherServices {
 
     @Nullable private final String metricQueryServiceAddress;
 
+    @Nonnull private final DispatcherOperationCaches operationCaches;
+
     @Nonnull private final Executor ioExecutor;
+
+    @Nonnull private final Collection<FailureEnricher> failureEnrichers;
 
     public PartialDispatcherServices(
             @Nonnull Configuration configuration,
@@ -66,22 +72,26 @@ public class PartialDispatcherServices {
             @Nonnull BlobServer blobServer,
             @Nonnull HeartbeatServices heartbeatServices,
             @Nonnull JobManagerMetricGroupFactory jobManagerMetricGroupFactory,
-            @Nonnull ArchivedExecutionGraphStore archivedExecutionGraphStore,
+            @Nonnull ArchivedApplicationStore archivedApplicationStore,
             @Nonnull FatalErrorHandler fatalErrorHandler,
             @Nonnull HistoryServerArchivist historyServerArchivist,
             @Nullable String metricQueryServiceAddress,
-            @Nonnull Executor ioExecutor) {
+            @Nonnull Executor ioExecutor,
+            @Nonnull DispatcherOperationCaches operationCaches,
+            @Nonnull Collection<FailureEnricher> failureEnrichers) {
         this.configuration = configuration;
         this.highAvailabilityServices = highAvailabilityServices;
         this.resourceManagerGatewayRetriever = resourceManagerGatewayRetriever;
         this.blobServer = blobServer;
         this.heartbeatServices = heartbeatServices;
         this.jobManagerMetricGroupFactory = jobManagerMetricGroupFactory;
-        this.archivedExecutionGraphStore = archivedExecutionGraphStore;
+        this.archivedApplicationStore = archivedApplicationStore;
         this.fatalErrorHandler = fatalErrorHandler;
         this.historyServerArchivist = historyServerArchivist;
         this.metricQueryServiceAddress = metricQueryServiceAddress;
         this.ioExecutor = ioExecutor;
+        this.operationCaches = operationCaches;
+        this.failureEnrichers = failureEnrichers;
     }
 
     @Nonnull
@@ -115,8 +125,8 @@ public class PartialDispatcherServices {
     }
 
     @Nonnull
-    public ArchivedExecutionGraphStore getArchivedExecutionGraphStore() {
-        return archivedExecutionGraphStore;
+    public ArchivedApplicationStore getArchivedApplicationStore() {
+        return archivedApplicationStore;
     }
 
     @Nonnull
@@ -135,7 +145,16 @@ public class PartialDispatcherServices {
     }
 
     @Nonnull
+    public DispatcherOperationCaches getOperationCaches() {
+        return operationCaches;
+    }
+
+    @Nonnull
     public Executor getIoExecutor() {
         return ioExecutor;
+    }
+
+    public Collection<FailureEnricher> getFailureEnrichers() {
+        return failureEnrichers;
     }
 }

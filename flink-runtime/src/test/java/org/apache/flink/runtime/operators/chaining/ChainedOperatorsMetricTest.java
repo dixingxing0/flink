@@ -18,20 +18,22 @@
 
 package org.apache.flink.runtime.operators.chaining;
 
+import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.RichFlatMapFunction;
 import org.apache.flink.api.common.operators.util.UserCodeClassWrapper;
 import org.apache.flink.api.common.typeutils.TypeSerializerFactory;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.metrics.Counter;
-import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
-import org.apache.flink.runtime.jobgraph.JobVertexID;
+import org.apache.flink.metrics.groups.OperatorIOMetricGroup;
+import org.apache.flink.metrics.groups.OperatorMetricGroup;
+import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.metrics.NoOpMetricRegistry;
-import org.apache.flink.runtime.metrics.groups.OperatorIOMetricGroup;
-import org.apache.flink.runtime.metrics.groups.OperatorMetricGroup;
+import org.apache.flink.runtime.metrics.groups.InternalOperatorIOMetricGroup;
+import org.apache.flink.runtime.metrics.groups.InternalOperatorMetricGroup;
 import org.apache.flink.runtime.metrics.groups.TaskIOMetricGroup;
+import org.apache.flink.runtime.metrics.groups.TaskManagerMetricGroup;
 import org.apache.flink.runtime.metrics.groups.TaskMetricGroup;
-import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
 import org.apache.flink.runtime.operators.BatchTask;
 import org.apache.flink.runtime.operators.DriverStrategy;
 import org.apache.flink.runtime.operators.FlatMapDriver;
@@ -44,11 +46,13 @@ import org.apache.flink.runtime.testutils.recordutils.RecordSerializerFactory;
 import org.apache.flink.types.Record;
 import org.apache.flink.util.Collector;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+
+import static org.apache.flink.runtime.executiongraph.ExecutionGraphTestUtils.createExecutionAttemptId;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Metrics related tests for batch task chains. */
 public class ChainedOperatorsMetricTest extends TaskTestBase {
@@ -65,9 +69,10 @@ public class ChainedOperatorsMetricTest extends TaskTestBase {
     private static final String CHAINED_OPERATOR_NAME = "chainedoperator";
 
     @Test
-    public void testOperatorIOMetricReuse() throws Exception {
+    void testOperatorIOMetricReuse() throws Exception {
         // environment
         initEnvironment(MEMORY_MANAGER_SIZE, NETWORK_BUFFER_SIZE);
+
         this.mockEnv =
                 new MockEnvironmentBuilder()
                         .setTaskName(HEAD_OPERATOR_NAME)
@@ -75,15 +80,12 @@ public class ChainedOperatorsMetricTest extends TaskTestBase {
                         .setInputSplitProvider(this.inputSplitProvider)
                         .setBufferSize(NETWORK_BUFFER_SIZE)
                         .setMetricGroup(
-                                new TaskMetricGroup(
-                                        NoOpMetricRegistry.INSTANCE,
-                                        UnregisteredMetricGroups
-                                                .createUnregisteredTaskManagerJobMetricGroup(),
-                                        new JobVertexID(),
-                                        new ExecutionAttemptID(),
-                                        "task",
-                                        0,
-                                        0))
+                                TaskManagerMetricGroup.createTaskManagerMetricGroup(
+                                                NoOpMetricRegistry.INSTANCE,
+                                                "host",
+                                                ResourceID.generate())
+                                        .addJob(new JobID(), "jobName")
+                                        .addTask(createExecutionAttemptId(), "task"))
                         .build();
 
         final int keyCnt = 100;
@@ -102,7 +104,7 @@ public class ChainedOperatorsMetricTest extends TaskTestBase {
 
         testTask.invoke();
 
-        Assert.assertEquals(numRecords * 2 * 2, this.outList.size());
+        assertThat(this.outList).hasSize(numRecords * 2 * 2);
 
         final TaskMetricGroup taskMetricGroup = mockEnv.getMetricGroup();
 
@@ -112,8 +114,8 @@ public class ChainedOperatorsMetricTest extends TaskTestBase {
             final Counter numRecordsInCounter = ioMetricGroup.getNumRecordsInCounter();
             final Counter numRecordsOutCounter = ioMetricGroup.getNumRecordsOutCounter();
 
-            Assert.assertEquals(numRecords, numRecordsInCounter.getCount());
-            Assert.assertEquals(numRecords * 2 * 2, numRecordsOutCounter.getCount());
+            assertThat(numRecordsInCounter.getCount()).isEqualTo(numRecords);
+            assertThat(numRecordsOutCounter.getCount()).isEqualTo(numRecords * 2 * 2);
         }
 
         // verify head operator metrics
@@ -125,21 +127,22 @@ public class ChainedOperatorsMetricTest extends TaskTestBase {
             final Counter numRecordsInCounter = ioMetricGroup.getNumRecordsInCounter();
             final Counter numRecordsOutCounter = ioMetricGroup.getNumRecordsOutCounter();
 
-            Assert.assertEquals(numRecords, numRecordsInCounter.getCount());
-            Assert.assertEquals(numRecords * 2, numRecordsOutCounter.getCount());
+            assertThat(numRecordsInCounter.getCount()).isEqualTo(numRecords);
+            assertThat(numRecordsOutCounter.getCount()).isEqualTo(numRecords * 2);
         }
 
         // verify chained operator metrics
         {
             // this only returns the existing group and doesn't create a new one
-            final OperatorMetricGroup operatorMetricGroup1 =
+            final InternalOperatorMetricGroup operatorMetricGroup1 =
                     taskMetricGroup.getOrAddOperator(CHAINED_OPERATOR_NAME);
-            final OperatorIOMetricGroup ioMetricGroup = operatorMetricGroup1.getIOMetricGroup();
+            final InternalOperatorIOMetricGroup ioMetricGroup =
+                    operatorMetricGroup1.getIOMetricGroup();
             final Counter numRecordsInCounter = ioMetricGroup.getNumRecordsInCounter();
             final Counter numRecordsOutCounter = ioMetricGroup.getNumRecordsOutCounter();
 
-            Assert.assertEquals(numRecords * 2, numRecordsInCounter.getCount());
-            Assert.assertEquals(numRecords * 2 * 2, numRecordsOutCounter.getCount());
+            assertThat(numRecordsInCounter.getCount()).isEqualTo(numRecords * 2);
+            assertThat(numRecordsOutCounter.getCount()).isEqualTo(numRecords * 2 * 2);
         }
     }
 

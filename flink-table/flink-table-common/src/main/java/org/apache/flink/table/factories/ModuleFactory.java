@@ -19,22 +19,55 @@
 package org.apache.flink.table.factories;
 
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.configuration.ConfigOption;
+import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.table.legacy.factories.TableFactory;
 import org.apache.flink.table.module.Module;
+import org.apache.flink.table.module.ModuleException;
 
 import java.util.Map;
+import java.util.Set;
 
 /**
  * A factory to create configured module instances based on string-based properties. See also {@link
- * TableFactory} for more information.
+ * Factory} for more information.
+ *
+ * <p>Note that this interface supports the {@link TableFactory} stack for compatibility purposes.
+ * This is deprecated, however, and new implementations should implement the {@link Factory} stack
+ * instead.
  */
 @PublicEvolving
-public interface ModuleFactory extends TableFactory {
+public interface ModuleFactory extends Factory {
 
-    /**
-     * Creates and configures a {@link Module} using the given properties.
-     *
-     * @param properties normalized properties describing a module.
-     * @return the configured module.
-     */
-    Module createModule(Map<String, String> properties);
+    /** Creates and configures a {@link Module}. */
+    default Module createModule(Context context) {
+        throw new ModuleException("Module factories must implement createModule(Context).");
+    }
+
+    /** Context provided when a module is created. */
+    @PublicEvolving
+    interface Context {
+        /**
+         * Returns the options with which the module is created.
+         *
+         * <p>An implementation should perform validation of these options.
+         */
+        Map<String, String> getOptions();
+
+        /** Gives read-only access to the configuration of the current session. */
+        ReadableConfig getConfiguration();
+
+        /**
+         * Returns the class loader of the current session.
+         *
+         * <p>The class loader is in particular useful for discovering further (nested) factories.
+         */
+        ClassLoader getClassLoader();
+    }
+
+    String factoryIdentifier();
+
+    Set<ConfigOption<?>> requiredOptions();
+
+    Set<ConfigOption<?>> optionalOptions();
 }

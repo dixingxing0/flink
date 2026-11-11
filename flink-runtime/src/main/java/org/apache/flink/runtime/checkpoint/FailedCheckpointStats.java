@@ -29,30 +29,14 @@ import static org.apache.flink.util.Preconditions.checkArgument;
 /**
  * Statistics for a failed checkpoint.
  *
- * <p>The reported statistics are immutable.
+ * <p>The reported statistics are mutable.
  */
-public class FailedCheckpointStats extends AbstractCheckpointStats {
+public class FailedCheckpointStats extends PendingCheckpointStats {
 
     private static final long serialVersionUID = 8000748529515900106L;
 
-    /** Number of acknowledged tasks. */
-    private final int numAcknowledgedSubtasks;
-
-    /** Total checkpoint state size over all subtasks. */
-    private final long stateSize;
-
-    private final long processedData;
-
-    private final long persistedData;
-
     /** Timestamp when the checkpoint was failed at the coordinator. */
     private final long failureTimestamp;
-
-    /**
-     * The latest acknowledged subtask stats if any subtask was acknowledged before failing the
-     * checkpoint.
-     */
-    @Nullable private final SubtaskStateStats latestAcknowledgedSubtask;
 
     /** Optional failure message. */
     @Nullable private final String failureMsg;
@@ -66,9 +50,12 @@ public class FailedCheckpointStats extends AbstractCheckpointStats {
      * @param totalSubtaskCount Total number of subtasks for the checkpoint.
      * @param taskStats Task stats for each involved operator.
      * @param numAcknowledgedSubtasks Number of acknowledged subtasks.
+     * @param checkpointedSize Total persisted data size over all subtasks during the sync and async
+     *     phases of this checkpoint.
      * @param stateSize Total checkpoint state size over all subtasks.
      * @param processedData Processed data during the checkpoint.
      * @param persistedData Persisted data during the checkpoint.
+     * @param unalignedCheckpoint Whether the checkpoint is unaligned.
      * @param failureTimestamp Timestamp when this checkpoint failed.
      * @param latestAcknowledgedSubtask The latest acknowledged subtask stats or <code>null</code>.
      * @param cause Cause of the checkpoint failure or <code>null</code>.
@@ -80,22 +67,30 @@ public class FailedCheckpointStats extends AbstractCheckpointStats {
             int totalSubtaskCount,
             Map<JobVertexID, TaskStateStats> taskStats,
             int numAcknowledgedSubtasks,
+            long checkpointedSize,
             long stateSize,
             long processedData,
             long persistedData,
+            boolean unalignedCheckpoint,
             long failureTimestamp,
             @Nullable SubtaskStateStats latestAcknowledgedSubtask,
             @Nullable Throwable cause) {
 
-        super(checkpointId, triggerTimestamp, props, totalSubtaskCount, taskStats);
+        super(
+                checkpointId,
+                triggerTimestamp,
+                props,
+                totalSubtaskCount,
+                numAcknowledgedSubtasks,
+                taskStats,
+                checkpointedSize,
+                stateSize,
+                processedData,
+                persistedData,
+                unalignedCheckpoint,
+                latestAcknowledgedSubtask);
         checkArgument(numAcknowledgedSubtasks >= 0, "Negative number of ACKs");
-        this.numAcknowledgedSubtasks = numAcknowledgedSubtasks;
-        checkArgument(stateSize >= 0, "Negative state size");
-        this.stateSize = stateSize;
-        this.processedData = processedData;
-        this.persistedData = persistedData;
         this.failureTimestamp = failureTimestamp;
-        this.latestAcknowledgedSubtask = latestAcknowledgedSubtask;
         this.failureMsg = cause != null ? cause.getMessage() : null;
     }
 
@@ -104,41 +99,11 @@ public class FailedCheckpointStats extends AbstractCheckpointStats {
         return CheckpointStatsStatus.FAILED;
     }
 
-    @Override
-    public int getNumberOfAcknowledgedSubtasks() {
-        return numAcknowledgedSubtasks;
-    }
-
-    @Override
-    public long getStateSize() {
-        return stateSize;
-    }
-
-    @Override
-    public long getProcessedData() {
-        return processedData;
-    }
-
-    @Override
-    public long getPersistedData() {
-        return persistedData;
-    }
-
-    @Override
-    @Nullable
-    public SubtaskStateStats getLatestAcknowledgedSubtaskStats() {
-        return latestAcknowledgedSubtask;
-    }
-
     /** Returns the end to end duration until the checkpoint failure. */
     @Override
     public long getEndToEndDuration() {
         return Math.max(0, failureTimestamp - triggerTimestamp);
     }
-
-    // ------------------------------------------------------------------------
-    // Failed checkpoint specific methods
-    // ------------------------------------------------------------------------
 
     /**
      * Returns the timestamp when this checkpoint failed.

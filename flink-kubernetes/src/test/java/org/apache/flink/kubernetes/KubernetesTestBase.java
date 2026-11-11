@@ -28,22 +28,25 @@ import org.apache.flink.kubernetes.kubeclient.Fabric8FlinkKubeClient;
 import org.apache.flink.kubernetes.kubeclient.FlinkKubeClient;
 import org.apache.flink.kubernetes.utils.Constants;
 import org.apache.flink.runtime.clusterframework.BootstrapTools;
-import org.apache.flink.runtime.concurrent.Executors;
-import org.apache.flink.util.TestLogger;
 
-import io.fabric8.kubernetes.client.KubernetesClient;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.rules.TemporaryFolder;
+import io.fabric8.kubernetes.client.NamespacedKubernetesClient;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.Executors;
 
 /** Base test class for Kubernetes. */
-public class KubernetesTestBase extends TestLogger {
+public class KubernetesTestBase {
+    @RegisterExtension
+    protected final MixedKubernetesServerExtension server =
+            new MixedKubernetesServerExtension(true, true);
 
     protected static final String NAMESPACE = "test";
     protected static final String CLUSTER_ID = "my-flink-cluster1";
@@ -54,10 +57,6 @@ public class KubernetesTestBase extends TestLogger {
             KubernetesConfigOptions.ImagePullPolicy.IfNotPresent;
     protected static final int JOB_MANAGER_MEMORY = 768;
 
-    @Rule public MixedKubernetesServer server = new MixedKubernetesServer(true, true);
-
-    @Rule public TemporaryFolder temporaryFolder = new TemporaryFolder();
-
     protected File flinkConfDir;
 
     protected File hadoopConfDir;
@@ -66,48 +65,54 @@ public class KubernetesTestBase extends TestLogger {
 
     protected final Configuration flinkConfig = new Configuration();
 
-    protected KubernetesClient kubeClient;
+    protected NamespacedKubernetesClient kubeClient;
 
     protected FlinkKubeClient flinkKubeClient;
 
     protected void setupFlinkConfig() {
-        flinkConfig.setString(KubernetesConfigOptions.NAMESPACE, NAMESPACE);
-        flinkConfig.setString(KubernetesConfigOptions.CLUSTER_ID, CLUSTER_ID);
-        flinkConfig.setString(KubernetesConfigOptions.CONTAINER_IMAGE, CONTAINER_IMAGE);
+        flinkConfig.set(KubernetesConfigOptions.NAMESPACE, NAMESPACE);
+        flinkConfig.set(KubernetesConfigOptions.CLUSTER_ID, CLUSTER_ID);
+        flinkConfig.set(KubernetesConfigOptions.CONTAINER_IMAGE, CONTAINER_IMAGE);
         flinkConfig.set(
                 KubernetesConfigOptions.CONTAINER_IMAGE_PULL_POLICY, CONTAINER_IMAGE_PULL_POLICY);
         flinkConfig.set(
                 JobManagerOptions.TOTAL_PROCESS_MEMORY, MemorySize.ofMebiBytes(JOB_MANAGER_MEMORY));
         flinkConfig.set(DeploymentOptionsInternal.CONF_DIR, flinkConfDir.toString());
+        flinkConfig.set(
+                KubernetesConfigOptions.KUBERNETES_TRANSACTIONAL_OPERATION_INITIAL_RETRY_DELAY,
+                Duration.ofMillis(10));
+        flinkConfig.set(
+                KubernetesConfigOptions.KUBERNETES_TRANSACTIONAL_OPERATION_MAX_RETRY_DELAY,
+                Duration.ofMillis(10));
+        flinkConfig.set(KubernetesConfigOptions.KUBERNETES_TRANSACTIONAL_OPERATION_MAX_RETRIES, 2);
     }
 
     protected void onSetup() throws Exception {}
 
-    @Before
-    public final void setup() throws Exception {
-        flinkConfDir = temporaryFolder.newFolder().getAbsoluteFile();
-        hadoopConfDir = temporaryFolder.newFolder().getAbsoluteFile();
-        kerberosDir = temporaryFolder.newFolder().getAbsoluteFile();
+    @BeforeEach
+    void setup(@TempDir File flinkConfDir, @TempDir File hadoopConfDir, @TempDir File kerberosDir)
+            throws Exception {
+        this.flinkConfDir = flinkConfDir.getAbsoluteFile();
+        this.hadoopConfDir = hadoopConfDir.getAbsoluteFile();
+        this.kerberosDir = kerberosDir.getAbsoluteFile();
 
         setupFlinkConfig();
         writeFlinkConfiguration();
 
-        kubeClient = server.getClient().inNamespace(NAMESPACE);
+        kubeClient = server.createClient().inNamespace(NAMESPACE);
         flinkKubeClient =
                 new Fabric8FlinkKubeClient(
-                        flinkConfig, kubeClient, Executors::newDirectExecutorService);
-
+                        flinkConfig, kubeClient, Executors.newSingleThreadScheduledExecutor());
         onSetup();
     }
 
-    @After
-    public void tearDown() throws Exception {
+    @AfterEach
+    void tearDown() throws Exception {
         flinkKubeClient.close();
     }
 
     protected void writeFlinkConfiguration() throws IOException {
-        BootstrapTools.writeConfiguration(
-                this.flinkConfig, new File(flinkConfDir, "flink-conf.yaml"));
+        BootstrapTools.writeConfiguration(this.flinkConfig, new File(flinkConfDir, "config.yaml"));
     }
 
     protected Map<String, String> getCommonLabels() {

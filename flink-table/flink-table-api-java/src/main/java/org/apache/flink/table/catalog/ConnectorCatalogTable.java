@@ -20,16 +20,17 @@ package org.apache.flink.table.catalog;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
-import org.apache.flink.table.api.TableSchema;
-import org.apache.flink.table.sinks.TableSink;
-import org.apache.flink.table.sources.DefinedProctimeAttribute;
-import org.apache.flink.table.sources.DefinedRowtimeAttributes;
-import org.apache.flink.table.sources.RowtimeAttributeDescriptor;
-import org.apache.flink.table.sources.TableSource;
+import org.apache.flink.table.legacy.api.TableSchema;
+import org.apache.flink.table.legacy.sinks.TableSink;
+import org.apache.flink.table.legacy.sources.DefinedProctimeAttribute;
+import org.apache.flink.table.legacy.sources.DefinedRowtimeAttributes;
+import org.apache.flink.table.legacy.sources.RowtimeAttributeDescriptor;
+import org.apache.flink.table.legacy.sources.TableSource;
 import org.apache.flink.table.types.AtomicDataType;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.TimestampKind;
 import org.apache.flink.table.types.logical.TimestampType;
+import org.apache.flink.table.types.utils.DataTypeUtils;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -50,9 +51,6 @@ import java.util.stream.Collectors;
 public class ConnectorCatalogTable<T1, T2> extends AbstractCatalogTable {
     private final TableSource<T1> tableSource;
     private final TableSink<T2> tableSink;
-    // Flag that tells if the tableSource/tableSink is BatchTableSource/BatchTableSink.
-    // NOTES: this should be false in BLINK planner, because BLINK planner always uses
-    // StreamTableSource.
     private final boolean isBatch;
 
     public static <T1> ConnectorCatalogTable<T1, ?> source(
@@ -96,13 +94,6 @@ public class ConnectorCatalogTable<T1, T2> extends AbstractCatalogTable {
     }
 
     @Override
-    public Map<String, String> toProperties() {
-        // This effectively makes sure the table cannot be persisted in a catalog.
-        throw new UnsupportedOperationException(
-                "ConnectorCatalogTable cannot be converted to properties");
-    }
-
-    @Override
     public CatalogTable copy(Map<String, String> options) {
         throw new UnsupportedOperationException(
                 "ConnectorCatalogTable cannot copy with new table options");
@@ -138,6 +129,10 @@ public class ConnectorCatalogTable<T1, T2> extends AbstractCatalogTable {
         if (source instanceof DefinedProctimeAttribute) {
             updateProctimeIndicator((DefinedProctimeAttribute) source, fieldNames, types);
         }
+        if (tableSchema.getPrimaryKey().isPresent()) {
+            String[] pkCols = tableSchema.getPrimaryKey().get().getColumns().toArray(new String[0]);
+            return TableSchema.builder().fields(fieldNames, types).primaryKey(pkCols).build();
+        }
         return TableSchema.builder().fields(fieldNames, types).build();
     }
 
@@ -166,8 +161,7 @@ public class ConnectorCatalogTable<T1, T2> extends AbstractCatalogTable {
             if (fieldNames[i].equals(proctimeAttribute)) {
                 // bridged to timestamp for compatible flink-planner
                 types[i] =
-                        new AtomicDataType(new TimestampType(true, TimestampKind.PROCTIME, 3))
-                                .bridgedTo(java.sql.Timestamp.class);
+                        DataTypeUtils.createProctimeDataType().bridgedTo(java.sql.Timestamp.class);
                 break;
             }
         }

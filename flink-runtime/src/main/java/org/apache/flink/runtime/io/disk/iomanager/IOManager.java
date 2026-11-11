@@ -31,8 +31,11 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.stream.Collectors;
 
 /** The facade for the provided I/O manager services. */
 public abstract class IOManager implements AutoCloseable {
@@ -41,6 +44,8 @@ public abstract class IOManager implements AutoCloseable {
     private static final String DIR_NAME_PREFIX = "io";
 
     private final FileChannelManager fileChannelManager;
+
+    protected final ExecutorService executorService;
 
     // -------------------------------------------------------------------------
     //               Constructors / Destructors
@@ -51,9 +56,18 @@ public abstract class IOManager implements AutoCloseable {
      *
      * @param tempDirs The basic directories for files underlying anonymous channels.
      */
-    protected IOManager(String[] tempDirs) {
+    protected IOManager(String[] tempDirs, ExecutorService executorService) {
         this.fileChannelManager =
                 new FileChannelManagerImpl(Preconditions.checkNotNull(tempDirs), DIR_NAME_PREFIX);
+        if (LOG.isInfoEnabled()) {
+            LOG.info(
+                    "Created a new {} for spilling of task related data to disk (joins, sorting, ...). Used directories:\n\t{}",
+                    FileChannelManager.class.getSimpleName(),
+                    Arrays.stream(fileChannelManager.getPaths())
+                            .map(File::getAbsolutePath)
+                            .collect(Collectors.joining("\n\t")));
+        }
+        this.executorService = executorService;
     }
 
     /** Removes all temporary files. */
@@ -216,4 +230,8 @@ public abstract class IOManager implements AutoCloseable {
      */
     public abstract BulkBlockChannelReader createBulkBlockChannelReader(
             ID channelID, List<MemorySegment> targetSegments, int numBlocks) throws IOException;
+
+    public ExecutorService getExecutorService() {
+        return executorService;
+    }
 }

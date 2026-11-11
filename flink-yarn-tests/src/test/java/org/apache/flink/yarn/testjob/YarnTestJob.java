@@ -20,14 +20,16 @@ package org.apache.flink.yarn.testjob;
 
 import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.sink.DiscardingSink;
-import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
+import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
+import org.apache.flink.streaming.api.functions.source.legacy.RichParallelSourceFunction;
 
 import java.io.IOException;
 import java.io.Serializable;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+
+import static org.apache.flink.util.Preconditions.checkState;
 
 /**
  * Testing job for {@link org.apache.flink.runtime.jobmaster.JobMaster} failover. Covering stream
@@ -41,7 +43,7 @@ public class YarnTestJob {
         env.addSource(new InfiniteSourceFunction(stopJobSignal))
                 .setParallelism(2)
                 .shuffle()
-                .addSink(new DiscardingSink<>())
+                .sinkTo(new DiscardingSink<>())
                 .setParallelism(2);
 
         return env.getStreamGraph().getJobGraph();
@@ -63,6 +65,9 @@ public class YarnTestJob {
         /** Signals that the job should stop. */
         public void signal() {
             try {
+                checkState(
+                        Files.exists(Paths.get(stopJobMarkerFile)),
+                        "Marker file is deleted before signal.");
                 Files.delete(Paths.get(stopJobMarkerFile));
             } catch (final IOException e) {
                 throw new RuntimeException(e);

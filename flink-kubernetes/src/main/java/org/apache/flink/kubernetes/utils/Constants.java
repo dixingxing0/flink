@@ -18,6 +18,9 @@
 
 package org.apache.flink.kubernetes.utils;
 
+import java.util.Arrays;
+import java.util.List;
+
 /** Constants for kubernetes. */
 public class Constants {
 
@@ -25,8 +28,25 @@ public class Constants {
     public static final String API_VERSION = "v1";
     public static final String APPS_API_VERSION = "apps/v1";
 
+    public static final String DNS_POLICY_DEFAULT = "ClusterFirst";
+    public static final String DNS_POLICY_HOSTNETWORK = "ClusterFirstWithHostNet";
+
     public static final String CONFIG_FILE_LOGBACK_NAME = "logback-console.xml";
     public static final String CONFIG_FILE_LOG4J_NAME = "log4j-console.properties";
+
+    public static final List<String> CONFIG_FILE_NAME_LIST =
+            Arrays.asList(
+                    "logback.xml",
+                    "log4j.properties",
+                    "logback-console.xml",
+                    "log4j-console.properties",
+                    "logback-session.xml",
+                    "log4j-session.properties",
+                    "log4j-cli.properties");
+
+    public static final String ENV_FLINK_LOG_DIR = "FLINK_LOG_DIR";
+
+    public static final String MAIN_CONTAINER_NAME = "flink-main-container";
 
     public static final String FLINK_CONF_VOLUME = "flink-config-volume";
     public static final String CONFIG_MAP_PREFIX = "flink-config-";
@@ -43,6 +63,7 @@ public class Constants {
     public static final String KERBEROS_KRB5CONF_VOLUME = "kerberos-krb5conf-volume";
     public static final String KERBEROS_KRB5CONF_CONFIG_MAP_PREFIX = "kerberos-krb5conf-";
     public static final String KERBEROS_KRB5CONF_MOUNT_DIR = "/etc";
+    public static final String KERBEROS_KRB5CONF_FILE = "krb5.conf";
 
     public static final String FLINK_REST_SERVICE_SUFFIX = "-rest";
 
@@ -55,8 +76,6 @@ public class Constants {
     public static final String LABEL_COMPONENT_KEY = "component";
     public static final String LABEL_COMPONENT_JOB_MANAGER = "jobmanager";
     public static final String LABEL_COMPONENT_TASK_MANAGER = "taskmanager";
-    public static final String LABEL_CONFIGMAP_TYPE_KEY = "configmap-type";
-    public static final String LABEL_CONFIGMAP_TYPE_HIGH_AVAILABILITY = "high-availability";
 
     // Use fixed port in kubernetes, it needs to be exposed.
     public static final int REST_PORT = 8081;
@@ -74,13 +93,13 @@ public class Constants {
 
     public static final String RESOURCE_UNIT_MB = "Mi";
 
-    public static final String ENV_FLINK_CLASSPATH = "FLINK_CLASSPATH";
-
     public static final String ENV_FLINK_POD_IP_ADDRESS = "_POD_IP_ADDRESS";
 
     public static final String POD_IP_FIELD_PATH = "status.podIP";
 
-    public static final String HEADLESS_SERVICE_CLUSTER_IP = "None";
+    public static final String ENV_FLINK_POD_NODE_ID = "_POD_NODE_ID";
+
+    public static final String POD_NODE_ID_FIELD_PATH = "spec.nodeName";
 
     public static final int MAXIMUM_CHARACTERS_OF_CLUSTER_ID = 45;
 
@@ -89,10 +108,32 @@ public class Constants {
     // Constants for Kubernetes high availability
     public static final String LEADER_ADDRESS_KEY = "address";
     public static final String LEADER_SESSION_ID_KEY = "sessionId";
-    public static final String JOB_GRAPH_STORE_KEY_PREFIX = "jobGraph-";
-    public static final String SUBMITTED_JOBGRAPH_FILE_PREFIX = "submittedJobGraph";
-    public static final String RUNNING_JOBS_REGISTRY_KEY_PREFIX = "runningJobsRegistry-";
+    public static final String EXECUTION_PLAN_STORE_KEY_PREFIX = "executionPlan-";
+    public static final String SUBMITTED_EXECUTION_PLAN_FILE_PREFIX = "submittedExecutionPlan";
+    public static final String APPLICATION_STORE_KEY_PREFIX = "application-";
+    public static final String SUBMITTED_APPLICATION_FILE_PREFIX = "submittedApplication";
     public static final String CHECKPOINT_COUNTER_KEY = "counter";
     public static final String CHECKPOINT_ID_KEY_PREFIX = "checkpointID-";
     public static final String COMPLETED_CHECKPOINT_FILE_SUFFIX = "completedCheckpoint";
+
+    // The file name of the mounted task manager pod template in the JobManager pod if there was any
+    // specified.
+    public static final String TASK_MANAGER_POD_TEMPLATE_FILE_NAME =
+            "taskmanager-pod-template.yaml";
+    public static final String POD_TEMPLATE_DIR_IN_POD = "/opt/flink/pod-template";
+    public static final String POD_TEMPLATE_CONFIG_MAP_PREFIX = "pod-template-";
+    public static final String POD_TEMPLATE_VOLUME = "pod-template-volume";
+
+    // Kubernetes start scripts
+    public static final String KUBERNETES_JOB_MANAGER_SCRIPT_PATH = "kubernetes-jobmanager.sh";
+    public static final String KUBERNETES_TASK_MANAGER_SCRIPT_PATH = "kubernetes-taskmanager.sh";
+
+    public static final String ENV_TM_JVM_MEM_OPTS = "FLINK_TM_JVM_MEM_OPTS";
+
+    // "resourceVersion="0" is any resource version.It saves time to access etcd and improves
+    // performance.
+    // https://kubernetes.io/docs/reference/using-api/api-concepts/#the-resourceversion-parameter
+    public static final String KUBERNETES_ZERO_RESOURCE_VERSION = "0";
+
+    public static final String USER_ARTIFACTS_VOLUME = "user-artifacts-volume";
 }

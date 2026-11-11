@@ -21,9 +21,12 @@ package org.apache.flink.runtime.highavailability;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.HighAvailabilityOptions;
 import org.apache.flink.core.fs.Path;
-import org.apache.flink.runtime.concurrent.Executors;
 import org.apache.flink.runtime.jobmanager.HighAvailabilityMode;
+import org.apache.flink.runtime.rest.util.NoOpFatalErrorHandler;
+import org.apache.flink.runtime.rpc.AddressResolution;
+import org.apache.flink.runtime.rpc.RpcSystem;
 import org.apache.flink.util.TestLogger;
+import org.apache.flink.util.concurrent.Executors;
 
 import org.junit.ClassRule;
 import org.junit.Test;
@@ -51,11 +54,12 @@ public class HighAvailabilityServicesUtilsTest extends TestLogger {
 
         Executor executor = Executors.directExecutor();
 
-        config.setString(HighAvailabilityOptions.HA_MODE, TestHAFactory.class.getName());
+        config.set(HighAvailabilityOptions.HA_MODE, TestHAFactory.class.getName());
 
         // when
         HighAvailabilityServices actualHaServices =
-                HighAvailabilityServicesUtils.createAvailableOrEmbeddedServices(config, executor);
+                HighAvailabilityServicesUtils.createAvailableOrEmbeddedServices(
+                        config, executor, NoOpFatalErrorHandler.INSTANCE);
 
         // then
         assertSame(haServices, actualHaServices);
@@ -65,7 +69,10 @@ public class HighAvailabilityServicesUtilsTest extends TestLogger {
                 HighAvailabilityServicesUtils.createHighAvailabilityServices(
                         config,
                         executor,
-                        HighAvailabilityServicesUtils.AddressResolution.NO_ADDRESS_RESOLUTION);
+                        AddressResolution.NO_ADDRESS_RESOLUTION,
+                        RpcSystem.load(),
+                        NoOpFatalErrorHandler.INSTANCE);
+
         // then
         assertSame(haServices, actualHaServices);
     }
@@ -78,11 +85,12 @@ public class HighAvailabilityServicesUtilsTest extends TestLogger {
                 TestingClientHAServices.createClientHAServices();
         TestHAFactory.clientHAServices = clientHAServices;
 
-        config.setString(HighAvailabilityOptions.HA_MODE, TestHAFactory.class.getName());
+        config.set(HighAvailabilityOptions.HA_MODE, TestHAFactory.class.getName());
 
         // when
         ClientHighAvailabilityServices actualClientHAServices =
-                HighAvailabilityServicesUtils.createClientHAService(config);
+                HighAvailabilityServicesUtils.createClientHAService(
+                        config, NoOpFatalErrorHandler.INSTANCE);
 
         // then
         assertSame(clientHAServices, actualClientHAServices);
@@ -94,12 +102,13 @@ public class HighAvailabilityServicesUtilsTest extends TestLogger {
 
         Executor executor = Executors.directExecutor();
 
-        config.setString(
+        config.set(
                 HighAvailabilityOptions.HA_MODE,
                 HighAvailabilityMode.FACTORY_CLASS.name().toLowerCase());
 
         // expect
-        HighAvailabilityServicesUtils.createAvailableOrEmbeddedServices(config, executor);
+        HighAvailabilityServicesUtils.createAvailableOrEmbeddedServices(
+                config, executor, NoOpFatalErrorHandler.INSTANCE);
     }
 
     @Test
@@ -108,8 +117,8 @@ public class HighAvailabilityServicesUtilsTest extends TestLogger {
         final String clusterId = UUID.randomUUID().toString();
         final Configuration configuration = new Configuration();
 
-        configuration.setString(HighAvailabilityOptions.HA_STORAGE_PATH, haStorageRootDirectory);
-        configuration.setString(HighAvailabilityOptions.HA_CLUSTER_ID, clusterId);
+        configuration.set(HighAvailabilityOptions.HA_STORAGE_PATH, haStorageRootDirectory);
+        configuration.set(HighAvailabilityOptions.HA_CLUSTER_ID, clusterId);
 
         final Path clusterHighAvailableStoragePath =
                 HighAvailabilityServicesUtils.getClusterHighAvailableStoragePath(configuration);

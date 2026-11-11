@@ -21,6 +21,7 @@ package org.apache.flink.runtime.state.ttl;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.base.MapSerializer;
 import org.apache.flink.runtime.state.internal.InternalMapState;
+import org.apache.flink.util.CollectionUtil;
 import org.apache.flink.util.FlinkRuntimeException;
 
 import javax.annotation.Nonnull;
@@ -32,6 +33,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Set;
 import java.util.function.Function;
 
 /**
@@ -76,7 +78,7 @@ class TtlMapState<K, N, UK, UV>
         if (map == null) {
             return;
         }
-        Map<UK, TtlValue<UV>> ttlMap = new HashMap<>(map.size());
+        Map<UK, TtlValue<UV>> ttlMap = CollectionUtil.newHashMapWithExpectedSize(map.size());
         long currentTimestamp = timeProvider.currentTimestamp();
         for (Map.Entry<UK, UV> entry : map.entrySet()) {
             UK key = entry.getKey();
@@ -131,9 +133,31 @@ class TtlMapState<K, N, UK, UV>
         return original.isEmpty();
     }
 
+    @Override
+    public boolean isEmptyExcluding(Set<?> excludedKeys) throws Exception {
+        // Ordinary TTL reads can clean up entries and invalidate another active iterator.
+        final Iterable<Map.Entry<UK, TtlValue<UV>>> entries = original.entries();
+        final long now = timeProvider.currentTimestamp();
+        if (entries != null) {
+            for (Map.Entry<UK, TtlValue<UV>> entry : entries) {
+                final TtlValue<UV> value = entry.getValue();
+                if (!excludedKeys.contains(entry.getKey())
+                        && value != null
+                        && (returnExpired || !TtlUtils.expired(value, ttl, now))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     @Nullable
     @Override
     public Map<UK, TtlValue<UV>> getUnexpiredOrNull(@Nonnull Map<UK, TtlValue<UV>> ttlValue) {
+        // the remove operation will clear the whole state if the map becomes empty after init
+        if (ttlValue.isEmpty()) {
+            return ttlValue;
+        }
         Map<UK, TtlValue<UV>> unexpired = new HashMap<>();
         TypeSerializer<TtlValue<UV>> valueSerializer =
                 ((MapSerializer<UK, TtlValue<UV>>) original.getValueSerializer())
@@ -144,7 +168,12 @@ class TtlMapState<K, N, UK, UV>
                 unexpired.put(e.getKey(), valueSerializer.copy(e.getValue()));
             }
         }
-        return ttlValue.size() == unexpired.size() ? ttlValue : unexpired;
+        if (!unexpired.isEmpty()) {
+            return unexpired;
+        } else {
+            // map is not empty but all values expired
+            return null;
+        }
     }
 
     @Override

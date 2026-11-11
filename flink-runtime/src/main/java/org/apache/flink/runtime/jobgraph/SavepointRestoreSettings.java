@@ -19,8 +19,15 @@
 package org.apache.flink.runtime.jobgraph;
 
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.configuration.StateRecoveryOptions;
+import org.apache.flink.core.execution.RecoveryClaimMode;
+
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 
 import java.io.Serializable;
+import java.util.Objects;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
@@ -30,13 +37,11 @@ public class SavepointRestoreSettings implements Serializable {
     private static final long serialVersionUID = 87377506900849777L;
 
     /** No restore should happen. */
-    private static final SavepointRestoreSettings NONE = new SavepointRestoreSettings(null, false);
-
-    /** By default, be strict when restoring from a savepoint. */
-    private static final boolean DEFAULT_ALLOW_NON_RESTORED_STATE = false;
+    private static final SavepointRestoreSettings NONE =
+            new SavepointRestoreSettings(null, null, null);
 
     /** Savepoint restore path. */
-    private final String restorePath;
+    private final @Nullable String restorePath;
 
     /**
      * Flag indicating whether non restored state is allowed if the savepoint contains state for an
@@ -44,15 +49,30 @@ public class SavepointRestoreSettings implements Serializable {
      */
     private final boolean allowNonRestoredState;
 
+    /** Whether {@link #allowNonRestoredState} was explicitly set by the user. */
+    private final boolean allowNonRestoredStateExplicitlySet;
+
+    private final @Nullable RecoveryClaimMode recoveryClaimMode;
+
     /**
      * Creates the restore settings.
      *
      * @param restorePath Savepoint restore path.
-     * @param allowNonRestoredState Ignore unmapped state.
+     * @param allowNonRestoredState Ignore unmapped state, or {@code null} if not explicitly set.
+     * @param recoveryClaimMode how to restore from the savepoint, or {@code null} if not explicitly
+     *     set.
      */
-    private SavepointRestoreSettings(String restorePath, boolean allowNonRestoredState) {
+    private SavepointRestoreSettings(
+            @Nullable String restorePath,
+            @Nullable Boolean allowNonRestoredState,
+            @Nullable RecoveryClaimMode recoveryClaimMode) {
         this.restorePath = restorePath;
-        this.allowNonRestoredState = allowNonRestoredState;
+        this.allowNonRestoredState =
+                allowNonRestoredState != null
+                        ? allowNonRestoredState
+                        : StateRecoveryOptions.SAVEPOINT_IGNORE_UNCLAIMED_STATE.defaultValue();
+        this.recoveryClaimMode = recoveryClaimMode;
+        this.allowNonRestoredStateExplicitlySet = allowNonRestoredState != null;
     }
 
     /**
@@ -84,6 +104,13 @@ public class SavepointRestoreSettings implements Serializable {
         return allowNonRestoredState;
     }
 
+    /** Tells how to restore from the given savepoint. */
+    public RecoveryClaimMode getRecoveryClaimMode() {
+        return recoveryClaimMode != null
+                ? recoveryClaimMode
+                : StateRecoveryOptions.RESTORE_MODE.defaultValue();
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -95,16 +122,18 @@ public class SavepointRestoreSettings implements Serializable {
 
         SavepointRestoreSettings that = (SavepointRestoreSettings) o;
         return allowNonRestoredState == that.allowNonRestoredState
-                && (restorePath != null
-                        ? restorePath.equals(that.restorePath)
-                        : that.restorePath == null);
+                && allowNonRestoredStateExplicitlySet == that.allowNonRestoredStateExplicitlySet
+                && Objects.equals(restorePath, that.restorePath)
+                && Objects.equals(recoveryClaimMode, that.recoveryClaimMode);
     }
 
     @Override
     public int hashCode() {
-        int result = restorePath != null ? restorePath.hashCode() : 0;
-        result = 31 * result + (allowNonRestoredState ? 1 : 0);
-        return result;
+        return Objects.hash(
+                restorePath,
+                allowNonRestoredState,
+                allowNonRestoredStateExplicitlySet,
+                recoveryClaimMode);
     }
 
     @Override
@@ -115,7 +144,9 @@ public class SavepointRestoreSettings implements Serializable {
                     + restorePath
                     + '\''
                     + ", allowNonRestoredState="
-                    + allowNonRestoredState
+                    + allowNonRestoredState()
+                    + ", recoveryClaimMode="
+                    + getRecoveryClaimMode()
                     + ')';
         } else {
             return "SavepointRestoreSettings.none()";
@@ -128,14 +159,34 @@ public class SavepointRestoreSettings implements Serializable {
         return NONE;
     }
 
-    public static SavepointRestoreSettings forPath(String savepointPath) {
-        return forPath(savepointPath, DEFAULT_ALLOW_NON_RESTORED_STATE);
+    public static SavepointRestoreSettings forPath(@Nonnull String savepointPath) {
+        return forPath(savepointPath, null, null);
     }
 
     public static SavepointRestoreSettings forPath(
-            String savepointPath, boolean allowNonRestoredState) {
+            @Nonnull String savepointPath, boolean allowNonRestoredState) {
+        return forPath(savepointPath, allowNonRestoredState, null);
+    }
+
+    /**
+     * Creates restore settings. Parameters that are {@code null} indicate the user did not
+     * explicitly set them — their defaults will be used at runtime and they will not be written to
+     * configuration by {@link #toConfiguration}, allowing downstream configuration (e.g., SQL SET
+     * statements or flink-conf.yaml) to take effect.
+     *
+     * @param savepointPath the savepoint path to restore from.
+     * @param allowNonRestoredState whether to allow non-restored state, or {@code null} if not
+     *     explicitly set by the user.
+     * @param recoveryClaimMode how to restore from the savepoint, or {@code null} if not explicitly
+     *     set by the user.
+     */
+    public static SavepointRestoreSettings forPath(
+            @Nonnull String savepointPath,
+            @Nullable Boolean allowNonRestoredState,
+            @Nullable RecoveryClaimMode recoveryClaimMode) {
         checkNotNull(savepointPath, "Savepoint restore path.");
-        return new SavepointRestoreSettings(savepointPath, allowNonRestoredState);
+        return new SavepointRestoreSettings(
+                savepointPath, allowNonRestoredState, recoveryClaimMode);
     }
 
     // -------------------------- Parsing to and from a configuration object
@@ -144,21 +195,32 @@ public class SavepointRestoreSettings implements Serializable {
     public static void toConfiguration(
             final SavepointRestoreSettings savepointRestoreSettings,
             final Configuration configuration) {
-        configuration.setBoolean(
-                SavepointConfigOptions.SAVEPOINT_IGNORE_UNCLAIMED_STATE,
-                savepointRestoreSettings.allowNonRestoredState());
+        if (savepointRestoreSettings.allowNonRestoredStateExplicitlySet) {
+            configuration.set(
+                    StateRecoveryOptions.SAVEPOINT_IGNORE_UNCLAIMED_STATE,
+                    savepointRestoreSettings.allowNonRestoredState);
+        }
+        if (savepointRestoreSettings.recoveryClaimMode != null) {
+            configuration.set(
+                    StateRecoveryOptions.RESTORE_MODE, savepointRestoreSettings.recoveryClaimMode);
+        }
         final String savepointPath = savepointRestoreSettings.getRestorePath();
         if (savepointPath != null) {
-            configuration.setString(SavepointConfigOptions.SAVEPOINT_PATH, savepointPath);
+            configuration.set(StateRecoveryOptions.SAVEPOINT_PATH, savepointPath);
         }
     }
 
-    public static SavepointRestoreSettings fromConfiguration(final Configuration configuration) {
-        final String savepointPath = configuration.getString(SavepointConfigOptions.SAVEPOINT_PATH);
-        final boolean allowNonRestored =
-                configuration.getBoolean(SavepointConfigOptions.SAVEPOINT_IGNORE_UNCLAIMED_STATE);
-        return savepointPath == null
-                ? SavepointRestoreSettings.none()
-                : SavepointRestoreSettings.forPath(savepointPath, allowNonRestored);
+    public static SavepointRestoreSettings fromConfiguration(final ReadableConfig configuration) {
+        final String savepointPath = configuration.get(StateRecoveryOptions.SAVEPOINT_PATH);
+        if (savepointPath == null) {
+            return SavepointRestoreSettings.none();
+        }
+        final Boolean allowNonRestored =
+                configuration
+                        .getOptional(StateRecoveryOptions.SAVEPOINT_IGNORE_UNCLAIMED_STATE)
+                        .orElse(null);
+        final RecoveryClaimMode recoveryClaimMode =
+                configuration.getOptional(StateRecoveryOptions.RESTORE_MODE).orElse(null);
+        return SavepointRestoreSettings.forPath(savepointPath, allowNonRestored, recoveryClaimMode);
     }
 }

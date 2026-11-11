@@ -18,13 +18,12 @@
 
 package org.apache.flink.runtime.rest.handler.job.checkpoints;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.checkpoint.CheckpointRetentionPolicy;
 import org.apache.flink.runtime.executiongraph.AccessExecutionGraph;
 import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguration;
 import org.apache.flink.runtime.rest.handler.HandlerRequest;
 import org.apache.flink.runtime.rest.handler.RestHandlerException;
-import org.apache.flink.runtime.rest.handler.job.AbstractExecutionGraphHandler;
+import org.apache.flink.runtime.rest.handler.job.AbstractAccessExecutionGraphHandler;
 import org.apache.flink.runtime.rest.handler.legacy.ExecutionGraphCache;
 import org.apache.flink.runtime.rest.messages.EmptyRequestBody;
 import org.apache.flink.runtime.rest.messages.ErrorResponseBody;
@@ -36,12 +35,13 @@ import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointConfigHeader
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointConfigInfo;
 import org.apache.flink.runtime.webmonitor.RestfulGateway;
 import org.apache.flink.runtime.webmonitor.history.ArchivedJson;
-import org.apache.flink.runtime.webmonitor.history.JsonArchivist;
+import org.apache.flink.runtime.webmonitor.history.OnlyExecutionGraphJsonArchivist;
 import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 
 import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.HttpResponseStatus;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Map;
@@ -49,12 +49,12 @@ import java.util.concurrent.Executor;
 
 /** Handler which serves the checkpoint configuration. */
 public class CheckpointConfigHandler
-        extends AbstractExecutionGraphHandler<CheckpointConfigInfo, JobMessageParameters>
-        implements JsonArchivist {
+        extends AbstractAccessExecutionGraphHandler<CheckpointConfigInfo, JobMessageParameters>
+        implements OnlyExecutionGraphJsonArchivist {
 
     public CheckpointConfigHandler(
             GatewayRetriever<? extends RestfulGateway> leaderRetriever,
-            Time timeout,
+            Duration timeout,
             Map<String, String> responseHeaders,
             MessageHeaders<EmptyRequestBody, CheckpointConfigInfo, JobMessageParameters>
                     messageHeaders,
@@ -71,8 +71,7 @@ public class CheckpointConfigHandler
 
     @Override
     protected CheckpointConfigInfo handleRequest(
-            HandlerRequest<EmptyRequestBody, JobMessageParameters> request,
-            AccessExecutionGraph executionGraph)
+            HandlerRequest<EmptyRequestBody> request, AccessExecutionGraph executionGraph)
             throws RestHandlerException {
         return createCheckpointConfigInfo(executionGraph);
     }
@@ -116,6 +115,17 @@ public class CheckpointConfigHandler
                             retentionPolicy != CheckpointRetentionPolicy.RETAIN_ON_CANCELLATION);
 
             String stateBackendName = executionGraph.getStateBackendName().orElse(null);
+            String checkpointStorageName = executionGraph.getCheckpointStorageName().orElse(null);
+            long periodicMaterializeIntervalMillis =
+                    executionGraph
+                            .getArchivedExecutionConfig()
+                            .getPeriodicMaterializeIntervalMillis();
+            String changelogStorageName = executionGraph.getChangelogStorageName().orElse(null);
+
+            boolean stateChangelogEnabled =
+                    executionGraph.isChangelogStateBackendEnabled() != null
+                            ? executionGraph.isChangelogStateBackendEnabled().getOrDefault(false)
+                            : false;
 
             return new CheckpointConfigInfo(
                     checkpointCoordinatorConfiguration.isExactlyOnce()
@@ -127,8 +137,14 @@ public class CheckpointConfigHandler
                     checkpointCoordinatorConfiguration.getMaxConcurrentCheckpoints(),
                     externalizedCheckpointInfo,
                     stateBackendName,
+                    checkpointStorageName,
                     checkpointCoordinatorConfiguration.isUnalignedCheckpointsEnabled(),
-                    checkpointCoordinatorConfiguration.getTolerableCheckpointFailureNumber());
+                    checkpointCoordinatorConfiguration.getTolerableCheckpointFailureNumber(),
+                    checkpointCoordinatorConfiguration.getAlignedCheckpointTimeout(),
+                    checkpointCoordinatorConfiguration.isEnableCheckpointsAfterTasksFinish(),
+                    stateChangelogEnabled,
+                    periodicMaterializeIntervalMillis,
+                    changelogStorageName);
         }
     }
 }

@@ -18,14 +18,20 @@
 
 package org.apache.flink.formats.json.maxwell;
 
-import org.apache.flink.formats.json.JsonOptions;
-import org.apache.flink.formats.json.TimestampFormat;
+import org.apache.flink.formats.common.TimestampFormat;
+import org.apache.flink.formats.json.JsonFormatOptions;
+import org.apache.flink.formats.json.maxwell.MaxwellJsonDecodingFormat.ReadableMetadata;
+import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
+import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.table.types.utils.DataTypeUtils;
+import org.apache.flink.testutils.logging.LoggerAuditingExtension;
 import org.apache.flink.util.Collector;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.io.File;
 import java.io.IOException;
@@ -35,35 +41,140 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 
+import static org.apache.flink.connector.testutils.formats.SchemaTestUtils.open;
+import static org.apache.flink.core.testutils.FlinkAssertions.anyCauseMatches;
 import static org.apache.flink.table.api.DataTypes.FIELD;
 import static org.apache.flink.table.api.DataTypes.FLOAT;
 import static org.apache.flink.table.api.DataTypes.INT;
 import static org.apache.flink.table.api.DataTypes.ROW;
 import static org.apache.flink.table.api.DataTypes.STRING;
-import static org.junit.Assert.assertEquals;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.slf4j.event.Level.DEBUG;
 
 /**
  * Tests for {@link MaxwellJsonSerializationSchema} and {@link MaxwellJsonDeserializationSchema}.
  */
-public class MaxwellJsonSerDerTest {
-    private static final RowType SCHEMA =
-            (RowType)
-                    ROW(
-                                    FIELD("id", INT().notNull()),
-                                    FIELD("name", STRING()),
-                                    FIELD("description", STRING()),
-                                    FIELD("weight", FLOAT()))
-                            .getLogicalType();
+class MaxwellJsonSerDerTest {
+
+    @RegisterExtension
+    public final LoggerAuditingExtension loggerExtension =
+            new LoggerAuditingExtension(MaxwellJsonDeserializationSchema.class, DEBUG);
+
+    private static final DataType PHYSICAL_DATA_TYPE =
+            ROW(
+                    FIELD("id", INT().notNull()),
+                    FIELD("name", STRING()),
+                    FIELD("description", STRING()),
+                    FIELD("weight", FLOAT()));
 
     @Test
-    public void testSerializationDeserialization() throws Exception {
+    void testDeserializationWithMetadata() throws Exception {
+        // we only read the first line for keeping the test simple
+        final String firstLine = readLines("maxwell-data.txt").get(0);
+        final List<ReadableMetadata> requestedMetadata = Arrays.asList(ReadableMetadata.values());
+        final DataType producedDataType =
+                DataTypeUtils.appendRowFields(
+                        PHYSICAL_DATA_TYPE,
+                        requestedMetadata.stream()
+                                .map(m -> DataTypes.FIELD(m.key, m.dataType))
+                                .collect(Collectors.toList()));
+        final MaxwellJsonDeserializationSchema deserializationSchema =
+                new MaxwellJsonDeserializationSchema(
+                        PHYSICAL_DATA_TYPE,
+                        requestedMetadata,
+                        InternalTypeInfo.of(producedDataType.getLogicalType()),
+                        false,
+                        TimestampFormat.ISO_8601);
+        open(deserializationSchema);
+        final SimpleCollector collector = new SimpleCollector();
+        deserializationSchema.deserialize(firstLine.getBytes(StandardCharsets.UTF_8), collector);
+        assertThat(collector.list).hasSize(1);
+        assertThat(collector.list.get(0))
+                .satisfies(
+                        row -> {
+                            assertThat(row.getInt(0)).isEqualTo(101);
+                            assertThat(row.getString(1).toString()).isEqualTo("scooter");
+                            assertThat(row.getString(2).toString())
+                                    .isEqualTo("Small 2-wheel scooter");
+                            assertThat(row.getFloat(3)).isEqualTo(3.14f);
+                            assertThat(row.getString(4).toString()).isEqualTo("test");
+                            assertThat(row.getString(5).toString()).isEqualTo("product");
+                            assertThat(row.getArray(6).getString(0).toString()).isEqualTo("id");
+                            assertThat(row.getTimestamp(7, 3).getMillisecond())
+                                    .isEqualTo(1596684883000L);
+                        });
+    }
+
+    @Test
+    void testIgnoreParseErrors() throws Exception {
         List<String> lines = readLines("maxwell-data.txt");
         MaxwellJsonDeserializationSchema deserializationSchema =
                 new MaxwellJsonDeserializationSchema(
-                        SCHEMA, InternalTypeInfo.of(SCHEMA), false, TimestampFormat.ISO_8601);
+                        PHYSICAL_DATA_TYPE,
+                        Collections.emptyList(),
+                        InternalTypeInfo.of(PHYSICAL_DATA_TYPE.getLogicalType()),
+                        true,
+                        TimestampFormat.ISO_8601);
+        open(deserializationSchema);
+
+        ThrowingExceptionCollector collector = new ThrowingExceptionCollector();
+        assertThatThrownBy(
+                        () -> {
+                            for (String line : lines) {
+                                deserializationSchema.deserialize(
+                                        line.getBytes(StandardCharsets.UTF_8), collector);
+                            }
+                        })
+                .isInstanceOf(RuntimeException.class)
+                .satisfies(
+                        anyCauseMatches(
+                                RuntimeException.class,
+                                "An error occurred while collecting data."));
+    }
+
+    @Test
+    void testIgnoreParseErrorsLogsDebugMessage() throws Exception {
+        String corruptMessage = "{\"data\":null,\"old\":null,\"type\":\"UNKNOWN_TYPE\"}";
+        MaxwellJsonDeserializationSchema deserializationSchema =
+                new MaxwellJsonDeserializationSchema(
+                        PHYSICAL_DATA_TYPE,
+                        Collections.emptyList(),
+                        InternalTypeInfo.of(PHYSICAL_DATA_TYPE.getLogicalType()),
+                        true, // ignoreParseErrors
+                        TimestampFormat.ISO_8601);
+        open(deserializationSchema);
+
+        SimpleCollector collector = new SimpleCollector();
+        deserializationSchema.deserialize(
+                corruptMessage.getBytes(StandardCharsets.UTF_8), collector);
+
+        // Verify no records were collected
+        assertThat(collector.list).isEmpty();
+
+        // Verify the error was logged at DEBUG level
+        assertThat(loggerExtension.getMessages())
+                .anyMatch(
+                        msg ->
+                                msg.contains("Unknown \"type\" value")
+                                        || msg.contains("Corrupt Maxwell JSON"));
+    }
+
+    @Test
+    void testSerializationDeserialization() throws Exception {
+        List<String> lines = readLines("maxwell-data.txt");
+        MaxwellJsonDeserializationSchema deserializationSchema =
+                new MaxwellJsonDeserializationSchema(
+                        PHYSICAL_DATA_TYPE,
+                        Collections.emptyList(),
+                        InternalTypeInfo.of(PHYSICAL_DATA_TYPE.getLogicalType()),
+                        false,
+                        TimestampFormat.ISO_8601);
+        open(deserializationSchema);
 
         SimpleCollector collector = new SimpleCollector();
         for (String line : lines) {
@@ -131,12 +242,17 @@ public class MaxwellJsonSerDerTest {
                         "-D(103,12-pack drill bits,12-pack of drill bits with sizes ranging from #40 to #3,0.8)");
         List<String> actual =
                 collector.list.stream().map(Object::toString).collect(Collectors.toList());
-        assertEquals(expected, actual);
+        assertThat(actual).isEqualTo(expected);
 
         MaxwellJsonSerializationSchema serializationSchema =
                 new MaxwellJsonSerializationSchema(
-                        SCHEMA, TimestampFormat.SQL, JsonOptions.MapNullKeyMode.LITERAL, "null");
-        serializationSchema.open(null);
+                        (RowType) PHYSICAL_DATA_TYPE.getLogicalType(),
+                        TimestampFormat.SQL,
+                        JsonFormatOptions.MapNullKeyMode.LITERAL,
+                        "null",
+                        true,
+                        false);
+        open(serializationSchema);
         List<String> result = new ArrayList<>();
         for (RowData rowData : collector.list) {
             result.add(new String(serializationSchema.serialize(rowData), StandardCharsets.UTF_8));
@@ -169,7 +285,7 @@ public class MaxwellJsonSerDerTest {
                         "{\"data\":{\"id\":102,\"name\":\"car battery\",\"description\":\"12V car battery\",\"weight\":5.17},\"type\":\"insert\"}",
                         "{\"data\":{\"id\":102,\"name\":\"car battery\",\"description\":\"12V car battery\",\"weight\":5.17},\"type\":\"delete\"}",
                         "{\"data\":{\"id\":103,\"name\":\"12-pack drill bits\",\"description\":\"12-pack of drill bits with sizes ranging from #40 to #3\",\"weight\":0.8},\"type\":\"delete\"}");
-        assertEquals(expectedResult, result);
+        assertThat(result).isEqualTo(expectedResult);
     }
 
     // --------------------------------------------------------------------------------------------
@@ -190,6 +306,19 @@ public class MaxwellJsonSerDerTest {
         @Override
         public void collect(RowData record) {
             list.add(record);
+        }
+
+        @Override
+        public void close() {
+            // do nothing
+        }
+    }
+
+    private static class ThrowingExceptionCollector implements Collector<RowData> {
+
+        @Override
+        public void collect(RowData record) {
+            throw new RuntimeException("An error occurred while collecting data.");
         }
 
         @Override

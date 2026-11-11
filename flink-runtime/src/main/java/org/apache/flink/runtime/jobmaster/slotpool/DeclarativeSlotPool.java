@@ -26,6 +26,7 @@ import org.apache.flink.runtime.jobmaster.SlotInfo;
 import org.apache.flink.runtime.slots.ResourceRequirement;
 import org.apache.flink.runtime.taskexecutor.slot.SlotOffer;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
+import org.apache.flink.runtime.util.ResourceCounter;
 
 import javax.annotation.Nullable;
 
@@ -42,6 +43,13 @@ import java.util.Collection;
 public interface DeclarativeSlotPool {
 
     /**
+     * Whether the resources request is stable.
+     *
+     * @return True if the resources request is stable, false else.
+     */
+    boolean isResourceRequestStable();
+
+    /**
      * Increases the resource requirements by increment.
      *
      * @param increment increment by which to increase the resource requirements
@@ -54,6 +62,13 @@ public interface DeclarativeSlotPool {
      * @param decrement decrement by which to decrease the resource requirements
      */
     void decreaseResourceRequirementsBy(ResourceCounter decrement);
+
+    /**
+     * Sets the resource requirements to the given resourceRequirements.
+     *
+     * @param resourceRequirements new resource requirements
+     */
+    void setResourceRequirements(ResourceCounter resourceRequirements);
 
     /**
      * Returns the current resource requirements.
@@ -79,12 +94,32 @@ public interface DeclarativeSlotPool {
             long currentTime);
 
     /**
-     * Returns the slot information for all free slots (slots which can be allocated from the slot
-     * pool).
+     * Registers the given set of slots at the slot pool. The slot pool will try to accept all slots
+     * unless the slot is unavailable (for example, the TaskManger is blocked).
      *
-     * @return collection of free slot information
+     * <p>The difference from {@link #offerSlots} is that this method allows accepting slots which
+     * exceed the currently required, but the {@link #offerSlots} only accepts those slots that are
+     * currently required.
+     *
+     * @param slots slots to register
+     * @param taskManagerLocation taskManagerLocation is the location of the offering TaskExecutor
+     * @param taskManagerGateway taskManagerGateway is the gateway to talk to the offering
+     *     TaskExecutor
+     * @param currentTime currentTime is the time the slots are being offered
+     * @return the successfully registered slots; the other slot offers are implicitly rejected
      */
-    Collection<SlotInfoWithUtilization> getFreeSlotsInformation();
+    Collection<SlotOffer> registerSlots(
+            Collection<? extends SlotOffer> slots,
+            TaskManagerLocation taskManagerLocation,
+            TaskManagerGateway taskManagerGateway,
+            long currentTime);
+
+    /**
+     * Returns the free slot tracker.
+     *
+     * @return free slot tracker
+     */
+    FreeSlotTracker getFreeSlotTracker();
 
     /**
      * Returns the slot information for all slots (free and allocated slots).
@@ -92,6 +127,16 @@ public interface DeclarativeSlotPool {
      * @return collection of slot information
      */
     Collection<? extends SlotInfo> getAllSlotsInformation();
+
+    /**
+     * Checks whether the slot pool contains a slot with the given {@link AllocationID} and if it is
+     * free.
+     *
+     * @param allocationId allocationId specifies the slot to check for
+     * @return {@code true} if the slot pool contains a free slot registered under the given
+     *     allocation id; otherwise {@code false}
+     */
+    boolean containsFreeSlot(AllocationID allocationId);
 
     /**
      * Reserves the free slot identified by the given allocationId and maps it to the given
@@ -114,7 +159,7 @@ public interface DeclarativeSlotPool {
      * @param allocationId allocationId identifying the slot to release
      * @param cause cause for releasing the slot; can be {@code null}
      * @param currentTime currentTime when the slot was released
-     * @return resource information about freed slot
+     * @return the resource requirements that the slot was fulfilling
      */
     ResourceCounter freeReservedSlot(
             AllocationID allocationId, @Nullable Throwable cause, long currentTime);
@@ -124,7 +169,8 @@ public interface DeclarativeSlotPool {
      *
      * @param owner owner identifying the owning TaskExecutor
      * @param cause cause for failing the slots
-     * @return resource information about released slots
+     * @return the resource requirements that all slots were fulfilling; empty if all slots were
+     *     currently free
      */
     ResourceCounter releaseSlots(ResourceID owner, Exception cause);
 
@@ -133,7 +179,8 @@ public interface DeclarativeSlotPool {
      *
      * @param allocationId allocationId identifying the slot to fail
      * @param cause cause for failing the slot
-     * @return resource information about released slot
+     * @return the resource requirements that the slot was fulfilling; empty if the slot was
+     *     currently free
      */
     ResourceCounter releaseSlot(AllocationID allocationId, Exception cause);
 
@@ -188,5 +235,31 @@ public interface DeclarativeSlotPool {
         @Override
         public void notifyNewSlotsAreAvailable(
                 Collection<? extends PhysicalSlot> newlyAvailableSlots) {}
+    }
+
+    /**
+     * Registers a listener which is called whenever no more resource requests in the specified
+     * duration.
+     *
+     * @param listener which is called whenever no more resource requests in the specified duration.
+     */
+    void registerResourceRequestStableListener(ResourceRequestStableListener listener);
+
+    /**
+     * Listener interface for no more resource requests in the {@link
+     * org.apache.flink.configuration.JobManagerOptions#SLOT_REQUEST_MAX_INTERVAL}.
+     */
+    interface ResourceRequestStableListener {
+
+        /** Notifies the listener about no more resource requests in the specified duration. */
+        void notifyResourceRequestStable();
+    }
+
+    /** No-op {@link ResourceRequestStableListener} implementation. */
+    enum NoOpResourceRequestStableListener implements ResourceRequestStableListener {
+        INSTANCE;
+
+        @Override
+        public void notifyResourceRequestStable() {}
     }
 }

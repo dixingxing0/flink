@@ -23,8 +23,7 @@ under the License.
 	<parent>
 		<groupId>org.apache.flink</groupId>
 		<artifactId>flink-parent</artifactId>
-		<version>1.13-SNAPSHOT</version>
-		<relativePath>..</relativePath>
+		<version>2.5-SNAPSHOT</version>
 	</parent>
 
 	<artifactId>flink-quickstart</artifactId>
@@ -35,14 +34,13 @@ under the License.
 
 	<modules>
 		<module>flink-quickstart-java</module>
-		<module>flink-quickstart-scala</module>
 	</modules>
 	<build>
 		<extensions>
 			<extension>
 				<groupId>org.apache.maven.archetype</groupId>
 				<artifactId>archetype-packaging</artifactId>
-				<version>2.2</version>
+				<version>3.4.1</version>
 			</extension>
 		</extensions>
 		<pluginManagement>
@@ -50,14 +48,14 @@ under the License.
 				<plugin>
 					<groupId>org.apache.maven.plugins</groupId>
 					<artifactId>maven-archetype-plugin</artifactId>
-					<version>2.2</version>
+					<version>3.4.1</version>
 				</plugin>
 			</plugins>
 		</pluginManagement>
 		<plugins>
 			<plugin>
 				<artifactId>maven-archetype-plugin</artifactId>
-				<version>2.2</version><!--$NO-MVN-MAN-VER$-->
+				<version>3.4.1</version><!--$NO-MVN-MAN-VER$-->
 				<configuration>
 					<skip>true</skip>
 				</configuration>

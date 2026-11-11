@@ -19,7 +19,6 @@
 package org.apache.flink.runtime.rest.handler.legacy.utils;
 
 import org.apache.flink.api.common.ArchivedExecutionConfig;
-import org.apache.flink.api.common.ExecutionMode;
 
 import java.util.Collections;
 import java.util.Map;
@@ -28,8 +27,10 @@ import java.util.Map;
 public class ArchivedExecutionConfigBuilder {
     private String executionMode;
     private String restartStrategyDescription;
+    private int maxParallelism;
     private int parallelism;
     private boolean objectReuseEnabled;
+    private long periodicMaterializeIntervalMillis;
     private Map<String, String> globalJobParameters;
 
     public ArchivedExecutionConfigBuilder setExecutionMode(String executionMode) {
@@ -48,6 +49,11 @@ public class ArchivedExecutionConfigBuilder {
         return this;
     }
 
+    public ArchivedExecutionConfigBuilder setMaxParallelism(int maxParallelism) {
+        this.maxParallelism = maxParallelism;
+        return this;
+    }
+
     public ArchivedExecutionConfigBuilder setObjectReuseEnabled(boolean objectReuseEnabled) {
         this.objectReuseEnabled = objectReuseEnabled;
         return this;
@@ -59,12 +65,19 @@ public class ArchivedExecutionConfigBuilder {
         return this;
     }
 
+    public ArchivedExecutionConfigBuilder setPeriodicMaterializeIntervalMillis(
+            long periodicMaterializeIntervalMillis) {
+        this.periodicMaterializeIntervalMillis = periodicMaterializeIntervalMillis;
+        return this;
+    }
+
     public ArchivedExecutionConfig build() {
         return new ArchivedExecutionConfig(
-                executionMode != null ? executionMode : ExecutionMode.PIPELINED.name(),
                 restartStrategyDescription != null ? restartStrategyDescription : "default",
+                maxParallelism,
                 parallelism,
                 objectReuseEnabled,
+                periodicMaterializeIntervalMillis,
                 globalJobParameters != null
                         ? globalJobParameters
                         : Collections.<String, String>emptyMap());

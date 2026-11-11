@@ -42,6 +42,7 @@ import java.lang.reflect.Array;
 import java.nio.ByteBuffer;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.temporal.ChronoField;
 import java.util.HashMap;
@@ -68,10 +69,15 @@ public class AvroToRowDataConverters {
     // -------------------------------------------------------------------------------------
 
     public static AvroToRowDataConverter createRowConverter(RowType rowType) {
+        return createRowConverter(rowType, true);
+    }
+
+    public static AvroToRowDataConverter createRowConverter(
+            RowType rowType, boolean legacyTimestampMapping) {
         final AvroToRowDataConverter[] fieldConverters =
                 rowType.getFields().stream()
                         .map(RowType.RowField::getType)
-                        .map(AvroToRowDataConverters::createNullableConverter)
+                        .map(type -> createNullableConverter(type, legacyTimestampMapping))
                         .toArray(AvroToRowDataConverter[]::new);
         final int arity = rowType.getFieldCount();
 
@@ -79,6 +85,8 @@ public class AvroToRowDataConverters {
             IndexedRecord record = (IndexedRecord) avroObject;
             GenericRowData row = new GenericRowData(arity);
             for (int i = 0; i < arity; ++i) {
+                // avro always deserialize successfully even though the type isn't matched
+                // so no need to throw exception about which field can't be deserialized
                 row.setField(i, fieldConverters[i].convert(record.get(i)));
             }
             return row;
@@ -86,8 +94,9 @@ public class AvroToRowDataConverters {
     }
 
     /** Creates a runtime converter which is null safe. */
-    private static AvroToRowDataConverter createNullableConverter(LogicalType type) {
-        final AvroToRowDataConverter converter = createConverter(type);
+    private static AvroToRowDataConverter createNullableConverter(
+            LogicalType type, boolean legacyTimestampMapping) {
+        final AvroToRowDataConverter converter = createConverter(type, legacyTimestampMapping);
         return avroObject -> {
             if (avroObject == null) {
                 return null;
@@ -97,7 +106,8 @@ public class AvroToRowDataConverters {
     }
 
     /** Creates a runtime converter which assuming input object is not null. */
-    private static AvroToRowDataConverter createConverter(LogicalType type) {
+    private static AvroToRowDataConverter createConverter(
+            LogicalType type, boolean legacyTimestampMapping) {
         switch (type.getTypeRoot()) {
             case NULL:
                 return avroObject -> null;
@@ -119,6 +129,12 @@ public class AvroToRowDataConverters {
                 return AvroToRowDataConverters::convertToTime;
             case TIMESTAMP_WITHOUT_TIME_ZONE:
                 return AvroToRowDataConverters::convertToTimestamp;
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                if (legacyTimestampMapping) {
+                    throw new UnsupportedOperationException("Unsupported type: " + type);
+                } else {
+                    return AvroToRowDataConverters::convertToTimestamp;
+                }
             case CHAR:
             case VARCHAR:
                 return avroObject -> StringData.fromString(avroObject.toString());
@@ -128,12 +144,12 @@ public class AvroToRowDataConverters {
             case DECIMAL:
                 return createDecimalConverter((DecimalType) type);
             case ARRAY:
-                return createArrayConverter((ArrayType) type);
+                return createArrayConverter((ArrayType) type, legacyTimestampMapping);
             case ROW:
-                return createRowConverter((RowType) type);
+                return createRowConverter((RowType) type, legacyTimestampMapping);
             case MAP:
             case MULTISET:
-                return createMapConverter(type);
+                return createMapConverter(type, legacyTimestampMapping);
             case RAW:
             default:
                 throw new UnsupportedOperationException("Unsupported type: " + type);
@@ -158,9 +174,10 @@ public class AvroToRowDataConverters {
         };
     }
 
-    private static AvroToRowDataConverter createArrayConverter(ArrayType arrayType) {
+    private static AvroToRowDataConverter createArrayConverter(
+            ArrayType arrayType, boolean legacyTimestampMapping) {
         final AvroToRowDataConverter elementConverter =
-                createNullableConverter(arrayType.getElementType());
+                createNullableConverter(arrayType.getElementType(), legacyTimestampMapping);
         final Class<?> elementClass =
                 LogicalTypeUtils.toInternalConversionClass(arrayType.getElementType());
 
@@ -175,11 +192,12 @@ public class AvroToRowDataConverters {
         };
     }
 
-    private static AvroToRowDataConverter createMapConverter(LogicalType type) {
+    private static AvroToRowDataConverter createMapConverter(
+            LogicalType type, boolean legacyTimestampMapping) {
         final AvroToRowDataConverter keyConverter =
-                createConverter(DataTypes.STRING().getLogicalType());
+                createConverter(DataTypes.STRING().getLogicalType(), legacyTimestampMapping);
         final AvroToRowDataConverter valueConverter =
-                createNullableConverter(extractValueTypeToAvroMap(type));
+                createNullableConverter(extractValueTypeToAvroMap(type), legacyTimestampMapping);
 
         return avroObject -> {
             final Map<?, ?> map = (Map<?, ?>) avroObject;
@@ -199,6 +217,8 @@ public class AvroToRowDataConverters {
             millis = (Long) object;
         } else if (object instanceof Instant) {
             millis = ((Instant) object).toEpochMilli();
+        } else if (object instanceof LocalDateTime) {
+            return TimestampData.fromLocalDateTime((LocalDateTime) object);
         } else {
             JodaConverter jodaConverter = JodaConverter.getConverter();
             if (jodaConverter != null) {

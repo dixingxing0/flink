@@ -41,8 +41,10 @@ public class JobVertexDetailsInfo implements ResponseBody {
     public static final String FIELD_NAME_VERTEX_ID = "id";
     public static final String FIELD_NAME_VERTEX_NAME = "name";
     public static final String FIELD_NAME_PARALLELISM = "parallelism";
+    public static final String FIELD_NAME_MAX_PARALLELISM = "maxParallelism";
     public static final String FIELD_NAME_NOW = "now";
     public static final String FIELD_NAME_SUBTASKS = "subtasks";
+    public static final String FIELD_NAME_AGGREGATED = "aggregated";
 
     @JsonProperty(FIELD_NAME_VERTEX_ID)
     @JsonSerialize(using = JobVertexIDSerializer.class)
@@ -54,11 +56,17 @@ public class JobVertexDetailsInfo implements ResponseBody {
     @JsonProperty(FIELD_NAME_PARALLELISM)
     private final int parallelism;
 
+    @JsonProperty(FIELD_NAME_MAX_PARALLELISM)
+    private final int maxParallelism;
+
     @JsonProperty(FIELD_NAME_NOW)
     private final long now;
 
     @JsonProperty(FIELD_NAME_SUBTASKS)
     private final List<SubtaskExecutionAttemptDetailsInfo> subtasks;
+
+    @JsonProperty(FIELD_NAME_AGGREGATED)
+    private final AggregatedTaskDetailsInfo aggregated;
 
     @JsonCreator
     public JobVertexDetailsInfo(
@@ -67,13 +75,16 @@ public class JobVertexDetailsInfo implements ResponseBody {
                     JobVertexID id,
             @JsonProperty(FIELD_NAME_VERTEX_NAME) String name,
             @JsonProperty(FIELD_NAME_PARALLELISM) int parallelism,
+            @JsonProperty(FIELD_NAME_MAX_PARALLELISM) int maxParallelism,
             @JsonProperty(FIELD_NAME_NOW) long now,
             @JsonProperty(FIELD_NAME_SUBTASKS) List<SubtaskExecutionAttemptDetailsInfo> subtasks) {
         this.id = checkNotNull(id);
         this.name = checkNotNull(name);
         this.parallelism = parallelism;
+        this.maxParallelism = maxParallelism;
         this.now = now;
         this.subtasks = checkNotNull(subtasks);
+        this.aggregated = AggregatedTaskDetailsInfo.create(subtasks);
     }
 
     @JsonIgnore
@@ -95,12 +106,14 @@ public class JobVertexDetailsInfo implements ResponseBody {
         return Objects.equals(id, that.id)
                 && Objects.equals(name, that.name)
                 && parallelism == that.parallelism
+                && maxParallelism == that.maxParallelism
                 && now == that.now
-                && Objects.equals(subtasks, that.subtasks);
+                && Objects.equals(subtasks, that.subtasks)
+                && Objects.equals(aggregated, that.aggregated);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(id, name, parallelism, now, subtasks);
+        return Objects.hash(id, name, parallelism, maxParallelism, now, subtasks, aggregated);
     }
 }

@@ -21,11 +21,13 @@ source "$(dirname "$0")"/common.sh
 source "$(dirname "$0")"/common_docker.sh
 
 CONTAINER_SCRIPTS=${END_TO_END_DIR}/test-scripts/container-scripts
-MINIKUBE_START_RETRIES=3
-MINIKUBE_START_BACKOFF=5
-RESULT_HASH="e682ec6622b5e83f2eb614617d5ab2cf"
-MINIKUBE_VERSION="v1.8.2"
-MINIKUBE_PATH="/usr/local/bin/minikube-$MINIKUBE_VERSION"
+RETRY_COUNT=3
+RETRY_BACKOFF_TIME=5
+RESULT_HASH="d41d8cd98f00b204e9800998ecf8427e"
+MINIKUBE_VERSION="v1.38.0"
+CRICTL_VERSION="v1.35.0"
+CRI_DOCKERD_VERSION="0.3.24"
+CNI_PLUGINS_VERSION="v1.6.2"
 
 NON_LINUX_ENV_NOTE="****** Please start/stop minikube manually in non-linux environment. ******"
 
@@ -40,19 +42,78 @@ function setup_kubernetes_for_linux {
     if ! [ -x "$(command -v kubectl)" ]; then
         echo "Installing kubectl ..."
         local version=$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)
-        curl -Lo kubectl https://storage.googleapis.com/kubernetes-release/release/$version/bin/linux/$arch/kubectl && \
-            chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+        download_kubectl_url="https://storage.googleapis.com/kubernetes-release/release/$version/bin/linux/$arch/kubectl"
+        retry_download "${download_kubectl_url}"
+        chmod +x kubectl && sudo mv kubectl /usr/local/bin/
     fi
-    # Download minikube.
-    if ! [ -x "$(command -v minikube)" ] || ! [[ $(minikube version) =~ "$MINIKUBE_VERSION" ]]; then
-        echo "Installing minikube to $MINIKUBE_PATH ..."
-        curl -Lo minikube https://storage.googleapis.com/minikube/releases/$MINIKUBE_VERSION/minikube-linux-$arch && \
-            chmod +x minikube && sudo mv minikube $MINIKUBE_PATH
+    # Download minikube when it is not installed beforehand.
+    if [ -x "$(command -v minikube)" ] && [[ "$(minikube version | grep -c $MINIKUBE_VERSION)" == "0" ]]; then
+      echo "Removing any already installed minikube binaries ..."
+      sudo rm "$(which minikube)"
+    fi
+
+    if ! [ -x "$(command -v minikube)" ]; then
+      echo "Installing minikube $MINIKUBE_VERSION ..."
+      download_minikube_url="https://storage.googleapis.com/minikube/releases/$MINIKUBE_VERSION/minikube-linux-$arch"
+      retry_download "${download_minikube_url}"
+      chmod +x "minikube-linux-$arch" && sudo mv "minikube-linux-$arch" /usr/bin/minikube
+    fi
+
+    # conntrack is required for minikube 1.9 and later
+    sudo apt-get install conntrack
+    # CNI plugins are required for minikube with the none driver and Kubernetes v1.24+
+    local cni_archive="cni-plugins-linux-${arch}-${CNI_PLUGINS_VERSION}.tgz"
+    retry_download "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/${cni_archive}"
+    sudo mkdir -p /opt/cni/bin
+    sudo tar zxvf ${cni_archive} -C /opt/cni/bin
+    rm -f ${cni_archive}
+    # crictl is required for cri-dockerd
+    local crictl_archive
+    crictl_archive="crictl-$CRICTL_VERSION-linux-${arch}.tar.gz"
+    download_crictl_url="https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/${crictl_archive}"
+    retry_download "${download_crictl_url}"
+    sudo tar zxvf ${crictl_archive} -C /usr/local/bin
+    rm -f ${crictl_archive}
+
+    # cri-dockerd is required to use Kubernetes 1.24+ and the none driver
+    local cri_dockerd_archive cri_dockerd_binary
+    cri_dockerd_archive="cri-dockerd-${CRI_DOCKERD_VERSION}.${arch}.tgz"
+    cri_dockerd_binary="cri-dockerd"
+    retry_download "https://github.com/Mirantis/cri-dockerd/releases/download/v${CRI_DOCKERD_VERSION}/${cri_dockerd_archive}"
+    tar xzvf $cri_dockerd_archive "cri-dockerd/${cri_dockerd_binary}" --strip-components=1
+    sudo install -o root -g root -m 0755 "${cri_dockerd_binary}" "/usr/local/bin/${cri_dockerd_binary}"
+    rm ${cri_dockerd_binary}
+
+    retry_download "https://raw.githubusercontent.com/Mirantis/cri-dockerd/v${CRI_DOCKERD_VERSION}/packaging/systemd/cri-docker.service"
+    retry_download "https://raw.githubusercontent.com/Mirantis/cri-dockerd/v${CRI_DOCKERD_VERSION}/packaging/systemd/cri-docker.socket"
+    sudo mv cri-docker.socket cri-docker.service /etc/systemd/system/
+    sudo sed -i -e "s,/usr/bin/${cri_dockerd_binary},/usr/local/bin/${cri_dockerd_binary}," /etc/systemd/system/cri-docker.service
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable cri-docker.service
+    sudo systemctl enable --now cri-docker.socket
+
+    # required to resolve HOST_JUJU_LOCK_PERMISSION error of "minikube start --vm-driver=none"
+    sudo sysctl fs.protected_regular=0
+}
+
+function retry_download {
+    if [[ "$#" != 1 ]]; then
+       echo "Fatal error: No parameter or too many parameters passed: $@"
+       exit 1;
+    fi
+
+    local download_url download_command
+    download_url="$1"
+    download_command="wget -nv ${download_url}"
+    if ! retry_times ${RETRY_COUNT} ${RETRY_BACKOFF_TIME} "${download_command}"; then
+      echo "ERROR: Download failed repeatedly after ${RETRY_COUNT} tries. Aborting..."
+      exit 1
     fi
 }
 
 function check_kubernetes_status {
-    $MINIKUBE_PATH status
+    minikube status
     return $?
 }
 
@@ -75,7 +136,8 @@ function start_kubernetes_if_not_running {
         # here.
         # Similarly, the kubelets are marking themself as "low disk space",
         # causing Flink to avoid this node (again, failing the test)
-        sudo CHANGE_MINIKUBE_NONE_USER=true $MINIKUBE_PATH start --vm-driver=none \
+        # pass env explicitly: sudo-rs (Ubuntu 26.04+) ignores 'sudo -E'
+        sudo env HOME="$HOME" PATH="$PATH" CHANGE_MINIKUBE_NONE_USER=true minikube start --vm-driver=none \
             --extra-config=kubelet.image-gc-high-threshold=99 \
             --extra-config=kubelet.image-gc-low-threshold=98 \
             --extra-config=kubelet.minimum-container-ttl-duration=120m \
@@ -83,7 +145,7 @@ function start_kubernetes_if_not_running {
             --extra-config=kubelet.eviction-soft="memory.available<5Mi,nodefs.available<2Mi,imagefs.available<2Mi" \
             --extra-config=kubelet.eviction-soft-grace-period="memory.available=2h,nodefs.available=2h,imagefs.available=2h"
         # Fix the kubectl context, as it's often stale.
-        $MINIKUBE_PATH update-context
+        minikube update-context
     fi
 
     check_kubernetes_status
@@ -99,24 +161,28 @@ function start_kubernetes {
         # Mount Flink dist into minikube virtual machine because we need to mount hostPath as usrlib
         minikube mount $FLINK_DIR:$FLINK_DIR &
         export minikube_mount_pid=$!
+        echo "The mounting process is running with pid $minikube_mount_pid"
     else
         setup_kubernetes_for_linux
-        if ! retry_times ${MINIKUBE_START_RETRIES} ${MINIKUBE_START_BACKOFF} start_kubernetes_if_not_running; then
+        if ! retry_times ${RETRY_COUNT} ${RETRY_BACKOFF_TIME} start_kubernetes_if_not_running; then
             echo "Could not start minikube. Aborting..."
             exit 1
         fi
     fi
-    eval $($MINIKUBE_PATH docker-env)
+}
+
+function stop_minikube {
+    sudo env HOME="$HOME" PATH="$PATH" minikube stop
 }
 
 function stop_kubernetes {
     if [[ "${OS_TYPE}" != "linux" ]]; then
         echo "$NON_LINUX_ENV_NOTE"
+        echo "Killing mounting process $minikube_mount_pid"
         kill $minikube_mount_pid 2> /dev/null
     else
         echo "Stopping minikube ..."
-        stop_command="sudo $MINIKUBE_PATH stop"
-        if ! retry_times ${MINIKUBE_START_RETRIES} ${MINIKUBE_START_BACKOFF} "${stop_command}"; then
+        if ! retry_times ${RETRY_COUNT} ${RETRY_BACKOFF_TIME} stop_minikube; then
             echo "Could not stop minikube. Aborting..."
             exit 1
         fi
@@ -131,29 +197,64 @@ function debug_and_show_logs {
 
     echo "Flink logs:"
     kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | while read pod;do
+        echo "Current logs for $pod: "
         kubectl logs $pod;
+        restart_count=$(kubectl get pod $pod -o jsonpath='{.status.containerStatuses[0].restartCount}')
+        if [[ ${restart_count} -gt 0 ]];then
+          echo "Previous logs for $pod: "
+          kubectl logs $pod --previous
+        fi
     done
 }
 
 function wait_rest_endpoint_up_k8s {
+  wait_for_logs $1 "Rest endpoint listening at"
+}
+
+function wait_num_checkpoints {
+    POD_NAME=$1
+    NUM_CHECKPOINTS=$2
+
+    echo "Waiting for job ($POD_NAME) to have at least $NUM_CHECKPOINTS completed checkpoints ..."
+
+   # wait at most 120 seconds
+    local TIMEOUT=120
+    for i in $(seq 1 ${TIMEOUT}); do
+      N=$(kubectl logs $POD_NAME 2> /dev/null | grep -o "Completed checkpoint [1-9]* for job" | awk '{print $3}' | tail -1)
+
+      if [ -z $N ]; then
+        N=0
+      fi
+
+      if (( N < NUM_CHECKPOINTS )); then
+        sleep 1
+      else
+        return
+      fi
+    done
+    echo "Could not get $NUM_CHECKPOINTS completed checkpoints in $TIMEOUT sec"
+    exit 1
+}
+
+function wait_for_logs {
   local jm_pod_name=$1
-  local successful_response_regex="Rest endpoint listening at"
+  local successful_response_regex=$2
+  local timeout=${3:-30}
 
   echo "Waiting for jobmanager pod ${jm_pod_name} ready."
-  kubectl wait --for=condition=Ready --timeout=30s pod/$jm_pod_name || exit 1
+  kubectl wait --for=condition=Ready --timeout=${timeout}s pod/$jm_pod_name || exit 1
 
-  # wait at most 30 seconds until the endpoint is up
-  local TIMEOUT=30
-  for i in $(seq 1 ${TIMEOUT}); do
+  # wait or timeout until the log shows up
+  echo "Waiting for log \"$2\"..."
+  for i in $(seq 1 ${timeout}); do
     if check_logs_output $jm_pod_name $successful_response_regex; then
-      echo "REST endpoint is up."
+      echo "Log \"$2\" shows up."
       return
     fi
 
-    echo "Waiting for REST endpoint to come up..."
     sleep 1
   done
-  echo "REST endpoint has not started within a timeout of ${TIMEOUT} sec"
+  echo "Log $2 does not show up within a timeout of ${timeout} sec"
   exit 1
 }
 
@@ -178,23 +279,11 @@ function cleanup {
     stop_kubernetes
 }
 
-function setConsoleLogging {
-    cat >> $FLINK_DIR/conf/log4j.properties <<END
-rootLogger.appenderRef.console.ref = ConsoleAppender
-
-# Log all infos to the console
-appender.console.name = ConsoleAppender
-appender.console.type = CONSOLE
-appender.console.layout.type = PatternLayout
-appender.console.layout.pattern = %d{yyyy-MM-dd HH:mm:ss,SSS} %-5p [%t] %-60c %x - %m%n
-END
-}
-
 function get_host_machine_address {
     if [[ "${OS_TYPE}" != "linux" ]]; then
         echo $(minikube ssh "route -n | grep ^0.0.0.0 | awk '{ print \$2 }' | tr -d '[:space:]'")
     else
-        echo "localhost"
+        echo $(hostname --ip-address)
     fi
 }
 

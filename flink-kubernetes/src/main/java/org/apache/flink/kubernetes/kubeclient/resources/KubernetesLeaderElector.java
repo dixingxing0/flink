@@ -20,8 +20,12 @@ package org.apache.flink.kubernetes.kubeclient.resources;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.kubernetes.configuration.KubernetesLeaderElectionConfiguration;
-import org.apache.flink.runtime.util.ExecutorThreadFactory;
+import org.apache.flink.kubernetes.utils.KubernetesUtils;
+import org.apache.flink.util.ExecutorUtils;
+import org.apache.flink.util.concurrent.ExecutorThreadFactory;
+import org.apache.flink.util.concurrent.FutureUtils;
 
+import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
 import io.fabric8.kubernetes.client.NamespacedKubernetesClient;
 import io.fabric8.kubernetes.client.extended.leaderelection.LeaderCallbacks;
 import io.fabric8.kubernetes.client.extended.leaderelection.LeaderElectionConfig;
@@ -31,8 +35,13 @@ import io.fabric8.kubernetes.client.extended.leaderelection.resourcelock.ConfigM
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.concurrent.GuardedBy;
+
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Represent {@link KubernetesLeaderElector} in kubernetes. {@link LeaderElector#run()} is a
@@ -53,28 +62,52 @@ public class KubernetesLeaderElector {
     @VisibleForTesting
     public static final String LEADER_ANNOTATION_KEY = "control-plane.alpha.kubernetes.io/leader";
 
-    private final ExecutorService executorService =
-            Executors.newSingleThreadExecutor(
-                    new ExecutorThreadFactory("KubernetesLeaderElector-ExecutorService"));
+    private final Object lock = new Object();
 
-    private final LeaderElector<NamespacedKubernetesClient> internalLeaderElector;
+    private final NamespacedKubernetesClient kubernetesClient;
+    private final LeaderElectionConfig leaderElectionConfig;
+    private final ExecutorService executorService;
+
+    private CompletableFuture<?> currentLeaderElectionSession = FutureUtils.completedVoidFuture();
 
     public KubernetesLeaderElector(
             NamespacedKubernetesClient kubernetesClient,
-            String namespace,
             KubernetesLeaderElectionConfiguration leaderConfig,
             LeaderCallbackHandler leaderCallbackHandler) {
-        final LeaderElectionConfig leaderElectionConfig =
+        this(
+                kubernetesClient,
+                leaderConfig,
+                leaderCallbackHandler,
+                Executors.newSingleThreadExecutor(
+                        new ExecutorThreadFactory("KubernetesLeaderElector-ExecutorService")));
+    }
+
+    @VisibleForTesting
+    public KubernetesLeaderElector(
+            NamespacedKubernetesClient kubernetesClient,
+            KubernetesLeaderElectionConfiguration leaderConfig,
+            LeaderCallbackHandler leaderCallbackHandler,
+            ExecutorService executorService) {
+        this.kubernetesClient = kubernetesClient;
+        this.leaderElectionConfig =
                 new LeaderElectionConfigBuilder()
                         .withName(leaderConfig.getConfigMapName())
                         .withLeaseDuration(leaderConfig.getLeaseDuration())
                         .withLock(
                                 new ConfigMapLock(
-                                        namespace,
-                                        leaderConfig.getConfigMapName(),
+                                        new ObjectMetaBuilder()
+                                                .withNamespace(kubernetesClient.getNamespace())
+                                                .withName(leaderConfig.getConfigMapName())
+                                                // Labels will be used to clean up the ha related
+                                                // ConfigMaps.
+                                                .withLabels(
+                                                        KubernetesUtils.getConfigMapLabels(
+                                                                leaderConfig.getClusterId()))
+                                                .build(),
                                         leaderConfig.getLockIdentity()))
                         .withRenewDeadline(leaderConfig.getRenewDeadline())
                         .withRetryPeriod(leaderConfig.getRetryPeriod())
+                        .withReleaseOnCancel(true)
                         .withLeaderCallbacks(
                                 new LeaderCallbacks(
                                         leaderCallbackHandler::isLeader,
@@ -85,19 +118,59 @@ public class KubernetesLeaderElector {
                                                         newLeader,
                                                         leaderConfig.getConfigMapName())))
                         .build();
-        internalLeaderElector = new LeaderElector<>(kubernetesClient, leaderElectionConfig);
+        this.executorService = executorService;
+
         LOG.info(
-                "Create KubernetesLeaderElector {} with lock identity {}.",
-                leaderConfig.getConfigMapName(),
-                leaderConfig.getLockIdentity());
+                "Create KubernetesLeaderElector on lock {}.",
+                leaderElectionConfig.getLock().describe());
+    }
+
+    @GuardedBy("lock")
+    private void resetInternalLeaderElector() {
+        cancelCurrentLeaderElectionSession();
+
+        currentLeaderElectionSession =
+                new LeaderElector(kubernetesClient, leaderElectionConfig, executorService).start();
+
+        LOG.info(
+                "Triggered leader election on lock {}.", leaderElectionConfig.getLock().describe());
+    }
+
+    @GuardedBy("lock")
+    private void cancelCurrentLeaderElectionSession() {
+        currentLeaderElectionSession.cancel(true);
     }
 
     public void run() {
-        executorService.submit(internalLeaderElector::run);
+        synchronized (lock) {
+            if (executorService.isShutdown()) {
+                LOG.debug(
+                        "Ignoring KubernetesLeaderElector.run call because the leader elector has already been shut down.");
+            } else {
+                resetInternalLeaderElector();
+            }
+        }
     }
 
     public void stop() {
-        executorService.shutdownNow();
+        synchronized (lock) {
+            // cancelling the current session needs to happen explicitly to allow the execution of
+            // code that handles the leader loss
+            cancelCurrentLeaderElectionSession();
+
+            // the shutdown of the executor needs to happen gracefully for scenarios where the
+            // release is called in the executorService. Interrupting this logic will result in the
+            // leadership-lost event not being sent to the client.
+            final List<Runnable> outStandingTasks =
+                    ExecutorUtils.gracefulShutdown(30, TimeUnit.SECONDS, executorService);
+
+            if (!outStandingTasks.isEmpty()) {
+                LOG.warn(
+                        "{} events were not processed before stopping the {} instance.",
+                        outStandingTasks.size(),
+                        KubernetesLeaderElector.class.getSimpleName());
+            }
+        }
     }
 
     public static boolean hasLeadership(KubernetesConfigMap configMap, String lockIdentity) {

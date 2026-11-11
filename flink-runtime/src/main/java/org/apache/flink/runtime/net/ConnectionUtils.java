@@ -18,9 +18,9 @@
 
 package org.apache.flink.runtime.net;
 
-import org.apache.flink.runtime.akka.AkkaUtils;
 import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalException;
 import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalListener;
+import org.apache.flink.runtime.rpc.RpcSystemUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -334,14 +334,12 @@ public class ConnectionUtils {
     private static boolean tryToConnect(
             InetAddress fromAddress, SocketAddress toSocket, int timeout, boolean logFailed)
             throws IOException {
+        String detailedMessage =
+                String.format(
+                        "connect to [%s] from local address [%s] with timeout [%s]",
+                        toSocket, fromAddress, timeout);
         if (LOG.isDebugEnabled()) {
-            LOG.debug(
-                    "Trying to connect to ("
-                            + toSocket
-                            + ") from local address "
-                            + fromAddress
-                            + " with timeout "
-                            + timeout);
+            LOG.debug("Trying to " + detailedMessage);
         }
         try (Socket socket = new Socket()) {
             // port 0 = let the OS choose the port
@@ -351,8 +349,7 @@ public class ConnectionUtils {
             socket.connect(toSocket, timeout);
             return true;
         } catch (Exception ex) {
-            String message =
-                    "Failed to connect from address '" + fromAddress + "': " + ex.getMessage();
+            String message = "Failed to " + detailedMessage + " due to: " + ex.getMessage();
             if (LOG.isDebugEnabled()) {
                 LOG.debug(message, ex);
             } else if (logFailed) {
@@ -370,6 +367,12 @@ public class ConnectionUtils {
 
         private static final Duration defaultLoggingDelay = Duration.ofMillis(400);
 
+        private final RpcSystemUtils rpcSystemUtils;
+
+        public LeaderConnectingAddressListener(RpcSystemUtils rpcSystemUtils) {
+            this.rpcSystemUtils = rpcSystemUtils;
+        }
+
         private enum LeaderRetrievalState {
             NOT_RETRIEVED,
             RETRIEVED,
@@ -378,7 +381,7 @@ public class ConnectionUtils {
 
         private final Object retrievalLock = new Object();
 
-        private String akkaURL;
+        private String rpcURL;
         private LeaderRetrievalState retrievalState = LeaderRetrievalState.NOT_RETRIEVED;
         private Exception exception;
 
@@ -413,12 +416,12 @@ public class ConnectionUtils {
                                                 + "while waiting for the leader retrieval.");
                             }
                         } else if (retrievalState == LeaderRetrievalState.NEWLY_RETRIEVED) {
-                            targetAddress = AkkaUtils.getInetSocketAddressFromAkkaURL(akkaURL);
+                            targetAddress = rpcSystemUtils.getInetSocketAddressFromRpcUrl(rpcURL);
 
                             LOG.debug(
-                                    "Retrieved new target address {} for akka URL {}.",
+                                    "Retrieved new target address {} for RPC URL {}.",
                                     targetAddress,
-                                    akkaURL);
+                                    rpcURL);
 
                             retrievalState = LeaderRetrievalState.RETRIEVED;
 
@@ -506,8 +509,8 @@ public class ConnectionUtils {
             } catch (Exception e) {
                 throw new LeaderRetrievalException(
                         "Could not retrieve the connecting address to the "
-                                + "current leader with the akka URL "
-                                + akkaURL
+                                + "current leader with the pekko URL "
+                                + rpcURL
                                 + ".",
                         e);
             }
@@ -517,7 +520,7 @@ public class ConnectionUtils {
         public void notifyLeaderAddress(String leaderAddress, UUID leaderSessionID) {
             if (leaderAddress != null && !leaderAddress.isEmpty()) {
                 synchronized (retrievalLock) {
-                    akkaURL = leaderAddress;
+                    rpcURL = leaderAddress;
                     retrievalState = LeaderRetrievalState.NEWLY_RETRIEVED;
 
                     retrievalLock.notifyAll();

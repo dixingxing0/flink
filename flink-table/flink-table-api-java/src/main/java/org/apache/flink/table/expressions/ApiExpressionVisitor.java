@@ -25,16 +25,24 @@ import org.apache.flink.annotation.Internal;
 public abstract class ApiExpressionVisitor<R> implements ExpressionVisitor<R> {
 
     public final R visit(Expression other) {
-        if (other instanceof UnresolvedReferenceExpression) {
+        if (other instanceof UnresolvedTypeLiteralExpression) {
+            return visit((UnresolvedTypeLiteralExpression) other);
+        } else if (other instanceof UnresolvedReferenceExpression) {
             return visit((UnresolvedReferenceExpression) other);
         } else if (other instanceof TableReferenceExpression) {
             return visit((TableReferenceExpression) other);
+        } else if (other instanceof ModelReferenceExpression) {
+            return visit((ModelReferenceExpression) other);
         } else if (other instanceof LocalReferenceExpression) {
             return visit((LocalReferenceExpression) other);
         } else if (other instanceof LookupCallExpression) {
             return visit((LookupCallExpression) other);
         } else if (other instanceof UnresolvedCallExpression) {
             return visit((UnresolvedCallExpression) other);
+        } else if (other instanceof SqlCallExpression) {
+            return visit((SqlCallExpression) other);
+        } else if (other instanceof ResolvedExpression) {
+            return visit((ResolvedExpression) other);
         }
         return visitNonApiExpression(other);
     }
@@ -45,17 +53,26 @@ public abstract class ApiExpressionVisitor<R> implements ExpressionVisitor<R> {
 
     public abstract R visit(TableReferenceExpression tableReference);
 
+    public abstract R visit(ModelReferenceExpression modelReferenceExpression);
+
     public abstract R visit(LocalReferenceExpression localReference);
+
+    /** For resolved expressions created by the planner. */
+    public abstract R visit(ResolvedExpression other);
 
     // --------------------------------------------------------------------------------------------
     // unresolved API expressions
     // --------------------------------------------------------------------------------------------
+
+    public abstract R visit(UnresolvedTypeLiteralExpression unresolvedTypeExpression);
 
     public abstract R visit(UnresolvedReferenceExpression unresolvedReference);
 
     public abstract R visit(LookupCallExpression lookupCall);
 
     public abstract R visit(UnresolvedCallExpression unresolvedCallExpression);
+
+    public abstract R visit(SqlCallExpression sqlCall);
 
     // --------------------------------------------------------------------------------------------
     // other expressions

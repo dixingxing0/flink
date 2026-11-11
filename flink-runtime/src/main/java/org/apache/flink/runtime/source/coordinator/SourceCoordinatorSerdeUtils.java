@@ -18,9 +18,12 @@ limitations under the License.
 
 package org.apache.flink.runtime.source.coordinator;
 
-import org.apache.flink.api.connector.source.ReaderInfo;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
+import org.apache.flink.core.memory.DataInputViewStreamWrapper;
+import org.apache.flink.core.memory.DataOutputViewStreamWrapper;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -30,8 +33,12 @@ import java.util.Map;
 
 /** A serialization util class for the {@link SourceCoordinator}. */
 public class SourceCoordinatorSerdeUtils {
+
+    public static final int VERSION_0 = 0;
+    public static final int VERSION_1 = 1;
+
     /** The current source coordinator serde version. */
-    private static final int CURRENT_VERSION = 0;
+    private static final int CURRENT_VERSION = VERSION_1;
 
     /** Private constructor for utility class. */
     private SourceCoordinatorSerdeUtils() {}
@@ -42,56 +49,31 @@ public class SourceCoordinatorSerdeUtils {
     }
 
     /** Read and verify the serde version. */
-    static void readAndVerifyCoordinatorSerdeVersion(DataInputStream in) throws IOException {
+    static int readAndVerifyCoordinatorSerdeVersion(DataInputStream in) throws IOException {
         int version = in.readInt();
         if (version > CURRENT_VERSION) {
             throw new IOException("Unsupported source coordinator serde version " + version);
         }
+        return version;
     }
 
-    /**
-     * Get serialized size of the registered readers map.
-     *
-     * <p>The binary format is following: 4 Bytes - num entries. N Bytes - entries 4 Bytes - subtask
-     * id N Bytes - reader info, see {@link #writeReaderInfo(ReaderInfo, DataOutputStream)}.
-     */
-    static void writeRegisteredReaders(
-            Map<Integer, ReaderInfo> registeredReaders, DataOutputStream out) throws IOException {
-        out.writeInt(registeredReaders.size());
-        for (ReaderInfo info : registeredReaders.values()) {
-            writeReaderInfo(info, out);
-        }
+    static byte[] readBytes(DataInputStream in, int size) throws IOException {
+        byte[] bytes = new byte[size];
+        in.readFully(bytes);
+        return bytes;
     }
 
-    static Map<Integer, ReaderInfo> readRegisteredReaders(DataInputStream in) throws IOException {
-        int numReaders = in.readInt();
-        Map<Integer, ReaderInfo> registeredReaders = new HashMap<>();
-        for (int i = 0; i < numReaders; i++) {
-            ReaderInfo info = readReaderInfo(in);
-            registeredReaders.put(info.getSubtaskId(), info);
-        }
-        return registeredReaders;
-    }
-
-    /** Serialize the assignment by checkpoint ids. */
-    static <SplitT> void writeAssignmentsByCheckpointId(
-            Map<Long, Map<Integer, LinkedHashSet<SplitT>>> assignmentByCheckpointIds,
-            SimpleVersionedSerializer<SplitT> splitSerializer,
-            DataOutputStream out)
+    static <SplitT> byte[] serializeAssignments(
+            Map<Integer, LinkedHashSet<SplitT>> assignments,
+            SimpleVersionedSerializer<SplitT> splitSerializer)
             throws IOException {
-        // SplitSerializer version.
-        out.writeInt(splitSerializer.getVersion());
-        // Num checkpoints.
-        out.writeInt(assignmentByCheckpointIds.size());
-        for (Map.Entry<Long, Map<Integer, LinkedHashSet<SplitT>>> assignments :
-                assignmentByCheckpointIds.entrySet()) {
-            long checkpointId = assignments.getKey();
-            out.writeLong(checkpointId);
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                DataOutputStream out = new DataOutputViewStreamWrapper(baos)) {
+            out.writeInt(splitSerializer.getVersion());
 
-            int numSubtasks = assignments.getValue().size();
+            int numSubtasks = assignments.size();
             out.writeInt(numSubtasks);
-            for (Map.Entry<Integer, LinkedHashSet<SplitT>> assignment :
-                    assignments.getValue().entrySet()) {
+            for (Map.Entry<Integer, LinkedHashSet<SplitT>> assignment : assignments.entrySet()) {
                 int subtaskId = assignment.getKey();
                 out.writeInt(subtaskId);
 
@@ -103,22 +85,21 @@ public class SourceCoordinatorSerdeUtils {
                     out.write(serializedSplit);
                 }
             }
+            out.flush();
+            return baos.toByteArray();
         }
     }
 
-    /** Deserialize the assignment by checkpoint ids. */
-    static <SplitT> Map<Long, Map<Integer, LinkedHashSet<SplitT>>> readAssignmentsByCheckpointId(
-            DataInputStream in, SimpleVersionedSerializer<SplitT> splitSerializer)
+    static <SplitT> Map<Integer, LinkedHashSet<SplitT>> deserializeAssignments(
+            byte[] assignmentData, SimpleVersionedSerializer<SplitT> splitSerializer)
             throws IOException {
-        int splitSerializerVersion = in.readInt();
-        int numCheckpoints = in.readInt();
-        Map<Long, Map<Integer, LinkedHashSet<SplitT>>> assignmentsByCheckpointIds =
-                new HashMap<>(numCheckpoints);
-        for (int i = 0; i < numCheckpoints; i++) {
-            long checkpointId = in.readLong();
+
+        try (ByteArrayInputStream bais = new ByteArrayInputStream(assignmentData);
+                DataInputStream in = new DataInputViewStreamWrapper(bais)) {
+            int splitSerializerVersion = in.readInt();
+
             int numSubtasks = in.readInt();
             Map<Integer, LinkedHashSet<SplitT>> assignments = new HashMap<>();
-            assignmentsByCheckpointIds.put(checkpointId, assignments);
             for (int j = 0; j < numSubtasks; j++) {
                 int subtaskId = in.readInt();
                 int numAssignedSplits = in.readInt();
@@ -132,34 +113,8 @@ public class SourceCoordinatorSerdeUtils {
                     splits.add(split);
                 }
             }
+
+            return assignments;
         }
-        return assignmentsByCheckpointIds;
-    }
-
-    static byte[] readBytes(DataInputStream in, int size) throws IOException {
-        byte[] bytes = new byte[size];
-        in.readFully(bytes);
-        return bytes;
-    }
-
-    // ----- private helper methods -----
-
-    /**
-     * Serialize {@link ReaderInfo}.
-     *
-     * <p>The binary format is following: 4 Bytes - subtask id N Bytes - location string
-     *
-     * @param readerInfo the given reader information to serialize.
-     */
-    private static void writeReaderInfo(ReaderInfo readerInfo, DataOutputStream out)
-            throws IOException {
-        out.writeInt(readerInfo.getSubtaskId());
-        out.writeUTF(readerInfo.getLocation());
-    }
-
-    private static ReaderInfo readReaderInfo(DataInputStream in) throws IOException {
-        int subtaskId = in.readInt();
-        String location = in.readUTF();
-        return new ReaderInfo(subtaskId, location);
     }
 }

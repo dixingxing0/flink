@@ -18,11 +18,14 @@
 
 package org.apache.flink.runtime.blob;
 
+import org.apache.flink.api.common.ApplicationID;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.configuration.BlobServerOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.util.FileUtils;
+import org.apache.flink.util.Reference;
 import org.apache.flink.util.ShutdownHookUtil;
+import org.apache.flink.util.function.FunctionUtils;
 
 import org.slf4j.Logger;
 
@@ -50,7 +53,7 @@ public abstract class AbstractBlobCache implements Closeable {
     protected final AtomicLong tempFileCounter = new AtomicLong(0);
 
     /** Root directory for local file storage. */
-    protected final File storageDir;
+    protected final Reference<File> storageDir;
 
     /** Blob store for distributed file storage, e.g. in HA. */
     protected final BlobView blobView;
@@ -75,6 +78,7 @@ public abstract class AbstractBlobCache implements Closeable {
 
     public AbstractBlobCache(
             final Configuration blobClientConfig,
+            final Reference<File> storageDir,
             final BlobView blobView,
             final Logger logger,
             @Nullable final InetSocketAddress serverAddress)
@@ -86,11 +90,11 @@ public abstract class AbstractBlobCache implements Closeable {
         this.readWriteLock = new ReentrantReadWriteLock();
 
         // configure and create the storage directory
-        this.storageDir = BlobUtils.initLocalStorageDirectory(blobClientConfig);
+        this.storageDir = storageDir;
         log.info("Created BLOB cache storage directory " + storageDir);
 
         // configure the number of fetch retries
-        final int fetchRetries = blobClientConfig.getInteger(BlobServerOptions.FETCH_RETRIES);
+        final int fetchRetries = blobClientConfig.get(BlobServerOptions.FETCH_RETRIES);
         if (fetchRetries >= 0) {
             this.numFetchRetries = fetchRetries;
         } else {
@@ -104,10 +108,18 @@ public abstract class AbstractBlobCache implements Closeable {
         shutdownHook = ShutdownHookUtil.addShutdownHook(this, getClass().getSimpleName(), log);
 
         this.serverAddress = serverAddress;
+
+        checkStoredBlobsForCorruption();
+    }
+
+    private void checkStoredBlobsForCorruption() throws IOException {
+        if (storageDir.deref().exists()) {
+            BlobUtils.checkAndDeleteCorruptedBlobs(storageDir.deref().toPath(), log);
+        }
     }
 
     public File getStorageDir() {
-        return storageDir;
+        return storageDir.deref();
     }
 
     /**
@@ -126,7 +138,7 @@ public abstract class AbstractBlobCache implements Closeable {
     protected File getFileInternal(@Nullable JobID jobId, BlobKey blobKey) throws IOException {
         checkArgument(blobKey != null, "BLOB key cannot be null.");
 
-        final File localFile = BlobUtils.getStorageLocation(storageDir, jobId, blobKey);
+        final File localFile = BlobUtils.getStorageLocation(storageDir.deref(), jobId, blobKey);
         readWriteLock.readLock().lock();
 
         try {
@@ -197,6 +209,94 @@ public abstract class AbstractBlobCache implements Closeable {
     }
 
     /**
+     * Returns local copy of the file for the BLOB with the given key.
+     *
+     * <p>The method will first attempt to serve the BLOB from its local cache. If the BLOB is not
+     * in the cache, the method will try to download it from this cache's BLOB server via a
+     * distributed BLOB store (if available) or direct end-to-end download.
+     *
+     * @param applicationId ID of the application this blob belongs to
+     * @param blobKey The key of the desired BLOB.
+     * @return file referring to the local storage location of the BLOB.
+     * @throws IOException Thrown if an I/O error occurs while downloading the BLOBs from the BLOB
+     *     server.
+     */
+    protected File getFileInternal(ApplicationID applicationId, BlobKey blobKey)
+            throws IOException {
+        checkArgument(blobKey != null, "BLOB key cannot be null.");
+
+        final File localFile =
+                BlobUtils.getStorageLocation(storageDir.deref(), applicationId, blobKey);
+        readWriteLock.readLock().lock();
+
+        try {
+            if (localFile.exists()) {
+                return localFile;
+            }
+        } finally {
+            readWriteLock.readLock().unlock();
+        }
+
+        // first try the distributed blob store (if available)
+        // use a temporary file (thread-safe without locking)
+        File incomingFile = createTemporaryFilename();
+        try {
+            try {
+                if (blobView.get(applicationId, blobKey, incomingFile)) {
+                    // now move the temp file to our local cache atomically
+                    readWriteLock.writeLock().lock();
+                    try {
+                        BlobUtils.moveTempFileToStore(
+                                incomingFile, applicationId, blobKey, localFile, log, null);
+                    } finally {
+                        readWriteLock.writeLock().unlock();
+                    }
+
+                    return localFile;
+                }
+            } catch (Exception e) {
+                log.info(
+                        "Failed to copy from blob store. Downloading from BLOB server instead.", e);
+            }
+
+            final InetSocketAddress currentServerAddress = serverAddress;
+
+            if (currentServerAddress != null) {
+                // fallback: download from the BlobServer
+                BlobClient.downloadFromBlobServer(
+                        applicationId,
+                        blobKey,
+                        incomingFile,
+                        currentServerAddress,
+                        blobClientConfig,
+                        numFetchRetries);
+
+                readWriteLock.writeLock().lock();
+                try {
+                    BlobUtils.moveTempFileToStore(
+                            incomingFile, applicationId, blobKey, localFile, log, null);
+                } finally {
+                    readWriteLock.writeLock().unlock();
+                }
+            } else {
+                throw new IOException(
+                        "Cannot download from BlobServer, because the server address is unknown.");
+            }
+
+            return localFile;
+        } finally {
+            // delete incomingFile from a failed download
+            if (!incomingFile.delete() && incomingFile.exists()) {
+                log.warn(
+                        "Could not delete the staging file {} for blob key {} and application {}.",
+                        incomingFile,
+                        blobKey,
+                        applicationId);
+            }
+        }
+    }
+
+    /**
      * Returns the port the BLOB server is listening on.
      *
      * @return BLOB server port or {@code -1} if no server address
@@ -228,7 +328,7 @@ public abstract class AbstractBlobCache implements Closeable {
      */
     File createTemporaryFilename() throws IOException {
         return new File(
-                BlobUtils.getIncomingDirectory(storageDir),
+                BlobUtils.getIncomingDirectory(storageDir.deref()),
                 String.format("temp-%08d", tempFileCounter.getAndIncrement()));
     }
 
@@ -241,7 +341,9 @@ public abstract class AbstractBlobCache implements Closeable {
 
             // Clean up the storage directory
             try {
-                FileUtils.deleteDirectory(storageDir);
+                storageDir
+                        .owned()
+                        .ifPresent(FunctionUtils.uncheckedConsumer(FileUtils::deleteDirectory));
             } finally {
                 // Remove shutdown hook to prevent resource leaks
                 ShutdownHookUtil.removeShutdownHook(shutdownHook, getClass().getSimpleName(), log);

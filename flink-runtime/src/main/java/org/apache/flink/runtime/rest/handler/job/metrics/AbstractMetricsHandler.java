@@ -18,7 +18,6 @@
 
 package org.apache.flink.runtime.rest.handler.job.metrics;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.rest.handler.AbstractRestHandler;
 import org.apache.flink.runtime.rest.handler.HandlerRequest;
 import org.apache.flink.runtime.rest.handler.RestHandlerException;
@@ -36,6 +35,7 @@ import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -69,7 +69,7 @@ public abstract class AbstractMetricsHandler<M extends MessageParameters>
 
     public AbstractMetricsHandler(
             GatewayRetriever<? extends RestfulGateway> leaderRetriever,
-            Time timeout,
+            Duration timeout,
             Map<String, String> headers,
             MessageHeaders<EmptyRequestBody, MetricCollectionResponseBody, M> messageHeaders,
             MetricFetcher metricFetcher) {
@@ -79,7 +79,7 @@ public abstract class AbstractMetricsHandler<M extends MessageParameters>
 
     @Override
     protected final CompletableFuture<MetricCollectionResponseBody> handleRequest(
-            @Nonnull HandlerRequest<EmptyRequestBody, M> request, @Nonnull RestfulGateway gateway)
+            @Nonnull HandlerRequest<EmptyRequestBody> request, @Nonnull RestfulGateway gateway)
             throws RestHandlerException {
         metricFetcher.update();
 
@@ -107,7 +107,7 @@ public abstract class AbstractMetricsHandler<M extends MessageParameters>
     /** Returns the {@link MetricStore.ComponentMetricStore} that should be queried for metrics. */
     @Nullable
     protected abstract MetricStore.ComponentMetricStore getComponentMetricStore(
-            HandlerRequest<EmptyRequestBody, M> request, MetricStore metricStore);
+            HandlerRequest<EmptyRequestBody> request, MetricStore metricStore);
 
     private static List<Metric> getAvailableMetrics(
             MetricStore.ComponentMetricStore componentMetricStore) {

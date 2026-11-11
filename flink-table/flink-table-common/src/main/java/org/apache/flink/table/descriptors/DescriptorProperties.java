@@ -21,21 +21,24 @@ package org.apache.flink.table.descriptors;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
+import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.MemorySize;
-import org.apache.flink.table.api.TableColumn;
-import org.apache.flink.table.api.TableColumn.ComputedColumn;
-import org.apache.flink.table.api.TableColumn.MetadataColumn;
 import org.apache.flink.table.api.TableException;
-import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.api.ValidationException;
-import org.apache.flink.table.api.WatermarkSpec;
+import org.apache.flink.table.catalog.CatalogPropertiesUtil;
+import org.apache.flink.table.factories.DynamicTableFactory;
+import org.apache.flink.table.legacy.api.TableColumn;
+import org.apache.flink.table.legacy.api.TableColumn.ComputedColumn;
+import org.apache.flink.table.legacy.api.TableColumn.MetadataColumn;
+import org.apache.flink.table.legacy.api.TableSchema;
+import org.apache.flink.table.legacy.api.WatermarkSpec;
+import org.apache.flink.table.legacy.utils.TypeStringUtils;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.utils.LogicalTypeParser;
 import org.apache.flink.table.types.utils.TypeConversions;
 import org.apache.flink.table.utils.EncodingUtils;
-import org.apache.flink.table.utils.TypeStringUtils;
 import org.apache.flink.util.InstantiationUtil;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.TimeUtils;
@@ -73,7 +76,11 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * instead of connector.kafka.kafka-version use connector.kafka.version.
  *
  * <p>Properties with key normalization enabled contain only lower-case keys.
+ *
+ * @deprecated This utility will be dropped soon. {@link DynamicTableFactory} is based on {@link
+ *     ConfigOption} and catalogs use {@link CatalogPropertiesUtil}.
  */
+@Deprecated
 @Internal
 public class DescriptorProperties {
 
@@ -104,6 +111,14 @@ public class DescriptorProperties {
     public static final String PRIMARY_KEY_NAME = "primary-key.name";
 
     public static final String PRIMARY_KEY_COLUMNS = "primary-key.columns";
+
+    public static final String INDEX = "index";
+
+    public static final String INDEX_NAME = "name";
+
+    public static final String INDEX_COLUMNS = "columns";
+
+    public static final String COMMENT = "comment";
 
     private static final Pattern SCHEMA_COLUMN_NAME_SUFFIX = Pattern.compile("\\d+\\.name");
 
@@ -618,7 +633,12 @@ public class DescriptorProperties {
     /** Returns the DataType under the given key if it exists. */
     public Optional<DataType> getOptionalDataType(String key) {
         return optionalGet(key)
-                .map(t -> TypeConversions.fromLogicalToDataType(LogicalTypeParser.parse(t)));
+                .map(
+                        t ->
+                                TypeConversions.fromLogicalToDataType(
+                                        LogicalTypeParser.parse(
+                                                t,
+                                                Thread.currentThread().getContextClassLoader())));
     }
 
     /** Returns the DataType under the given existing key. */
@@ -713,7 +733,10 @@ public class DescriptorProperties {
                 final String typeString =
                         optionalGet(typeKey).orElseThrow(exceptionSupplier(typeKey));
                 final DataType exprType =
-                        TypeConversions.fromLogicalToDataType(LogicalTypeParser.parse(typeString));
+                        TypeConversions.fromLogicalToDataType(
+                                LogicalTypeParser.parse(
+                                        typeString,
+                                        Thread.currentThread().getContextClassLoader()));
                 schemaBuilder.watermark(rowtime, exprString, exprType);
             }
         }
@@ -1358,7 +1381,9 @@ public class DescriptorProperties {
                     // we don't validate the string but let the parser do the work for us
                     // it throws a validation exception
                     v -> {
-                        LogicalType t = LogicalTypeParser.parse(v);
+                        LogicalType t =
+                                LogicalTypeParser.parse(
+                                        v, Thread.currentThread().getContextClassLoader());
                         if (t.getTypeRoot() == LogicalTypeRoot.UNRESOLVED) {
                             throw new ValidationException(
                                     "Could not parse type string '" + v + "'.");

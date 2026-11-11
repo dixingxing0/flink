@@ -18,10 +18,9 @@
 
 package org.apache.flink.runtime.util;
 
-import org.apache.flink.shaded.guava18.com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.flink.shaded.guava33.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -31,7 +30,9 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-public class RunnablesTest {
+import static org.assertj.core.api.Assertions.assertThat;
+
+class RunnablesTest {
 
     private static final int TIMEOUT_MS = 100;
 
@@ -40,27 +41,29 @@ public class RunnablesTest {
     // ------------------------------------------------------------------------
 
     @Test
-    public void testExecutorService_uncaughtExceptionHandler() throws InterruptedException {
+    void testExecutorService_uncaughtExceptionHandler() throws InterruptedException {
         final CountDownLatch handlerCalled = new CountDownLatch(1);
         final ThreadFactory threadFactory =
                 new ThreadFactoryBuilder()
                         .setDaemon(true)
                         .setUncaughtExceptionHandler((t, e) -> handlerCalled.countDown())
                         .build();
-        final ExecutorService scheduledExecutorService =
-                Executors.newSingleThreadExecutor(threadFactory);
-        scheduledExecutorService.execute(
-                () -> {
-                    throw new RuntimeException("foo");
-                });
-        Assert.assertTrue(
-                "Expected handler to be called.",
-                handlerCalled.await(TIMEOUT_MS, TimeUnit.MILLISECONDS));
+        final ExecutorService executorService = Executors.newSingleThreadExecutor(threadFactory);
+        try {
+            executorService.execute(
+                    () -> {
+                        throw new RuntimeException("foo");
+                    });
+
+            // expect handler to be called
+            handlerCalled.await();
+        } finally {
+            executorService.shutdown();
+        }
     }
 
     @Test
-    public void testScheduledExecutorService_uncaughtExceptionHandler()
-            throws InterruptedException {
+    void testScheduledExecutorService_uncaughtExceptionHandler() throws InterruptedException {
         final CountDownLatch handlerCalled = new CountDownLatch(1);
         final ThreadFactory threadFactory =
                 new ThreadFactoryBuilder()
@@ -73,9 +76,9 @@ public class RunnablesTest {
                 () -> {
                     throw new RuntimeException("foo");
                 });
-        Assert.assertFalse(
-                "Expected handler not to be called.",
-                handlerCalled.await(TIMEOUT_MS, TimeUnit.MILLISECONDS));
+        assertThat(handlerCalled.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                .withFailMessage("Expected handler not to be called.")
+                .isFalse();
     }
 
     // ------------------------------------------------------------------------
@@ -83,7 +86,7 @@ public class RunnablesTest {
     // ------------------------------------------------------------------------
 
     @Test
-    public void testWithUncaughtExceptionHandler_runtimeException() throws InterruptedException {
+    void testWithUncaughtExceptionHandler_runtimeException() throws InterruptedException {
         final RuntimeException expected = new RuntimeException("foo");
         testWithUncaughtExceptionHandler(
                 () -> {
@@ -93,7 +96,7 @@ public class RunnablesTest {
     }
 
     @Test
-    public void testWithUncaughtExceptionHandler_error() throws InterruptedException {
+    void testWithUncaughtExceptionHandler_error() throws InterruptedException {
         final Error expected = new Error("foo");
         testWithUncaughtExceptionHandler(
                 () -> {
@@ -120,11 +123,11 @@ public class RunnablesTest {
                             handlerCalled.countDown();
                         });
         scheduledExecutorService.execute(guardedRunnable);
-        Assert.assertTrue(handlerCalled.await(100, TimeUnit.MILLISECONDS));
-        Assert.assertNotNull(thread.get());
-        Assert.assertNotNull(throwable.get());
-        Assert.assertEquals("ueh-test-0", thread.get().getName());
-        Assert.assertEquals(expected.getClass(), throwable.get().getClass());
-        Assert.assertEquals("foo", throwable.get().getMessage());
+        assertThat(handlerCalled.await(100, TimeUnit.MILLISECONDS)).isTrue();
+        assertThat(thread).isNotNull();
+        assertThat(throwable).isNotNull();
+        assertThat(thread.get().getName()).isEqualTo("ueh-test-0");
+        assertThat(throwable.get().getClass()).isEqualTo(expected.getClass());
+        assertThat(throwable.get().getMessage()).isEqualTo("foo");
     }
 }

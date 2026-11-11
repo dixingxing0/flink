@@ -20,13 +20,10 @@ package org.apache.flink.runtime.jobgraph.tasks;
 
 import org.apache.flink.core.testutils.CommonTestUtils;
 import org.apache.flink.runtime.checkpoint.CheckpointRetentionPolicy;
-import org.apache.flink.runtime.jobgraph.JobVertexID;
-import org.apache.flink.runtime.state.memory.MemoryStateBackend;
+import org.apache.flink.runtime.state.hashmap.HashMapStateBackend;
 import org.apache.flink.util.SerializedValue;
 
 import org.junit.Test;
-
-import java.util.Arrays;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
@@ -39,9 +36,6 @@ public class JobCheckpointingSettingsTest {
     public void testIsJavaSerializable() throws Exception {
         JobCheckpointingSettings settings =
                 new JobCheckpointingSettings(
-                        Arrays.asList(new JobVertexID(), new JobVertexID()),
-                        Arrays.asList(new JobVertexID(), new JobVertexID()),
-                        Arrays.asList(new JobVertexID(), new JobVertexID()),
                         new CheckpointCoordinatorConfiguration(
                                 1231231,
                                 1231,
@@ -50,14 +44,11 @@ public class JobCheckpointingSettingsTest {
                                 CheckpointRetentionPolicy.RETAIN_ON_FAILURE,
                                 false,
                                 false,
-                                false,
+                                0,
                                 0),
-                        new SerializedValue<>(new MemoryStateBackend()));
+                        new SerializedValue<>(new HashMapStateBackend()));
 
         JobCheckpointingSettings copy = CommonTestUtils.createCopySerializable(settings);
-        assertEquals(settings.getVerticesToAcknowledge(), copy.getVerticesToAcknowledge());
-        assertEquals(settings.getVerticesToConfirm(), copy.getVerticesToConfirm());
-        assertEquals(settings.getVerticesToTrigger(), copy.getVerticesToTrigger());
         assertEquals(
                 settings.getCheckpointCoordinatorConfiguration(),
                 copy.getCheckpointCoordinatorConfiguration());
@@ -66,6 +57,6 @@ public class JobCheckpointingSettingsTest {
                 copy.getDefaultStateBackend()
                                 .deserializeValue(this.getClass().getClassLoader())
                                 .getClass()
-                        == MemoryStateBackend.class);
+                        == HashMapStateBackend.class);
     }
 }

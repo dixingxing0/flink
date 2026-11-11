@@ -19,7 +19,8 @@
 package org.apache.flink.table.operations;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.table.catalog.ResolvedSchema;
+import org.apache.flink.table.expressions.SqlFactory;
 
 import java.util.Collections;
 import java.util.List;
@@ -28,6 +29,7 @@ import java.util.List;
 @Internal
 public class DistinctQueryOperation implements QueryOperation {
 
+    private static final String INPUT_ALIAS = "$$T_DISTINCT";
     private final QueryOperation child;
 
     public DistinctQueryOperation(QueryOperation child) {
@@ -35,14 +37,23 @@ public class DistinctQueryOperation implements QueryOperation {
     }
 
     @Override
-    public TableSchema getTableSchema() {
-        return child.getTableSchema();
+    public ResolvedSchema getResolvedSchema() {
+        return child.getResolvedSchema();
     }
 
     @Override
     public String asSummaryString() {
         return OperationUtils.formatWithChildren(
                 "Distinct", Collections.emptyMap(), getChildren(), Operation::asSummaryString);
+    }
+
+    @Override
+    public String asSerializableString(SqlFactory sqlFactory) {
+        return String.format(
+                "SELECT DISTINCT %s FROM (%s\n) %s",
+                OperationUtils.formatSelectColumns(getResolvedSchema(), INPUT_ALIAS),
+                OperationUtils.indent(child.asSerializableString(sqlFactory)),
+                INPUT_ALIAS);
     }
 
     @Override

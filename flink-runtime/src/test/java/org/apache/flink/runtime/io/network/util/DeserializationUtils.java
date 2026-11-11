@@ -19,11 +19,12 @@
 package org.apache.flink.runtime.io.network.util;
 
 import org.apache.flink.runtime.io.network.api.serialization.RecordDeserializer;
+import org.apache.flink.runtime.io.network.api.serialization.RecordDeserializer.DeserializationResult;
 import org.apache.flink.testutils.serialization.types.SerializationTestType;
 
-import org.junit.Assert;
-
 import java.util.ArrayDeque;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Utility class to help deserialization for testing. */
 public final class DeserializationUtils {
@@ -46,11 +47,14 @@ public final class DeserializationUtils {
             SerializationTestType expected = records.poll();
             SerializationTestType actual = expected.getClass().newInstance();
 
-            if (deserializer.getNextRecord(actual).isFullRecord()) {
-                Assert.assertEquals(expected, actual);
+            final DeserializationResult result = deserializer.getNextRecord(actual);
+            if (result.isFullRecord()) {
+                assertThat(actual).isEqualTo(expected);
                 deserializedRecords++;
             } else {
                 records.addFirst(expected);
+            }
+            if (result.isBufferConsumed()) {
                 break;
             }
         }

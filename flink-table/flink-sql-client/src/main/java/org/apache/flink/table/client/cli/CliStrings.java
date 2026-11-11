@@ -18,14 +18,46 @@
 
 package org.apache.flink.table.client.cli;
 
-import org.apache.flink.table.client.cli.SqlCommandParser.SqlCommand;
+import org.apache.flink.runtime.rest.util.RestClientException;
+import org.apache.flink.table.api.SqlParserException;
+import org.apache.flink.util.ExceptionUtils;
+import org.apache.flink.util.Preconditions;
 
+import org.apache.commons.lang3.StringUtils;
 import org.jline.utils.AttributedString;
 import org.jline.utils.AttributedStringBuilder;
 import org.jline.utils.AttributedStyle;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 /** Utility class that contains all strings for CLI commands and messages. */
 public final class CliStrings {
+
+    /**
+     * A cause caption at the start of a line; a caption inside a message does not count, and only a
+     * line feed starts a line, since a message may carry other separators in echoed SQL.
+     */
+    private static final Pattern CAUSED_BY =
+            Pattern.compile("^Caused by: ", Pattern.MULTILINE | Pattern.UNIX_LINES);
+
+    /**
+     * The end of the exception line of a stack trace segment: its first frame line, "\tat ..." or
+     * "\t... n more", or the end of the server trace if it has no frames.
+     */
+    private static final Pattern HEADLINE_END =
+            Pattern.compile("\\R(\\tat |\\t\\.\\.\\. \\d+ more|End of exception on server side>)");
+
+    /** By name, since Calcite is not on the client's runtime classpath. */
+    private static final String CALCITE_PARSE_EXCEPTION =
+            "org.apache.calcite.sql.parser.SqlParseException";
 
     private CliStrings() {
         // private
@@ -33,85 +65,115 @@ public final class CliStrings {
 
     public static final String CLI_NAME = "Flink SQL CLI Client";
     public static final String DEFAULT_MARGIN = " ";
-    public static final String NULL_COLUMN = "(NULL)";
+
+    // --------------------------------------------------------------------------------------------
+
+    private static final String CMD_DESC_DELIMITER = "\t\t";
+
+    /** SQL Client HELP command helper class. */
+    private static final class SQLCliCommandsDescriptions {
+        private int commandMaxLength;
+        private final Map<String, String> commandsDescriptions;
+
+        public SQLCliCommandsDescriptions() {
+            this.commandsDescriptions = new LinkedHashMap<>();
+            this.commandMaxLength = -1;
+        }
+
+        public SQLCliCommandsDescriptions commandDescription(String command, String description) {
+            Preconditions.checkState(
+                    StringUtils.isNotBlank(command), "content of command must not be empty.");
+            Preconditions.checkState(
+                    StringUtils.isNotBlank(description),
+                    "content of command's description must not be empty.");
+            this.updateMaxCommandLength(command.length());
+            this.commandsDescriptions.put(command, description);
+            return this;
+        }
+
+        private void updateMaxCommandLength(int newLength) {
+            Preconditions.checkState(newLength > 0);
+            if (this.commandMaxLength < newLength) {
+                this.commandMaxLength = newLength;
+            }
+        }
+
+        public AttributedString build() {
+            AttributedStringBuilder attributedStringBuilder = new AttributedStringBuilder();
+            if (!this.commandsDescriptions.isEmpty()) {
+                this.commandsDescriptions.forEach(
+                        (cmd, cmdDesc) -> {
+                            attributedStringBuilder
+                                    .style(AttributedStyle.DEFAULT.bold())
+                                    .append(
+                                            String.format(
+                                                    String.format("%%-%ds", commandMaxLength), cmd))
+                                    .append(CMD_DESC_DELIMITER)
+                                    .style(AttributedStyle.DEFAULT)
+                                    .append(cmdDesc)
+                                    .append('\n');
+                        });
+            }
+            return attributedStringBuilder.toAttributedString();
+        }
+    }
+
+    private static final AttributedString SQL_CLI_COMMANDS_DESCRIPTIONS =
+            new SQLCliCommandsDescriptions()
+                    .commandDescription("HELP", "Prints the available commands.")
+                    .commandDescription("QUIT/EXIT", "Quits the SQL CLI client.")
+                    .commandDescription("CLEAR", "Clears the current terminal.")
+                    .commandDescription(
+                            "SET",
+                            "Sets a session configuration property. Syntax: \"SET '<key>'='<value>';\". Use \"SET;\" for listing all properties.")
+                    .commandDescription(
+                            "RESET",
+                            "Resets a session configuration property. Syntax: \"RESET '<key>';\". Use \"RESET;\" for reset all session properties.")
+                    .commandDescription(
+                            "INSERT INTO",
+                            "Inserts the results of a SQL SELECT query into a declared table sink.")
+                    .commandDescription(
+                            "INSERT OVERWRITE",
+                            "Inserts the results of a SQL SELECT query into a declared table sink and overwrite existing data.")
+                    .commandDescription(
+                            "SELECT", "Executes a SQL SELECT query on the Flink cluster.")
+                    .commandDescription(
+                            "EXPLAIN",
+                            "Describes the execution plan of a query or table with the given name.")
+                    .commandDescription(
+                            "BEGIN STATEMENT SET",
+                            "Begins a statement set. Syntax: \"BEGIN STATEMENT SET;\"")
+                    .commandDescription("END", "Ends a statement set. Syntax: \"END;\"")
+                    .commandDescription(
+                            "ADD JAR",
+                            "Adds the specified jar file to the submitted jobs' classloader. Syntax: \"ADD JAR '<path_to_filename>.jar'\"")
+                    .commandDescription(
+                            "REMOVE JAR",
+                            "Removes the specified jar file from the submitted jobs' classloader. Syntax: \"REMOVE JAR '<path_to_filename>.jar'\"")
+                    .commandDescription(
+                            "SHOW JARS",
+                            "Shows the list of user-specified jar dependencies. This list is impacted by the --jar and --library startup options as well as the ADD/REMOVE JAR commands.")
+                    .build();
 
     // --------------------------------------------------------------------------------------------
 
     public static final AttributedString MESSAGE_HELP =
             new AttributedStringBuilder()
                     .append("The following commands are available:\n\n")
-                    .append(formatCommand(SqlCommand.CLEAR, "Clears the current terminal."))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.CREATE_TABLE,
-                                    "Create table under current catalog and database."))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.DROP_TABLE,
-                                    "Drop table with optional catalog and database. Syntax: 'DROP TABLE [IF EXISTS] <name>;'"))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.CREATE_VIEW,
-                                    "Creates a virtual table from a SQL query. Syntax: 'CREATE VIEW <name> AS <query>;'"))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.DESCRIBE,
-                                    "Describes the schema of a table with the given name."))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.DROP_VIEW,
-                                    "Deletes a previously created virtual table. Syntax: 'DROP VIEW <name>;'"))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.EXPLAIN,
-                                    "Describes the execution plan of a query or table with the given name."))
-                    .append(formatCommand(SqlCommand.HELP, "Prints the available commands."))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.INSERT_INTO,
-                                    "Inserts the results of a SQL SELECT query into a declared table sink."))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.INSERT_OVERWRITE,
-                                    "Inserts the results of a SQL SELECT query into a declared table sink and overwrite existing data."))
-                    .append(formatCommand(SqlCommand.QUIT, "Quits the SQL CLI client."))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.RESET,
-                                    "Resets all session configuration properties."))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.SELECT,
-                                    "Executes a SQL SELECT query on the Flink cluster."))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.SET,
-                                    "Sets a session configuration property. Syntax: 'SET <key>=<value>;'. Use 'SET;' for listing all properties."))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.SHOW_FUNCTIONS,
-                                    "Shows all user-defined and built-in functions."))
-                    .append(formatCommand(SqlCommand.SHOW_TABLES, "Shows all registered tables."))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.SOURCE,
-                                    "Reads a SQL SELECT query from a file and executes it on the Flink cluster."))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.USE_CATALOG,
-                                    "Sets the current catalog. The current database is set to the catalog's default one. Experimental! Syntax: 'USE CATALOG <name>;'"))
-                    .append(
-                            formatCommand(
-                                    SqlCommand.USE,
-                                    "Sets the current default database. Experimental! Syntax: 'USE <name>;'"))
+                    .append(SQL_CLI_COMMANDS_DESCRIPTIONS)
                     .style(AttributedStyle.DEFAULT.underline())
                     .append("\nHint")
                     .style(AttributedStyle.DEFAULT)
                     .append(
-                            ": Make sure that a statement ends with ';' for finalizing (multi-line) statements.")
+                            ": Make sure that a statement ends with \";\" for finalizing (multi-line) statements.")
+                    // About Documentation Link.
+                    .style(AttributedStyle.DEFAULT)
+                    .append(
+                            "\nYou can also type any Flink SQL statement, please visit https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/sql/overview/ for more details.")
                     .toAttributedString();
 
     public static final String MESSAGE_WELCOME;
+
     // make findbugs happy
     static {
         MESSAGE_WELCOME =
@@ -162,63 +224,22 @@ public final class CliStrings {
 
     public static final String MESSAGE_SQL_EXECUTION_ERROR = "Could not execute SQL statement.";
 
-    public static final String MESSAGE_RESET =
-            "All session properties have been set to their default values.";
-
-    public static final String MESSAGE_SET = "Session property has been set.";
-
-    public static final String MESSAGE_EMPTY = "Result was empty.";
-
     public static final String MESSAGE_RESULT_QUIT = "Result retrieval cancelled.";
 
     public static final String MESSAGE_SUBMITTING_STATEMENT =
             "Submitting SQL update statement to the cluster...";
 
+    public static final String MESSAGE_FINISH_STATEMENT =
+            "Complete execution of the SQL update statement.";
+
     public static final String MESSAGE_STATEMENT_SUBMITTED =
-            "Table update statement has been successfully submitted to the cluster:";
+            "SQL update statement has been successfully submitted to the cluster:";
 
-    public static final String MESSAGE_MAX_SIZE_EXCEEDED =
-            "The given file exceeds the maximum number of characters.";
+    public static final String MESSAGE_EXECUTE_FILE = "Executing SQL from file.";
 
-    public static final String MESSAGE_WILL_EXECUTE = "Executing the following statement:";
+    public static final String MESSAGE_EXECUTE_STATEMENT = "Execute statement succeeded.";
 
-    public static final String MESSAGE_UNSUPPORTED_SQL = "Unsupported SQL statement.";
-
-    public static final String MESSAGE_TABLE_CREATED = "Table has been created.";
-
-    public static final String MESSAGE_TABLE_REMOVED = "Table has been removed.";
-
-    public static final String MESSAGE_ALTER_TABLE_SUCCEEDED = "Alter table succeeded!";
-
-    public static final String MESSAGE_ALTER_TABLE_FAILED = "Alter table failed!";
-
-    public static final String MESSAGE_VIEW_CREATED = "View has been created.";
-
-    public static final String MESSAGE_VIEW_REMOVED = "View has been removed.";
-
-    public static final String MESSAGE_ALTER_VIEW_SUCCEEDED = "Alter view succeeded!";
-
-    public static final String MESSAGE_ALTER_VIEW_FAILED = "Alter view failed!";
-
-    public static final String MESSAGE_FUNCTION_CREATED = "Function has been created.";
-
-    public static final String MESSAGE_FUNCTION_REMOVED = "Function has been removed.";
-
-    public static final String MESSAGE_ALTER_FUNCTION_SUCCEEDED = "Alter function succeeded!";
-
-    public static final String MESSAGE_ALTER_FUNCTION_FAILED = "Alter function failed!";
-
-    public static final String MESSAGE_DATABASE_CREATED = "Database has been created.";
-
-    public static final String MESSAGE_DATABASE_REMOVED = "Database has been removed.";
-
-    public static final String MESSAGE_ALTER_DATABASE_SUCCEEDED = "Alter database succeeded!";
-
-    public static final String MESSAGE_ALTER_DATABASE_FAILED = "Alter database failed!";
-
-    public static final String MESSAGE_CATALOG_CREATED = "Catalog has been created.";
-
-    public static final String MESSAGE_CATALOG_REMOVED = "Catalog has been removed.";
+    public static final String MESSAGE_DEPLOY_SCRIPT = "Deploy script in application mode: ";
 
     // --------------------------------------------------------------------------------------------
 
@@ -309,14 +330,108 @@ public final class CliStrings {
                 .toAttributedString();
     }
 
-    public static AttributedString messageError(String message, Throwable t) {
-        while (t.getCause() != null
-                && t.getCause().getMessage() != null
-                && !t.getCause().getMessage().isEmpty()) {
-            t = t.getCause();
+    public static AttributedString messageWarning(String message) {
+        return new AttributedStringBuilder()
+                .style(AttributedStyle.DEFAULT.bold().foreground(AttributedStyle.YELLOW))
+                .append("[WARNING] ")
+                .append(message)
+                .toAttributedString();
+    }
+
+    public static AttributedString messageError(String message, Throwable t, boolean isVerbose) {
+        final Throwable reason = findReason(t);
+        if (isVerbose) {
+            return messageError(message, ExceptionUtils.stringifyException(reason));
+        } else if (reason instanceof RestClientException) {
+            // TODO: Remove this after RestClientException supports to get RootCause.
+            return messageError(message, findReasonInStackTrace(reason.getMessage()));
+        } else {
+            return messageError(message, reason.getClass().getName() + ": " + reason.getMessage());
         }
-        return messageError(message, t.getClass().getName() + ": " + t.getMessage());
-        // return messageError(message, ExceptionUtils.stringifyException(t));
+    }
+
+    /**
+     * The root cause, or the outermost exception whose message ends with the root message and adds
+     * context in front of it, as Calcite does with the position of a validation error. A planning
+     * rejection, where the plan follows the reason, does not qualify. The planner's parse exception
+     * is picked by type, since it echoes the line inside the Calcite text. The search starts at a
+     * {@link RestClientException}, whose message is the whole server trace.
+     */
+    private static Throwable findReason(Throwable t) {
+        final List<Throwable> chain = new ArrayList<>();
+        final Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        int outermost = 0;
+        for (Throwable current = t;
+                current != null && seen.add(current);
+                current = current.getCause()) {
+            chain.add(current);
+            if (current instanceof RestClientException) {
+                outermost = chain.size() - 1;
+            }
+            final Throwable cause = current.getCause();
+            if (cause == null || cause.getMessage() == null || cause.getMessage().isEmpty()) {
+                break;
+            }
+        }
+        final Throwable root = chain.get(chain.size() - 1);
+        for (int i = outermost; i < chain.size() - 1; i++) {
+            final Throwable candidate = chain.get(i);
+            final Throwable cause = chain.get(i + 1);
+            final boolean parseError = isParseError(candidate, cause);
+            final boolean quotesRootCause = addsContext(candidate.getMessage(), root.getMessage());
+            final boolean repeatsCause = cause.toString().equals(candidate.getMessage());
+            if (parseError || (quotesRootCause && !repeatsCause)) {
+                return candidate;
+            }
+        }
+        return root;
+    }
+
+    /** Applies the rule of {@link #findReason} to a stringified stack trace. */
+    private static String findReasonInStackTrace(String stackTrace) {
+        final String[] segments = CAUSED_BY.split(stackTrace);
+        final String root = headline(segments[segments.length - 1]);
+        // The first segment is the response preamble, never a cause worth showing on its own.
+        for (int i = 1; i < segments.length - 1; i++) {
+            final String candidate = headline(segments[i]);
+            final String cause = headline(segments[i + 1]);
+            final boolean parseError = isParseError(candidate, cause);
+            final boolean quotesRootCause = addsContext(messageOf(candidate), messageOf(root));
+            final boolean repeatsCause = messageOf(candidate).equals(cause);
+            if (parseError || (quotesRootCause && !repeatsCause)) {
+                return candidate;
+            }
+        }
+        return root;
+    }
+
+    private static boolean isParseError(Throwable candidate, Throwable cause) {
+        return candidate instanceof SqlParserException
+                && cause.getClass().getName().equals(CALCITE_PARSE_EXCEPTION);
+    }
+
+    private static boolean isParseError(String headline, String causeHeadline) {
+        return headline.startsWith(SqlParserException.class.getName() + ": ")
+                && causeHeadline.startsWith(CALCITE_PARSE_EXCEPTION + ": ");
+    }
+
+    private static boolean addsContext(String outer, String inner) {
+        return outer != null
+                && inner != null
+                && !inner.isEmpty()
+                && outer.length() > inner.length()
+                && outer.endsWith(inner);
+    }
+
+    /** The exception line of a stack trace segment, without its frames. */
+    private static String headline(String segment) {
+        final Matcher end = HEADLINE_END.matcher(segment);
+        return (end.find() ? segment.substring(0, end.start()) : segment).trim();
+    }
+
+    private static String messageOf(String headline) {
+        final int separator = headline.indexOf(": ");
+        return separator < 0 ? "" : headline.substring(separator + 2);
     }
 
     public static AttributedString messageError(String message) {
@@ -335,16 +450,5 @@ public final class CliStrings {
         }
 
         return builder.toAttributedString();
-    }
-
-    private static AttributedString formatCommand(SqlCommand cmd, String description) {
-        return new AttributedStringBuilder()
-                .style(AttributedStyle.DEFAULT.bold())
-                .append(cmd.toString())
-                .append("\t\t")
-                .style(AttributedStyle.DEFAULT)
-                .append(description)
-                .append('\n')
-                .toAttributedString();
     }
 }

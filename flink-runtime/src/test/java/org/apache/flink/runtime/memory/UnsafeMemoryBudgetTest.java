@@ -18,86 +18,63 @@
 
 package org.apache.flink.runtime.memory;
 
-import org.apache.flink.util.JavaGcCleanerWrapper;
-import org.apache.flink.util.TestLogger;
+import org.junit.jupiter.api.Test;
 
-import org.junit.Test;
-
-import static org.hamcrest.CoreMatchers.is;
-import static org.junit.Assert.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 
 /** Test suite for {@link UnsafeMemoryBudget}. */
-public class UnsafeMemoryBudgetTest extends TestLogger {
-    static final int MAX_SLEEPS_VERIFY_EMPTY_FOR_TESTS =
-            10; // 2^10 - 1 = (1 x 1024) - 1 ms ~ 1 s total sleep duration
+class UnsafeMemoryBudgetTest {
 
     @Test
-    public void testGetTotalMemory() {
+    void testGetTotalMemory() {
         UnsafeMemoryBudget budget = createUnsafeMemoryBudget();
-        assertThat(budget.getTotalMemorySize(), is(100L));
+        assertThat(budget.getTotalMemorySize()).isEqualTo(100L);
     }
 
     @Test
-    public void testAvailableMemory() throws MemoryReservationException {
+    void testAvailableMemory() throws MemoryReservationException {
         UnsafeMemoryBudget budget = createUnsafeMemoryBudget();
-        assertThat(budget.getAvailableMemorySize(), is(100L));
+        assertThat(budget.getAvailableMemorySize()).isEqualTo(100L);
 
         budget.reserveMemory(10L);
-        assertThat(budget.getAvailableMemorySize(), is(90L));
+        assertThat(budget.getAvailableMemorySize()).isEqualTo(90L);
 
         budget.releaseMemory(10L);
-        assertThat(budget.getAvailableMemorySize(), is(100L));
+        assertThat(budget.getAvailableMemorySize()).isEqualTo(100L);
     }
 
     @Test
-    public void testReserveMemory() throws MemoryReservationException {
+    void testReserveMemory() throws MemoryReservationException {
         UnsafeMemoryBudget budget = createUnsafeMemoryBudget();
         budget.reserveMemory(50L);
-        assertThat(budget.getAvailableMemorySize(), is(50L));
-    }
-
-    @Test(expected = MemoryReservationException.class)
-    public void testReserveMemoryOverLimitFails() throws MemoryReservationException {
-        UnsafeMemoryBudget budget = createUnsafeMemoryBudget();
-        budget.reserveMemory(120L);
+        assertThat(budget.getAvailableMemorySize()).isEqualTo(50L);
     }
 
     @Test
-    public void testReleaseMemory() throws MemoryReservationException {
+    void testReserveMemoryOverLimitFails() {
+        UnsafeMemoryBudget budget = createUnsafeMemoryBudget();
+        assertThatExceptionOfType(MemoryReservationException.class)
+                .isThrownBy(() -> budget.reserveMemory(120L));
+    }
+
+    @Test
+    void testReleaseMemory() throws MemoryReservationException {
         UnsafeMemoryBudget budget = createUnsafeMemoryBudget();
         budget.reserveMemory(50L);
         budget.releaseMemory(30L);
-        assertThat(budget.getAvailableMemorySize(), is(80L));
-    }
-
-    @Test(expected = IllegalStateException.class)
-    public void testReleaseMemoryMoreThanReservedFails() throws MemoryReservationException {
-        UnsafeMemoryBudget budget = createUnsafeMemoryBudget();
-        budget.reserveMemory(50L);
-        budget.releaseMemory(70L);
-    }
-
-    @Test(expected = MemoryReservationException.class)
-    public void testReservationFailsIfOwnerNotGced() throws MemoryReservationException {
-        UnsafeMemoryBudget budget = createUnsafeMemoryBudget();
-        Object memoryOwner = new Object();
-        budget.reserveMemory(50L);
-        JavaGcCleanerWrapper.createCleaner(memoryOwner, () -> budget.releaseMemory(50L));
-        budget.reserveMemory(60L);
-        // this should not be reached but keeps the reference to the memoryOwner and prevents its GC
-        log.info(memoryOwner.toString());
+        assertThat(budget.getAvailableMemorySize()).isEqualTo(80L);
     }
 
     @Test
-    public void testReservationSuccessIfOwnerGced() throws MemoryReservationException {
+    void testReleaseMemoryMoreThanReservedFails() throws MemoryReservationException {
         UnsafeMemoryBudget budget = createUnsafeMemoryBudget();
         budget.reserveMemory(50L);
-        JavaGcCleanerWrapper.createCleaner(new Object(), () -> budget.releaseMemory(50L));
-        budget.reserveMemory(60L);
-        assertThat(budget.getAvailableMemorySize(), is(40L));
+        assertThatExceptionOfType(IllegalStateException.class)
+                .isThrownBy(() -> budget.releaseMemory(70L));
     }
 
     private static UnsafeMemoryBudget createUnsafeMemoryBudget() {
-        return new UnsafeMemoryBudget(100L, MAX_SLEEPS_VERIFY_EMPTY_FOR_TESTS);
+        return new UnsafeMemoryBudget(100L);
     }
 }

@@ -19,28 +19,56 @@
 package org.apache.flink.sql.parser.dql;
 
 import org.apache.calcite.sql.SqlCall;
+import org.apache.calcite.sql.SqlCharStringLiteral;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.SqlSpecialOperator;
-import org.apache.calcite.sql.SqlWriter;
 import org.apache.calcite.sql.parser.SqlParserPos;
-import org.apache.calcite.util.ImmutableNullableList;
 
+import java.util.ArrayList;
 import java.util.List;
 
-/** SHOW FUNCTION Sql Call. */
-public class SqlShowFunctions extends SqlCall {
+/**
+ * Show Functions sql call. The full syntax for show functions is as followings:
+ *
+ * <pre>{@code
+ * SHOW [USER] FUNCTIONS [ ( FROM | IN ) [catalog_name.]database_name ] [ [NOT] (LIKE | ILIKE)
+ * <sql_like_pattern> ] statement
+ * }</pre>
+ */
+public class SqlShowFunctions extends SqlShowCall {
 
     public static final SqlSpecialOperator OPERATOR =
-            new SqlSpecialOperator("SHOW FUNCTIONS", SqlKind.OTHER);
+            new SqlSpecialOperator("SHOW FUNCTIONS", SqlKind.OTHER) {
+                @Override
+                public SqlCall createCall(
+                        SqlLiteral functionQualifier, SqlParserPos pos, SqlNode... operands) {
+                    return new SqlShowFunctions(
+                            pos,
+                            operandToBoolean(operands[5]),
+                            operandToString(operands[1]),
+                            (SqlIdentifier) operands[0],
+                            operandToString(operands[2]),
+                            (SqlCharStringLiteral) operands[3],
+                            operandToBoolean(operands[4]));
+                }
+            };
 
-    private final SqlIdentifier databaseName;
+    private final boolean requireUser;
 
-    public SqlShowFunctions(SqlParserPos pos, SqlIdentifier database) {
-        super(pos);
-        this.databaseName = database;
+    public SqlShowFunctions(
+            SqlParserPos pos,
+            boolean requireUser,
+            String preposition,
+            SqlIdentifier databaseName,
+            String likeType,
+            SqlCharStringLiteral likeLiteral,
+            boolean notLike) {
+        super(pos, preposition, databaseName, likeType, likeLiteral, notLike);
+        this.requireUser = requireUser;
     }
 
     @Override
@@ -48,20 +76,19 @@ public class SqlShowFunctions extends SqlCall {
         return OPERATOR;
     }
 
+    public boolean requireUser() {
+        return requireUser;
+    }
+
     @Override
     public List<SqlNode> getOperandList() {
-        return ImmutableNullableList.of(databaseName);
+        List<SqlNode> operands = new ArrayList<>(super.getOperandList());
+        operands.add(SqlLiteral.createBoolean(requireUser, SqlParserPos.ZERO));
+        return operands;
     }
 
     @Override
-    public void unparse(SqlWriter writer, int leftPrec, int rightPrec) {
-        writer.keyword("SHOW FUNCTIONS");
-        if (databaseName != null) {
-            databaseName.unparse(writer, leftPrec, rightPrec);
-        }
-    }
-
-    public String[] getDatabasePath() {
-        return databaseName.names.toArray(new String[0]);
+    String getOperationName() {
+        return requireUser ? "SHOW USER FUNCTIONS" : "SHOW FUNCTIONS";
     }
 }

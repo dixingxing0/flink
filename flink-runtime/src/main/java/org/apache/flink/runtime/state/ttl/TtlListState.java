@@ -103,13 +103,33 @@ class TtlListState<K, N, T>
     @Nullable
     @Override
     public List<TtlValue<T>> getUnexpiredOrNull(@Nonnull List<TtlValue<T>> ttlValues) {
+        // the update operation will clear the whole state if the list becomes empty after init
+        if (ttlValues.isEmpty()) {
+            return ttlValues;
+        }
+
         long currentTimestamp = timeProvider.currentTimestamp();
-        List<TtlValue<T>> unexpired = new ArrayList<>(ttlValues.size());
         TypeSerializer<TtlValue<T>> elementSerializer =
                 ((ListSerializer<TtlValue<T>>) original.getValueSerializer())
                         .getElementSerializer();
-        for (TtlValue<T> ttlValue : ttlValues) {
-            if (!TtlUtils.expired(ttlValue, ttl, currentTimestamp)) {
+        int firstExpireElementIndex = -1;
+        for (int i = 0; i < ttlValues.size(); i++) {
+            TtlValue<T> ttlValue = ttlValues.get(i);
+            if (TtlUtils.expired(ttlValue, ttl, currentTimestamp)) {
+                firstExpireElementIndex = i;
+                break;
+            }
+        }
+        if (firstExpireElementIndex == -1) {
+            return ttlValues;
+        }
+
+        List<TtlValue<T>> unexpired = new ArrayList<>(ttlValues.size());
+        for (int i = 0; i < ttlValues.size(); i++) {
+            TtlValue<T> ttlValue = ttlValues.get(i);
+            if (i < firstExpireElementIndex
+                    || (i > firstExpireElementIndex
+                            && !TtlUtils.expired(ttlValue, ttl, currentTimestamp))) {
                 // we have to do the defensive copy to update the value
                 unexpired.add(elementSerializer.copy(ttlValue));
             }
@@ -117,7 +137,8 @@ class TtlListState<K, N, T>
         if (!unexpired.isEmpty()) {
             return unexpired;
         } else {
-            return ttlValues.size() == unexpired.size() ? ttlValues : unexpired;
+            // list is not empty and all expired
+            return null;
         }
     }
 

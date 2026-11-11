@@ -18,6 +18,7 @@
 
 package org.apache.flink.table.api;
 
+import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.table.api.internal.BaseExpressions;
 import org.apache.flink.table.expressions.Expression;
 import org.apache.flink.table.expressions.ExpressionVisitor;
@@ -29,6 +30,7 @@ import java.util.List;
  *
  * @see BaseExpressions
  */
+@PublicEvolving
 public final class ApiExpression extends BaseExpressions<Object, ApiExpression>
         implements Expression {
     private final Expression wrappedExpression;
@@ -38,7 +40,7 @@ public final class ApiExpression extends BaseExpressions<Object, ApiExpression>
         return wrappedExpression.asSummaryString();
     }
 
-    ApiExpression(Expression wrappedExpression) {
+    public ApiExpression(Expression wrappedExpression) {
         if (wrappedExpression instanceof ApiExpression) {
             throw new UnsupportedOperationException("This is a bug. Please file an issue.");
         }

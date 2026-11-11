@@ -15,12 +15,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.flink.runtime.executiongraph;
 
 import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
 
-import javax.annotation.Nullable;
+import java.util.Collection;
+import java.util.Optional;
 
 /** Common interface for the runtime {@link ExecutionVertex} and {@link ArchivedExecutionVertex}. */
 public interface AccessExecutionVertex {
@@ -46,6 +48,14 @@ public interface AccessExecutionVertex {
     AccessExecution getCurrentExecutionAttempt();
 
     /**
+     * Returns the current executions for this execution vertex. The returned collection must
+     * contain the current execution attempt.
+     *
+     * @return current executions
+     */
+    <T extends AccessExecution> Collection<T> getCurrentExecutions();
+
+    /**
      * Returns the current {@link ExecutionState} for this execution vertex.
      *
      * @return execution state for this execution vertex
@@ -64,9 +74,10 @@ public interface AccessExecutionVertex {
      * Returns the exception that caused the job to fail. This is the first root exception that was
      * not recoverable and triggered job failure.
      *
-     * @return failure exception as a string, or {@code "(null)"}
+     * @return failure exception wrapped in an {@code Optional} of {@link ErrorInfo}, or an empty
+     *     {@link Optional} if no exception was caught.
      */
-    String getFailureCauseAsString();
+    Optional<ErrorInfo> getFailureInfo();
 
     /**
      * Returns the {@link TaskManagerLocation} for this execution vertex.
@@ -76,11 +87,9 @@ public interface AccessExecutionVertex {
     TaskManagerLocation getCurrentAssignedResourceLocation();
 
     /**
-     * Returns the execution for the given attempt number.
+     * Returns the execution history.
      *
-     * @param attemptNumber attempt number of execution to be returned
-     * @return execution for the given attempt number
+     * @return the execution history
      */
-    @Nullable
-    AccessExecution getPriorExecutionAttempt(int attemptNumber);
+    ExecutionHistory getExecutionHistory();
 }

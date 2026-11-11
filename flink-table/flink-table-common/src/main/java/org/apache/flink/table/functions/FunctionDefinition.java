@@ -29,8 +29,9 @@ import java.util.Set;
  * Definition of a function. Instances of this class provide all details necessary to validate a
  * function call and perform planning.
  *
- * <p>A pure function definition must not contain a runtime implementation. This can be provided by
- * the planner at later stages.
+ * <p>A pure function definition doesn't have to contain a runtime implementation. This can be
+ * provided by the planner at later stages. A {@link UserDefinedFunction} is a function definition
+ * that includes a runtime implementation already.
  *
  * @see UserDefinedFunction
  */
@@ -72,6 +73,14 @@ public interface FunctionDefinition {
      * reduction during planning for constant calls to this function.
      */
     default boolean isDeterministic() {
+        return true;
+    }
+
+    /**
+     * If the constant-folding should be run during planning time on calls to this function. If not,
+     * the expression will be left as-is and the call will be made during runtime.
+     */
+    default boolean supportsConstantFolding() {
         return true;
     }
 }

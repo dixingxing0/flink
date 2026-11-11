@@ -20,10 +20,10 @@ package org.apache.flink.runtime.jobmaster.slotpool;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
+import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
 import org.apache.flink.runtime.jobmanager.slots.TaskManagerGateway;
 import org.apache.flink.runtime.jobmaster.SlotInfo;
 import org.apache.flink.runtime.messages.Acknowledge;
@@ -32,6 +32,7 @@ import org.apache.flink.runtime.slots.RequirementMatcher;
 import org.apache.flink.runtime.slots.ResourceRequirement;
 import org.apache.flink.runtime.taskexecutor.slot.SlotOffer;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
+import org.apache.flink.runtime.util.ResourceCounter;
 import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.Preconditions;
 
@@ -41,16 +42,20 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
+import java.util.function.Function;
 
 /**
  * Default {@link DeclarativeSlotPool} implementation.
@@ -64,18 +69,33 @@ import java.util.stream.Collectors;
  *
  * <p>The slot pool will call {@link #newSlotsListener} whenever newly offered slots are accepted or
  * if an allocated slot should become free after it is being {@link #freeReservedSlot freed}.
+ *
+ * <p>This class expects 1 of 2 access patterns for changing requirements, which should not be
+ * mixed:
+ *
+ * <p>1) the legacy approach (used by the DefaultScheduler) tightly couples requirements to reserved
+ * slots. When a slot is requested it increases the requirements, when the slot is freed they are
+ * decreased again. In the general case what happens is that requirements are increased, a free slot
+ * is reserved, (the slot is used for a bit,) the slot is freed, the requirements are reduced. To
+ * this end {@link #freeReservedSlot}, {@link #releaseSlot} and {@link #releaseSlots} return a
+ * {@link ResourceCounter} describing which requirement the slot(s) were fulfilling, with the
+ * expectation that the scheduler will subsequently decrease the requirements by that amount.
+ *
+ * <p>2) The declarative approach (used by the AdaptiveScheduler) in contrast derives requirements
+ * exclusively based on what a given job currently requires. It may repeatedly reserve/free slots
+ * without any modifications to the requirements.
  */
 public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
 
-    private static final Logger LOG = LoggerFactory.getLogger(DefaultDeclarativeSlotPool.class);
+    protected final Logger log = LoggerFactory.getLogger(getClass());
 
     private final Consumer<? super Collection<ResourceRequirement>> notifyNewResourceRequirements;
 
-    private final Time idleSlotTimeout;
-    private final Time rpcTimeout;
+    private final Duration idleSlotTimeout;
+    private final Duration rpcTimeout;
 
     private final JobID jobId;
-    private final AllocatedSlotPool slotPool;
+    protected final AllocatedSlotPool slotPool;
 
     private final Map<AllocationID, ResourceProfile> slotToRequirementProfileMappings;
 
@@ -84,24 +104,43 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
     private ResourceCounter fulfilledResourceRequirements;
 
     private NewSlotsListener newSlotsListener = NoOpNewSlotsListener.INSTANCE;
+    private ResourceRequestStableListener resourceRequestStableListener =
+            NoOpResourceRequestStableListener.INSTANCE;
 
     private final RequirementMatcher requirementMatcher = new DefaultRequirementMatcher();
+
+    @Nonnull private final ComponentMainThreadExecutor componentMainThreadExecutor;
+
+    // For slots(resources) requests by batch.
+    @Nonnull private final Duration slotRequestMaxInterval;
+    @Nullable private ScheduledFuture<?> slotRequestFuture;
+    private boolean resourceRequestStable;
 
     public DefaultDeclarativeSlotPool(
             JobID jobId,
             AllocatedSlotPool slotPool,
             Consumer<? super Collection<ResourceRequirement>> notifyNewResourceRequirements,
-            Time idleSlotTimeout,
-            Time rpcTimeout) {
+            Duration idleSlotTimeout,
+            Duration rpcTimeout,
+            Duration slotRequestMaxInterval,
+            ComponentMainThreadExecutor componentMainThreadExecutor) {
 
         this.jobId = jobId;
         this.slotPool = slotPool;
         this.notifyNewResourceRequirements = notifyNewResourceRequirements;
         this.idleSlotTimeout = idleSlotTimeout;
         this.rpcTimeout = rpcTimeout;
+        this.componentMainThreadExecutor = Preconditions.checkNotNull(componentMainThreadExecutor);
+        this.slotRequestMaxInterval = Preconditions.checkNotNull(slotRequestMaxInterval);
+        this.resourceRequestStable = true;
         this.totalResourceRequirements = ResourceCounter.empty();
         this.fulfilledResourceRequirements = ResourceCounter.empty();
         this.slotToRequirementProfileMappings = new HashMap<>();
+    }
+
+    @Override
+    public boolean isResourceRequestStable() {
+        return resourceRequestStable;
     }
 
     @Override
@@ -111,7 +150,7 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
         }
         totalResourceRequirements = totalResourceRequirements.add(increment);
 
-        declareResourceRequirements();
+        doDeclareResourceRequirements(false);
     }
 
     @Override
@@ -121,13 +160,52 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
         }
         totalResourceRequirements = totalResourceRequirements.subtract(decrement);
 
+        doDeclareResourceRequirements(false);
+    }
+
+    private void doDeclareResourceRequirements(boolean internalAdjust) {
+        if (slotRequestMaxInterval.toMillis() <= 0L) {
+            declareResourceRequirements();
+        } else {
+            cancelSlotRequestFutureTaskIfNeeded();
+
+            if (!internalAdjust) {
+                resourceRequestStable = false;
+            }
+
+            slotRequestFuture =
+                    componentMainThreadExecutor.schedule(
+                            () -> {
+                                declareResourceRequirements();
+                                if (!internalAdjust) {
+                                    resourceRequestStable = true;
+                                    resourceRequestStableListener.notifyResourceRequestStable();
+                                }
+                            },
+                            slotRequestMaxInterval.toMillis(),
+                            TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void cancelSlotRequestFutureTaskIfNeeded() {
+        if (slotRequestFuture != null
+                && !slotRequestFuture.isDone()
+                && !slotRequestFuture.isCancelled()) {
+            slotRequestFuture.cancel(true);
+        }
+    }
+
+    @Override
+    public void setResourceRequirements(ResourceCounter resourceRequirements) {
+        totalResourceRequirements = resourceRequirements;
+
         declareResourceRequirements();
     }
 
     private void declareResourceRequirements() {
         final Collection<ResourceRequirement> resourceRequirements = getResourceRequirements();
 
-        LOG.debug(
+        log.debug(
                 "Declare new resource requirements for job {}.{}\trequired resources: {}{}\tacquired resources: {}",
                 jobId,
                 System.lineSeparator(),
@@ -158,10 +236,22 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
             TaskManagerGateway taskManagerGateway,
             long currentTime) {
 
-        LOG.debug(
-                "Received {} slot offers from TaskExecutor {}.",
-                offers.size(),
-                taskManagerLocation);
+        log.debug("Received {} slot offers from TaskExecutor {}.", offers, taskManagerLocation);
+
+        return internalOfferSlots(
+                offers,
+                taskManagerLocation,
+                taskManagerGateway,
+                currentTime,
+                this::matchWithOutstandingRequirement);
+    }
+
+    private Collection<SlotOffer> internalOfferSlots(
+            Collection<? extends SlotOffer> offers,
+            TaskManagerLocation taskManagerLocation,
+            TaskManagerGateway taskManagerGateway,
+            long currentTime,
+            Function<ResourceProfile, Optional<ResourceProfile>> matchingCondition) {
         final Collection<SlotOffer> acceptedSlotOffers = new ArrayList<>();
         final Collection<AllocatedSlot> acceptedSlots = new ArrayList<>();
 
@@ -172,12 +262,12 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
             } else {
                 Optional<AllocatedSlot> acceptedSlot =
                         matchOfferWithOutstandingRequirements(
-                                offer, taskManagerLocation, taskManagerGateway);
+                                offer, taskManagerLocation, taskManagerGateway, matchingCondition);
                 if (acceptedSlot.isPresent()) {
                     acceptedSlotOffers.add(offer);
                     acceptedSlots.add(acceptedSlot.get());
                 } else {
-                    LOG.debug(
+                    log.debug(
                             "Could not match offer {} to any outstanding requirement.",
                             offer.getAllocationId());
                 }
@@ -187,7 +277,7 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
         slotPool.addSlots(acceptedSlots, currentTime);
 
         if (!acceptedSlots.isEmpty()) {
-            LOG.debug(
+            log.debug(
                     "Acquired new resources; new total acquired resources: {}",
                     fulfilledResourceRequirements);
             newSlotsListener.notifyNewSlotsAreAvailable(acceptedSlots);
@@ -196,20 +286,54 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
         return acceptedSlotOffers;
     }
 
+    @Override
+    public Collection<SlotOffer> registerSlots(
+            Collection<? extends SlotOffer> slots,
+            TaskManagerLocation taskManagerLocation,
+            TaskManagerGateway taskManagerGateway,
+            long currentTime) {
+        // This method exists to allow slots to be re-offered by recovered TMs while the job is in a
+        // restarting state (where it usually hasn't set any requirements).
+        // For this to work with the book-keeping of this class these slots are "matched" against
+        // the ResourceProfile.ANY, which in practice isn't used.
+        // If such a slot is then later reserved the mapping is updated accordingly.
+        // While this approach does have the downside of somewhat hiding this special case, it
+        // does allow the slot timeouts or releases to work as if the case didn't exist at all.
+
+        log.debug("Register slots {} from TaskManager {}.", slots, taskManagerLocation);
+        internalOfferSlots(
+                slots,
+                taskManagerLocation,
+                taskManagerGateway,
+                currentTime,
+                this::matchWithOutstandingRequirementOrWildcard);
+        return new ArrayList<>(slots);
+    }
+
+    private Optional<ResourceProfile> matchWithOutstandingRequirementOrWildcard(
+            ResourceProfile resourceProfile) {
+        final Optional<ResourceProfile> match = matchWithOutstandingRequirement(resourceProfile);
+
+        if (match.isPresent()) {
+            return match;
+        } else {
+            // use ANY as wildcard as there is no practical purpose for a slot with 0 resources
+            return Optional.of(ResourceProfile.ANY);
+        }
+    }
+
     private Optional<AllocatedSlot> matchOfferWithOutstandingRequirements(
             SlotOffer slotOffer,
             TaskManagerLocation taskManagerLocation,
-            TaskManagerGateway taskManagerGateway) {
+            TaskManagerGateway taskManagerGateway,
+            Function<ResourceProfile, Optional<ResourceProfile>> matchingCondition) {
 
         final Optional<ResourceProfile> match =
-                requirementMatcher.match(
-                        slotOffer.getResourceProfile(),
-                        totalResourceRequirements.getResourcesWithCount(),
-                        fulfilledResourceRequirements::getResourceCount);
+                matchingCondition.apply(slotOffer.getResourceProfile());
 
         if (match.isPresent()) {
             final ResourceProfile matchedRequirement = match.get();
-            LOG.debug(
+            log.debug(
                     "Matched slot offer {} to requirement {}.",
                     slotOffer.getAllocationId(),
                     matchedRequirement);
@@ -227,6 +351,14 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
             return Optional.of(allocatedSlot);
         }
         return Optional.empty();
+    }
+
+    private Optional<ResourceProfile> matchWithOutstandingRequirement(
+            ResourceProfile resourceProfile) {
+        return requirementMatcher.match(
+                resourceProfile,
+                totalResourceRequirements,
+                fulfilledResourceRequirements::getResourceCount);
     }
 
     @VisibleForTesting
@@ -275,17 +407,26 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
 
         if (!previouslyMatchedResourceProfile.equals(requiredSlotProfile)) {
             // slots can be reserved for a requirement that is not in line with the mapping we
-            // computed when the slot was
-            // offered, so we have to update the mapping adjust the requirements accordingly to
-            // ensure we still request enough slots to
-            // be able to fulfill the total requirements
-            LOG.debug(
-                    "Adjusting requirements because a slot was reserved for a different requirement than initially assumed. Slot={} assumedRequirement={} actualRequirement={}",
-                    allocationId,
-                    previouslyMatchedResourceProfile,
-                    requiredSlotProfile);
+            // computed when the slot was offered, so we have to update the mapping
             updateSlotToRequirementProfileMapping(allocationId, requiredSlotProfile);
-            adjustRequirements(previouslyMatchedResourceProfile, requiredSlotProfile);
+            if (previouslyMatchedResourceProfile == ResourceProfile.ANY) {
+                log.debug(
+                        "Re-matched slot offer {} to requirement {}.",
+                        allocationId,
+                        requiredSlotProfile);
+            } else {
+                // adjust the requirements accordingly to ensure we still request enough slots to
+                // be able to fulfill the total requirements
+                // If the previous profile was ANY, then the slot was accepted without
+                // being matched against a resource requirement; thus no update is needed.
+
+                log.debug(
+                        "Adjusting requirements because a slot was reserved for a different requirement than initially assumed. Slot={} assumedRequirement={} actualRequirement={}",
+                        allocationId,
+                        previouslyMatchedResourceProfile,
+                        requiredSlotProfile);
+                adjustRequirements(previouslyMatchedResourceProfile, requiredSlotProfile);
+            }
         }
 
         return allocatedSlot;
@@ -294,7 +435,7 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
     @Override
     public ResourceCounter freeReservedSlot(
             AllocationID allocationId, @Nullable Throwable cause, long currentTime) {
-        LOG.debug("Free reserved slot {}.", allocationId);
+        log.debug("Free reserved slot {}.", allocationId);
 
         final Optional<AllocatedSlot> freedSlot =
                 slotPool.freeReservedSlot(allocationId, currentTime);
@@ -332,8 +473,12 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
         // offered, so we have to adjust the requirements accordingly to ensure we still request
         // enough slots to
         // be able to fulfill the total requirements
-        decreaseResourceRequirementsBy(ResourceCounter.withResource(newResourceProfile, 1));
-        increaseResourceRequirementsBy(ResourceCounter.withResource(oldResourceProfile, 1));
+        totalResourceRequirements =
+                totalResourceRequirements.subtract(
+                        ResourceCounter.withResource(newResourceProfile, 1));
+        totalResourceRequirements =
+                totalResourceRequirements.add(ResourceCounter.withResource(oldResourceProfile, 1));
+        doDeclareResourceRequirements(true);
     }
 
     @Override
@@ -345,31 +490,58 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
     }
 
     @Override
+    public void registerResourceRequestStableListener(ResourceRequestStableListener listener) {
+        Preconditions.checkState(
+                this.resourceRequestStableListener == NoOpResourceRequestStableListener.INSTANCE,
+                "DefaultDeclarativeSlotPool only supports a stable resource request listener.");
+        this.resourceRequestStableListener = Preconditions.checkNotNull(listener);
+    }
+
+    @Override
     public ResourceCounter releaseSlots(ResourceID owner, Exception cause) {
-        final Collection<AllocatedSlot> removedSlots = slotPool.removeSlots(owner);
+        final AllocatedSlotPool.AllocatedSlotsAndReservationStatus removedSlots =
+                slotPool.removeSlots(owner);
 
-        ResourceCounter previouslyFulfilledRequirements = getFulfilledRequirements(removedSlots);
+        final Collection<AllocatedSlot> slotsToFree = new ArrayList<>();
+        for (AllocatedSlot removedSlot : removedSlots.getAllocatedSlots()) {
+            if (!removedSlots.wasFree(removedSlot.getAllocationId())) {
+                slotsToFree.add(removedSlot);
+            }
+        }
 
-        releasePayload(removedSlots, cause);
-        releaseSlots(removedSlots, cause);
-
-        return previouslyFulfilledRequirements;
+        return freeAndReleaseSlots(slotsToFree, removedSlots.getAllocatedSlots(), cause);
     }
 
     @Override
     public ResourceCounter releaseSlot(AllocationID allocationId, Exception cause) {
+        final boolean wasSlotFree = slotPool.containsFreeSlot(allocationId);
         final Optional<AllocatedSlot> removedSlot = slotPool.removeSlot(allocationId);
 
-        Optional<ResourceCounter> previouslyFulfilledRequirement =
-                removedSlot.map(Collections::singleton).map(this::getFulfilledRequirements);
+        if (removedSlot.isPresent()) {
+            final AllocatedSlot slot = removedSlot.get();
 
-        removedSlot.ifPresent(
-                allocatedSlot -> {
-                    releasePayload(Collections.singleton(allocatedSlot), cause);
-                    releaseSlots(Collections.singleton(allocatedSlot), cause);
-                });
+            final Collection<AllocatedSlot> slotAsCollection = Collections.singleton(slot);
+            return freeAndReleaseSlots(
+                    wasSlotFree ? Collections.emptySet() : slotAsCollection,
+                    slotAsCollection,
+                    cause);
+        } else {
+            return ResourceCounter.empty();
+        }
+    }
 
-        return previouslyFulfilledRequirement.orElseGet(ResourceCounter::empty);
+    private ResourceCounter freeAndReleaseSlots(
+            Collection<AllocatedSlot> currentlyReservedSlots,
+            Collection<AllocatedSlot> slots,
+            Exception cause) {
+
+        ResourceCounter previouslyFulfilledRequirements =
+                getFulfilledRequirements(currentlyReservedSlots);
+
+        releasePayload(currentlyReservedSlots, cause);
+        releaseSlots(slots, cause);
+
+        return previouslyFulfilledRequirements;
     }
 
     private void releasePayload(Iterable<? extends AllocatedSlot> allocatedSlots, Throwable cause) {
@@ -381,7 +553,7 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
     @Override
     public void releaseIdleSlots(long currentTimeMillis) {
         final Collection<AllocatedSlotPool.FreeSlotInfo> freeSlotsInformation =
-                slotPool.getFreeSlotsInformation();
+                slotPool.getFreeSlotTracker().getFreeSlotsWithIdleSinceInformation();
 
         ResourceCounter excessResources =
                 fulfilledResourceRequirements.subtract(totalResourceRequirements);
@@ -394,7 +566,7 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
         while (!excessResources.isEmpty() && freeSlotIterator.hasNext()) {
             final AllocatedSlotPool.FreeSlotInfo idleSlot = freeSlotIterator.next();
 
-            if (currentTimeMillis >= idleSlot.getFreeSince() + idleSlotTimeout.toMilliseconds()) {
+            if (currentTimeMillis >= idleSlot.getFreeSince() + idleSlotTimeout.toMillis()) {
                 final ResourceProfile matchingProfile =
                         getMatchingResourceProfile(idleSlot.getAllocationId());
 
@@ -417,7 +589,7 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
 
         releaseSlots(
                 slotsToReturnToOwner, new FlinkException("Returning idle slots to their owners."));
-        LOG.debug(
+        log.debug(
                 "Idle slots have been returned; new total acquired resources: {}",
                 fulfilledResourceRequirements);
     }
@@ -426,10 +598,10 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
         for (AllocatedSlot slotToReturn : slotsToReturnToOwner) {
             Preconditions.checkState(!slotToReturn.isUsed(), "Free slot must not be used.");
 
-            if (LOG.isDebugEnabled()) {
-                LOG.info("Releasing slot [{}].", slotToReturn.getAllocationId(), cause);
+            if (log.isDebugEnabled()) {
+                log.info("Releasing slot [{}].", slotToReturn.getAllocationId(), cause);
             } else {
-                LOG.info("Releasing slot [{}].", slotToReturn.getAllocationId());
+                log.info("Releasing slot [{}].", slotToReturn.getAllocationId());
             }
 
             final ResourceProfile matchingResourceProfile =
@@ -447,7 +619,7 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
                     (Acknowledge ignored, Throwable throwable) -> {
                         if (throwable != null) {
                             // The slot status will be synced to task manager in next heartbeat.
-                            LOG.debug(
+                            log.debug(
                                     "Releasing slot [{}] of registered TaskExecutor {} failed. Discarding slot.",
                                     slotToReturn.getAllocationId(),
                                     slotToReturn.getTaskManagerId(),
@@ -458,15 +630,18 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
     }
 
     @Override
-    public Collection<SlotInfoWithUtilization> getFreeSlotsInformation() {
-        return slotPool.getFreeSlotsInformation().stream()
-                .map(AllocatedSlotPool.FreeSlotInfo::asSlotInfo)
-                .collect(Collectors.toList());
+    public FreeSlotTracker getFreeSlotTracker() {
+        return slotPool.getFreeSlotTracker();
     }
 
     @Override
     public Collection<? extends SlotInfo> getAllSlotsInformation() {
         return slotPool.getAllSlotsInformation();
+    }
+
+    @Override
+    public boolean containsFreeSlot(AllocationID allocationId) {
+        return slotPool.containsFreeSlot(allocationId);
     }
 
     @Override
@@ -490,5 +665,16 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
     @VisibleForTesting
     ResourceCounter getFulfilledResourceRequirements() {
         return fulfilledResourceRequirements;
+    }
+
+    @VisibleForTesting
+    void tryWaitSlotRequestIsDone() {
+        if (Objects.nonNull(slotRequestFuture)) {
+            try {
+                slotRequestFuture.get();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
     }
 }

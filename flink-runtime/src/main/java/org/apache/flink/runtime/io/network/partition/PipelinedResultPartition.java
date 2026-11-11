@@ -19,21 +19,30 @@
 package org.apache.flink.runtime.io.network.partition;
 
 import org.apache.flink.runtime.checkpoint.channel.ChannelStateWriter;
+import org.apache.flink.runtime.checkpoint.channel.ResultSubpartitionInfo;
+import org.apache.flink.runtime.io.network.api.EndOfData;
+import org.apache.flink.runtime.io.network.api.StopMode;
+import org.apache.flink.runtime.io.network.api.serialization.EventSerializer;
+import org.apache.flink.runtime.io.network.buffer.BufferBuilder;
 import org.apache.flink.runtime.io.network.buffer.BufferCompressor;
+import org.apache.flink.runtime.io.network.buffer.BufferConsumer;
 import org.apache.flink.runtime.io.network.buffer.BufferPool;
+import org.apache.flink.runtime.io.network.logger.NetworkActionsLogger;
+import org.apache.flink.runtime.io.network.partition.consumer.EndOfOutputChannelStateEvent;
 import org.apache.flink.util.function.SupplierWithException;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
 import java.io.IOException;
+import java.util.concurrent.CompletableFuture;
 
 import static org.apache.flink.util.Preconditions.checkArgument;
 
 /**
  * A result output of a task, pipelined (streamed) to the receivers.
  *
- * <p>This result partition implementation is used both in batch and streaming. For streaming it
+ * <p>This result partition implementation is used both in batch and streaming. For streaming, it
  * supports low latency transfers (ensure data is sent within x milliseconds) or unconstrained while
  * for batch it transfers only once a buffer is full. Additionally, for streaming use this typically
  * limits the length of the buffer backlog to not have too much data in flight, while for batch we
@@ -48,26 +57,53 @@ import static org.apache.flink.util.Preconditions.checkArgument;
  */
 public class PipelinedResultPartition extends BufferWritingResultPartition
         implements CheckpointedResultPartition, ChannelStateHolder {
+    private static final int PIPELINED_RESULT_PARTITION_ITSELF = -42;
 
     /**
-     * The lock that guard release operations (which can be asynchronously propagated from the
-     * networks threads.
+     * The lock that guard operations which can be asynchronously propagated from the networks
+     * threads.
      */
-    private final Object releaseLock = new Object();
+    private final Object lock = new Object();
+
+    /**
+     * A flag for each subpartition indicating whether the downstream task has processed all the
+     * user records.
+     */
+    @GuardedBy("lock")
+    private final boolean[] allRecordsProcessedSubpartitions;
+
+    /**
+     * The total number of subpartitions whose user records have not been fully processed by the
+     * downstream tasks yet.
+     */
+    @GuardedBy("lock")
+    private int numNotAllRecordsProcessedSubpartitions;
+
+    @GuardedBy("lock")
+    private boolean hasNotifiedEndOfUserRecords;
+
+    /**
+     * The future represents whether all the records has been processed by all the downstream tasks.
+     */
+    @GuardedBy("lock")
+    private final CompletableFuture<Void> allRecordsProcessedFuture = new CompletableFuture<>();
 
     /**
      * A flag for each subpartition indicating whether it was already consumed or not, to make
      * releases idempotent.
      */
-    @GuardedBy("releaseLock")
+    @GuardedBy("lock")
     private final boolean[] consumedSubpartitions;
 
     /**
      * The total number of references to subpartitions of this result. The result partition can be
-     * safely released, iff the reference count is zero.
+     * safely released, iff the reference count is zero. Every subpartition is a user of the result
+     * as well the {@link PipelinedResultPartition} is a user itself, as it's writing to those
+     * results. Even if all consumers are released, partition can not be released until writer
+     * releases the partition as well.
      */
-    @GuardedBy("releaseLock")
-    private int numUnconsumedSubpartitions;
+    @GuardedBy("lock")
+    private int numberOfUsers;
 
     public PipelinedResultPartition(
             String owningTaskName,
@@ -91,8 +127,11 @@ public class PipelinedResultPartition extends BufferWritingResultPartition
                 bufferCompressor,
                 bufferPoolFactory);
 
+        this.allRecordsProcessedSubpartitions = new boolean[subpartitions.length];
+        this.numNotAllRecordsProcessedSubpartitions = subpartitions.length;
+
         this.consumedSubpartitions = new boolean[subpartitions.length];
-        this.numUnconsumedSubpartitions = subpartitions.length;
+        this.numberOfUsers = subpartitions.length + 1;
     }
 
     @Override
@@ -110,6 +149,10 @@ public class PipelinedResultPartition extends BufferWritingResultPartition
      */
     @Override
     void onConsumedSubpartition(int subpartitionIndex) {
+        decrementNumberOfUsers(subpartitionIndex);
+    }
+
+    private void decrementNumberOfUsers(int subpartitionIndex) {
         if (isReleased()) {
             return;
         }
@@ -118,14 +161,16 @@ public class PipelinedResultPartition extends BufferWritingResultPartition
 
         // we synchronize only the bookkeeping section, to avoid holding the lock during any
         // calls into other components
-        synchronized (releaseLock) {
-            if (consumedSubpartitions[subpartitionIndex]) {
-                // repeated call - ignore
-                return;
-            }
+        synchronized (lock) {
+            if (subpartitionIndex != PIPELINED_RESULT_PARTITION_ITSELF) {
+                if (consumedSubpartitions[subpartitionIndex]) {
+                    // repeated call - ignore
+                    return;
+                }
 
-            consumedSubpartitions[subpartitionIndex] = true;
-            remainingUnconsumed = (--numUnconsumedSubpartitions);
+                consumedSubpartitions[subpartitionIndex] = true;
+            }
+            remainingUnconsumed = (--numberOfUsers);
         }
 
         LOG.debug(
@@ -140,8 +185,8 @@ public class PipelinedResultPartition extends BufferWritingResultPartition
     }
 
     @Override
-    public CheckpointedResultSubpartition getCheckpointedSubpartition(int subpartitionIndex) {
-        return (CheckpointedResultSubpartition) subpartitions[subpartitionIndex];
+    public ResultSubpartitionInfo getCheckpointedSubpartitionInfo(int subpartitionIndex) {
+        return subpartitions[subpartitionIndex].getSubpartitionInfo();
     }
 
     @Override
@@ -155,6 +200,37 @@ public class PipelinedResultPartition extends BufferWritingResultPartition
     }
 
     @Override
+    public void notifyEndOfData(StopMode mode) throws IOException {
+        synchronized (lock) {
+            if (!hasNotifiedEndOfUserRecords) {
+                broadcastEvent(new EndOfData(mode), false);
+                hasNotifiedEndOfUserRecords = true;
+            }
+        }
+    }
+
+    @Override
+    public CompletableFuture<Void> getAllDataProcessedFuture() {
+        return allRecordsProcessedFuture;
+    }
+
+    @Override
+    public void onSubpartitionAllDataProcessed(int subpartition) {
+        synchronized (lock) {
+            if (allRecordsProcessedSubpartitions[subpartition]) {
+                return;
+            }
+
+            allRecordsProcessedSubpartitions[subpartition] = true;
+            numNotAllRecordsProcessedSubpartitions--;
+
+            if (numNotAllRecordsProcessedSubpartitions == 0) {
+                allRecordsProcessedFuture.complete(null);
+            }
+        }
+    }
+
+    @Override
     @SuppressWarnings("FieldAccessNotGuarded")
     public String toString() {
         return "PipelinedResultPartition "
@@ -164,7 +240,7 @@ public class PipelinedResultPartition extends BufferWritingResultPartition
                 + ", "
                 + subpartitions.length
                 + " subpartitions, "
-                + numUnconsumedSubpartitions
+                + numberOfUsers
                 + " pending consumptions]";
     }
 
@@ -182,9 +258,44 @@ public class PipelinedResultPartition extends BufferWritingResultPartition
 
     @Override
     public void finishReadRecoveredState(boolean notifyAndBlockOnCompletion) throws IOException {
-        for (ResultSubpartition subpartition : subpartitions) {
-            ((CheckpointedResultSubpartition) subpartition)
-                    .finishReadRecoveredState(notifyAndBlockOnCompletion);
+        if (!notifyAndBlockOnCompletion) {
+            return;
         }
+        try (BufferConsumer eventBufferConsumer =
+                EventSerializer.toBufferConsumer(EndOfOutputChannelStateEvent.INSTANCE, false)) {
+            for (int i = 0; i < subpartitions.length; i++) {
+                if (((PipelinedSubpartition) subpartitions[i]).isSupportChannelStateRecover()) {
+                    addToSubpartition(i, eventBufferConsumer.copy(), 0);
+                }
+            }
+        }
+    }
+
+    @Override
+    public BufferBuilder requestBufferBuilderBlocking()
+            throws IOException, RuntimeException, InterruptedException {
+        return getBufferPool().requestBufferBuilderBlocking();
+    }
+
+    @Override
+    public void addRecovered(int subpartitionIndex, BufferConsumer bufferConsumer)
+            throws IOException {
+        ResultSubpartition subpartition = subpartitions[subpartitionIndex];
+        NetworkActionsLogger.traceRecover(
+                "PipelinedSubpartition#addRecovered",
+                bufferConsumer,
+                getOwningTaskName(),
+                subpartition.subpartitionInfo);
+
+        if (addToSubpartition(subpartitionIndex, bufferConsumer, Integer.MIN_VALUE)
+                == ResultSubpartition.ADD_BUFFER_ERROR_CODE) {
+            throw new IOException("Buffer consumer couldn't be added to ResultSubpartition");
+        }
+    }
+
+    @Override
+    public void close() {
+        decrementNumberOfUsers(PIPELINED_RESULT_PARTITION_ITSELF);
+        super.close();
     }
 }

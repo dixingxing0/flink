@@ -21,17 +21,18 @@ package org.apache.flink.runtime.jobgraph.topology;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSet;
 import org.apache.flink.runtime.jobgraph.JobEdge;
 import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobgraph.JobGraphTestUtils;
 import org.apache.flink.runtime.jobgraph.JobVertex;
+import org.apache.flink.util.IterableUtils;
 import org.apache.flink.util.TestLogger;
 
-import org.apache.flink.shaded.guava18.com.google.common.collect.Iterables;
+import org.apache.flink.shaded.guava33.com.google.common.collect.Iterables;
 
 import org.junit.Before;
 import org.junit.Test;
 
 import java.util.Iterator;
 import java.util.List;
-import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.runtime.executiongraph.ExecutionGraphTestUtils.createNoOpVertex;
@@ -40,6 +41,7 @@ import static org.apache.flink.runtime.io.network.partition.ResultPartitionType.
 import static org.apache.flink.runtime.jobgraph.DistributionPattern.ALL_TO_ALL;
 import static org.apache.flink.runtime.jobgraph.topology.DefaultLogicalResultTest.assertResultsEquals;
 import static org.apache.flink.runtime.jobgraph.topology.DefaultLogicalVertexTest.assertVertexInfoEquals;
+import static org.apache.flink.runtime.util.JobVertexConnectionUtils.connectNewDataSetAsInput;
 import static org.junit.Assert.assertEquals;
 
 /** Unit tests for {@link DefaultLogicalTopology}. */
@@ -52,7 +54,7 @@ public class DefaultLogicalTopologyTest extends TestLogger {
     @Before
     public void setUp() throws Exception {
         jobGraph = createJobGraph();
-        logicalTopology = new DefaultLogicalTopology(jobGraph);
+        logicalTopology = DefaultLogicalTopology.fromJobGraph(jobGraph);
     }
 
     @Test
@@ -74,9 +76,7 @@ public class DefaultLogicalTopologyTest extends TestLogger {
 
     @Test
     public void testGetLogicalPipelinedRegions() {
-        final Set<DefaultLogicalPipelinedRegion> regions =
-                logicalTopology.getLogicalPipelinedRegions();
-        assertEquals(2, regions.size());
+        assertEquals(2, IterableUtils.toStream(logicalTopology.getAllPipelinedRegions()).count());
     }
 
     private JobGraph createJobGraph() {
@@ -85,10 +85,10 @@ public class DefaultLogicalTopologyTest extends TestLogger {
         jobVertices[0] = createNoOpVertex("v1", parallelism);
         jobVertices[1] = createNoOpVertex("v2", parallelism);
         jobVertices[2] = createNoOpVertex("v3", parallelism);
-        jobVertices[1].connectNewDataSetAsInput(jobVertices[0], ALL_TO_ALL, PIPELINED);
-        jobVertices[2].connectNewDataSetAsInput(jobVertices[1], ALL_TO_ALL, BLOCKING);
+        connectNewDataSetAsInput(jobVertices[1], jobVertices[0], ALL_TO_ALL, PIPELINED);
+        connectNewDataSetAsInput(jobVertices[2], jobVertices[1], ALL_TO_ALL, BLOCKING);
 
-        return new JobGraph(jobVertices);
+        return JobGraphTestUtils.streamingJobGraph(jobVertices);
     }
 
     private static void assertVertexAndConnectedResultsEquals(

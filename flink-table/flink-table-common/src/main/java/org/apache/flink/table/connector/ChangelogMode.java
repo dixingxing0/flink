@@ -24,8 +24,8 @@ import org.apache.flink.util.Preconditions;
 
 import java.util.Collections;
 import java.util.EnumSet;
-import java.util.Objects;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * The set of changes contained in a changelog.
@@ -38,17 +38,70 @@ public final class ChangelogMode {
     private static final ChangelogMode INSERT_ONLY =
             ChangelogMode.newBuilder().addContainedKind(RowKind.INSERT).build();
 
-    private final Set<RowKind> kinds;
+    private static final ChangelogMode UPSERT =
+            ChangelogMode.newBuilder()
+                    .addContainedKind(RowKind.INSERT)
+                    .addContainedKind(RowKind.UPDATE_AFTER)
+                    .addContainedKind(RowKind.DELETE)
+                    .keyOnlyDeletes(true)
+                    .build();
 
-    private ChangelogMode(Set<RowKind> kinds) {
+    private static final ChangelogMode UPSERT_WITH_FULL_DELETES =
+            ChangelogMode.newBuilder()
+                    .addContainedKind(RowKind.INSERT)
+                    .addContainedKind(RowKind.UPDATE_AFTER)
+                    .addContainedKind(RowKind.DELETE)
+                    .keyOnlyDeletes(false)
+                    .build();
+
+    private static final ChangelogMode ALL =
+            ChangelogMode.newBuilder()
+                    .addContainedKind(RowKind.INSERT)
+                    .addContainedKind(RowKind.UPDATE_BEFORE)
+                    .addContainedKind(RowKind.UPDATE_AFTER)
+                    .addContainedKind(RowKind.DELETE)
+                    .build();
+
+    private final Set<RowKind> kinds;
+    private final boolean keyOnlyDeletes;
+
+    private ChangelogMode(Set<RowKind> kinds, boolean keyOnlyDeletes) {
         Preconditions.checkArgument(
                 kinds.size() > 0, "At least one kind of row should be contained in a changelog.");
         this.kinds = Collections.unmodifiableSet(kinds);
+        this.keyOnlyDeletes = keyOnlyDeletes;
     }
 
     /** Shortcut for a simple {@link RowKind#INSERT}-only changelog. */
     public static ChangelogMode insertOnly() {
         return INSERT_ONLY;
+    }
+
+    /**
+     * Shortcut for an upsert changelog that describes idempotent updates on a key and thus does not
+     * contain {@link RowKind#UPDATE_BEFORE} rows.
+     */
+    public static ChangelogMode upsert() {
+        return upsert(true);
+    }
+
+    /**
+     * Shortcut for an upsert changelog that describes idempotent updates on a key and thus does not
+     * contain {@link RowKind#UPDATE_BEFORE} rows.
+     *
+     * @param keyOnlyDeletes Tells the system the DELETEs contain just the key.
+     */
+    public static ChangelogMode upsert(boolean keyOnlyDeletes) {
+        if (keyOnlyDeletes) {
+            return UPSERT;
+        } else {
+            return UPSERT_WITH_FULL_DELETES;
+        }
+    }
+
+    /** Shortcut for a changelog that can contain all {@link RowKind}s. */
+    public static ChangelogMode all() {
+        return ALL;
     }
 
     /** Builder for configuring and creating instances of {@link ChangelogMode}. */
@@ -68,34 +121,46 @@ public final class ChangelogMode {
         return kinds.size() == 1 && kinds.contains(kind);
     }
 
+    public boolean keyOnlyDeletes() {
+        return keyOnlyDeletes;
+    }
+
     @Override
     public boolean equals(Object o) {
-        if (this == o) {
-            return true;
-        }
         if (o == null || getClass() != o.getClass()) {
             return false;
         }
-        ChangelogMode that = (ChangelogMode) o;
-        return kinds.equals(that.kinds);
+
+        final ChangelogMode that = (ChangelogMode) o;
+        return keyOnlyDeletes == that.keyOnlyDeletes && kinds.equals(that.kinds);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(kinds);
+        int result = kinds.hashCode();
+        result = 31 * result + Boolean.hashCode(keyOnlyDeletes);
+        return result;
     }
 
     @Override
     public String toString() {
-        return kinds.toString();
+        if (!keyOnlyDeletes) {
+            return kinds.toString();
+        } else {
+            return kinds.stream()
+                    .map(kind -> kind == RowKind.DELETE ? "~DELETE" : kind.toString())
+                    .collect(Collectors.joining(", ", "[", "]"));
+        }
     }
 
     // --------------------------------------------------------------------------------------------
 
     /** Builder for configuring and creating instances of {@link ChangelogMode}. */
+    @PublicEvolving
     public static class Builder {
 
         private final Set<RowKind> kinds = EnumSet.noneOf(RowKind.class);
+        private boolean keyOnlyDeletes = false;
 
         private Builder() {
             // default constructor to allow a fluent definition
@@ -106,8 +171,13 @@ public final class ChangelogMode {
             return this;
         }
 
+        public Builder keyOnlyDeletes(boolean flag) {
+            this.keyOnlyDeletes = flag;
+            return this;
+        }
+
         public ChangelogMode build() {
-            return new ChangelogMode(kinds);
+            return new ChangelogMode(kinds, keyOnlyDeletes);
         }
     }
 }

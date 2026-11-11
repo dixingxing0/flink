@@ -18,21 +18,20 @@
 
 package org.apache.flink.api.common.resources;
 
-import org.apache.flink.util.TestLogger;
-
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.AssertionsForInterfaceTypes.assertThatComparable;
 
 /** Tests for {@link Resource}. */
-public class ResourceTest extends TestLogger {
+@SuppressWarnings("rawtypes")
+class ResourceTest {
 
     @Test
-    public void testConstructorValid() {
+    void testConstructorValid() {
         final Resource v1 = new TestResource(0.1);
         assertTestResourceValueEquals(0.1, v1);
 
@@ -40,119 +39,192 @@ public class ResourceTest extends TestLogger {
         assertTestResourceValueEquals(0.1, v2);
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void testConstructorInvalidValue() {
-        new TestResource(-0.1);
+    @Test
+    void testConstructorInvalidValue() {
+        assertThatThrownBy(() -> new TestResource(-0.1))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
-    public void testEquals() {
+    void testEquals() {
         final Resource v1 = new TestResource(0.1);
         final Resource v2 = new TestResource(0.1);
         final Resource v3 = new TestResource(0.2);
-        assertTrue(v1.equals(v2));
-        assertFalse(v1.equals(v3));
+        assertThat(v2).isEqualTo(v1);
+        assertThat(v3).isNotEqualTo(v1);
     }
 
     @Test
-    public void testEqualsIgnoringScale() {
+    void testEqualsIgnoringScale() {
         final Resource v1 = new TestResource(new BigDecimal("0.1"));
         final Resource v2 = new TestResource(new BigDecimal("0.10"));
-        assertTrue(v1.equals(v2));
+        assertThat(v2).isEqualTo(v1);
     }
 
     @Test
-    public void testMerge() {
+    void testHashCodeIgnoringScale() {
+        final Resource v1 = new TestResource(new BigDecimal("0.1"));
+        final Resource v2 = new TestResource(new BigDecimal("0.10"));
+        assertThat(v2).hasSameHashCodeAs(v1);
+    }
+
+    @Test
+    void testMerge() {
         final Resource v1 = new TestResource(0.1);
         final Resource v2 = new TestResource(0.2);
         assertTestResourceValueEquals(0.3, v1.merge(v2));
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void testMergeErrorOnDifferentTypes() {
+    @Test
+    void testMergeErrorOnDifferentTypes() {
         final Resource v1 = new TestResource(0.1);
-        final Resource v2 = new GPUResource(0.1);
-        v1.merge(v2);
+        final Resource v2 = new CPUResource(0.1);
+        // v1.merge(v2);
+        assertThatThrownBy(() -> v1.merge(v2)).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
-    public void testSubtract() {
+    void testSubtract() {
         final Resource v1 = new TestResource(0.2);
         final Resource v2 = new TestResource(0.1);
         assertTestResourceValueEquals(0.1, v1.subtract(v2));
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void testSubtractLargerValue() {
+    @Test
+    void testSubtractLargerValue() {
         final Resource v1 = new TestResource(0.1);
         final Resource v2 = new TestResource(0.2);
-        v1.subtract(v2);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void testSubtractErrorOnDifferentTypes() {
-        final Resource v1 = new TestResource(0.1);
-        final Resource v2 = new GPUResource(0.1);
-        v1.subtract(v2);
+        assertThatThrownBy(() -> v1.subtract(v2)).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
-    public void testDivide() {
+    void testSubtractErrorOnDifferentTypes() {
+        final Resource v1 = new TestResource(0.1);
+        final Resource v2 = new CPUResource(0.1);
+        assertThatThrownBy(() -> v1.subtract(v2)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void testDivide() {
         final Resource resource = new TestResource(0.04);
         final BigDecimal by = BigDecimal.valueOf(0.1);
         assertTestResourceValueEquals(0.4, resource.divide(by));
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void testDivideNegative() {
+    @Test
+    void testDivideNegative() {
         final Resource resource = new TestResource(1.2);
         final BigDecimal by = BigDecimal.valueOf(-0.5);
-        resource.divide(by);
+        assertThatThrownBy(() -> resource.divide(by)).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
-    public void testDivideInteger() {
+    void testDivideInteger() {
         final Resource resource = new TestResource(0.12);
         final int by = 4;
         assertTestResourceValueEquals(0.03, resource.divide(by));
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void testDivideNegativeInteger() {
+    @Test
+    void testDivideNegativeInteger() {
         final Resource resource = new TestResource(1.2);
         final int by = -5;
-        resource.divide(by);
+        assertThatThrownBy(() -> resource.divide(by)).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
-    public void testMultiply() {
+    void testMultiply() {
         final Resource resource = new TestResource(0.3);
         final BigDecimal by = BigDecimal.valueOf(0.2);
         assertTestResourceValueEquals(0.06, resource.multiply(by));
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void testMutiplyNegative() {
+    @Test
+    void testMutiplyNegative() {
         final Resource resource = new TestResource(0.3);
         final BigDecimal by = BigDecimal.valueOf(-0.2);
-        resource.multiply(by);
+        assertThatThrownBy(() -> resource.multiply(by))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
-    public void testMultiplyInteger() {
+    void testMultiplyInteger() {
         final Resource resource = new TestResource(0.3);
         final int by = 2;
         assertTestResourceValueEquals(0.6, resource.multiply(by));
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void testMutiplyNegativeInteger() {
+    @Test
+    void testMutiplyNegativeInteger() {
         final Resource resource = new TestResource(0.3);
         final int by = -2;
-        resource.multiply(by);
+        assertThatThrownBy(() -> resource.multiply(by))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void testIsZero() {
+        final Resource resource1 = new TestResource(0.0);
+        final Resource resource2 = new TestResource(1.0);
+
+        assertThat(resource1.isZero()).isTrue();
+        assertThat(resource2.isZero()).isFalse();
+    }
+
+    @Test
+    void testCompareTo() {
+        final Resource resource1 = new TestResource(0.0);
+        final Resource resource2 = new TestResource(0.0);
+        final Resource resource3 = new TestResource(1.0);
+
+        assertThatComparable(resource1).isEqualByComparingTo(resource1);
+        assertThatComparable(resource2).isEqualByComparingTo(resource1);
+        assertThatComparable(resource1).isLessThan(resource3);
+        assertThatComparable(resource3).isGreaterThan(resource1);
+    }
+
+    @Test
+    void testCompareToFailNull() {
+        // new TestResource(0.0).compareTo(null);
+        assertThatThrownBy(() -> new TestResource(0.0).compareTo(null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void testCompareToFailDifferentType() {
+        // initialized as different anonymous classes
+        final Resource resource1 = new TestResource(0.0) {};
+        final Resource resource2 = new TestResource(0.0) {};
+        assertThatThrownBy(() -> resource1.compareTo(resource2))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void testCompareToFailDifferentName() {
+        // initialized as different anonymous classes
+        final Resource resource1 = new TestResource("name1", 0.0);
+        final Resource resource2 = new TestResource("name2", 0.0);
+        assertThatThrownBy(() -> resource1.compareTo(resource2))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    /** This test assume that the scale limitation is 8. */
+    @Test
+    void testValueScaleLimited() {
+        final Resource v1 = new TestResource(0.100000001);
+        assertTestResourceValueEquals(0.1, v1);
+
+        final Resource v2 = new TestResource(1.0).divide(3);
+        assertTestResourceValueEquals(0.33333333, v2);
+    }
+
+    @Test
+    void testStripTrailingZeros() {
+        final Resource v = new TestResource(0.25).multiply(2);
+        assertThat(v.getValue().toString()).isEqualTo("0.5");
     }
 
     private static void assertTestResourceValueEquals(final double value, final Resource resource) {
-        assertEquals(new TestResource(value), resource);
+        assertThat(resource).isEqualTo(new TestResource(value));
     }
 }

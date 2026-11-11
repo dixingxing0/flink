@@ -6,38 +6,67 @@ Learn more about Flink at [https://flink.apache.org/](https://flink.apache.org/)
 
 ## Python Packaging
 
-This packaging allows you to write Flink programs in Python, but it is currently a very initial version and will change in future versions.
+PyFlink is a Python API for Apache Flink that allows you to build scalable batch and streaming workloads,
+such as real-time data processing pipelines, large-scale exploratory data analysis, Machine Learning (ML)
+pipelines and ETL processes. If you’re already familiar with Python and libraries such as Pandas,
+then PyFlink makes it simpler to leverage the full capabilities of the Flink ecosystem.
+Depending on the level of abstraction you need, there are two different APIs that can be used in PyFlink: PyFlink Table API and PyFlink DataStream API.
 
-In this initial version only Table API is supported, you can find the documentation at [https://ci.apache.org/projects/flink/flink-docs-stable/dev/table/tableApi.html](https://ci.apache.org/projects/flink/flink-docs-stable/dev/table/tableApi.html)
+The PyFlink Table API allows you to write powerful relational queries in a way that is similar to
+using SQL or working with tabular data in Python. You can find more information about it via the tutorial
+[https://nightlies.apache.org/flink/flink-docs-stable/api/python/user_guide/table_api_tutorial.html](https://nightlies.apache.org/flink/flink-docs-stable/api/python/user_guide/table_api_tutorial.html)
 
-The tutorial can be found at [https://ci.apache.org/projects/flink/flink-docs-stable/tutorials/python_table_api.html](https://ci.apache.org/projects/flink/flink-docs-stable/tutorials/python_table_api.html)
+The PyFlink DataStream API gives you lower-level control over the core building blocks of Flink,
+state and time, to build more complex stream processing use cases.
+Tutorial can be found at [https://nightlies.apache.org/flink/flink-docs-stable/api/python/user_guide/datastream_tutorial.html](https://nightlies.apache.org/flink/flink-docs-stable/api/python/user_guide/datastream_tutorial.html)
 
-The auto-generated Python docs can be found at [https://ci.apache.org/projects/flink/flink-docs-stable/api/python/](https://ci.apache.org/projects/flink/flink-docs-stable/api/python/)
+You can find more information via the documentation at [https://nightlies.apache.org/flink/flink-docs-stable/api/python/user_guide/overview.html](https://nightlies.apache.org/flink/flink-docs-stable/api/python/user_guide/overview.html)
+
+The auto-generated Python docs can be found at [https://nightlies.apache.org/flink/flink-docs-stable/api/python/](https://nightlies.apache.org/flink/flink-docs-stable/api/python/)
 
 ## Python Requirements
 
-Apache Flink Python API depends on Py4J (currently version 0.10.8.1), CloudPickle (currently version 1.2.2), python-dateutil(currently version 2.8.0), Apache Beam (currently version 2.23.0) and jsonpickle (currently 1.2).
+Apache Flink Python API depends on Py4J (currently version 0.10.9.7), CloudPickle (currently version 2.2.0), python-dateutil (currently version >=2.8.0,<3), Apache Beam (currently version >= 2.69.0, <= 2.75.0).
 
 ## Development Notices
 
 ### Protobuf Code Generation
 
-Protocol buffer is used in file `flink_fn_execution_pb2.py` and the file is generated from `flink-fn-execution.proto`. Whenever `flink-fn-execution.proto` is updated, please re-generate `flink_fn_execution_pb2.py` by executing:
+Protocol buffer is used in file `flink_fn_execution_pb2.py` and `flink_fn_execution_pb2.pyi`, the file is generated from `flink-fn-execution.proto`. Whenever `flink-fn-execution.proto` is updated, please re-generate `flink_fn_execution_pb2.py` and `flink_fn_execution_pb2.pyi` by executing:
 
 ```
 python pyflink/gen_protos.py
 ```
 
 PyFlink depends on the following libraries to execute the above script:
-1. grpcio-tools (>=1.3.5,<=1.14.2)
+1. grpcio-tools (==1.80.0)
 2. setuptools (>=37.0.0)
-3. pip (>=7.1.0)
+3. pip (>=20.3)
 
-### Running Test Cases 
+### Running Test Cases
 
-Currently, we use conda and tox to verify the compatibility of the Flink Python API for multiple versions of Python and will integrate some useful plugins with tox, such as flake8.
+Currently, we use tox and to verify the compatibility of the Flink Python API for multiple versions of Python and will integrate some useful plugins with tox, such as flake8.
 We can enter the directory where this README.md file is located and run test cases by executing
 
 ```
+./dev/lint-python.sh
+```
+
+To use your system uv environment, you can set `FLINK_UV_HOME` variable:
+
+```shell
+export FLINK_UV_HOME=$(dirname $(dirname $(which uv)))
+```
+
+Create a virtual environment:
+```shell
+uv venv pyflink_39 --python=3.9
+```
+
+Then you can activate your environment and run tests, for example:
+
+```shell
+source pyflink_39/bin/activate
+uv pip install --group dev
 ./dev/lint-python.sh
 ```

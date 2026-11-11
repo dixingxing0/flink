@@ -63,15 +63,19 @@ public class SerializedThrowable extends Exception implements Serializable {
     }
 
     private SerializedThrowable(Throwable exception, Set<Throwable> alreadySeen) {
-        super(getMessageOrError(exception));
+        super(getClassNameAndMessageOrError(exception));
 
         if (!(exception instanceof SerializedThrowable)) {
             // serialize and memoize the original message
             byte[] serialized;
-            try {
-                serialized = InstantiationUtil.serializeObject(exception);
-            } catch (Throwable t) {
-                serialized = null;
+            // introduce the synchronization here to avoid deadlock of multi thread serializing
+            // exceptions
+            synchronized (SerializedThrowable.class) {
+                try {
+                    serialized = InstantiationUtil.serializeObject(exception);
+                } catch (Throwable t) {
+                    serialized = null;
+                }
             }
             this.serializedException = serialized;
             this.cachedException = new WeakReference<>(exception);
@@ -93,7 +97,8 @@ public class SerializedThrowable extends Exception implements Serializable {
                     initCause(new SerializedThrowable(exception.getCause(), alreadySeen));
                 }
             }
-
+            // mimic suppressed exceptions
+            this.addAllSuppressed(exception.getSuppressed(), alreadySeen);
         } else {
             // copy from that serialized throwable
             SerializedThrowable other = (SerializedThrowable) exception;
@@ -103,6 +108,7 @@ public class SerializedThrowable extends Exception implements Serializable {
             this.cachedException = other.cachedException;
             this.setStackTrace(other.getStackTrace());
             this.initCause(other.getCause());
+            this.addAllSuppressed(other.getSuppressed(), alreadySeen);
         }
     }
 
@@ -137,6 +143,26 @@ public class SerializedThrowable extends Exception implements Serializable {
 
     public String getFullStringifiedStackTrace() {
         return fullStringifiedStackTrace;
+    }
+
+    /**
+     * Add all suppressed exceptions to this exception.
+     *
+     * @param suppressed The suppressed exceptions to add.
+     * @param alreadySeen The set of exceptions that have already been seen.
+     */
+    private void addAllSuppressed(Throwable[] suppressed, Set<Throwable> alreadySeen) {
+        for (Throwable s : suppressed) {
+            if (alreadySeen.add(s)) {
+                SerializedThrowable serializedThrowable;
+                if (s instanceof SerializedThrowable) {
+                    serializedThrowable = (SerializedThrowable) s;
+                } else {
+                    serializedThrowable = new SerializedThrowable(s);
+                }
+                this.addSuppressed(serializedThrowable);
+            }
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -175,9 +201,14 @@ public class SerializedThrowable extends Exception implements Serializable {
         }
     }
 
-    private static String getMessageOrError(Throwable error) {
+    private static String getClassNameAndMessageOrError(Throwable error) {
         try {
-            return error.getMessage();
+            String className = error.getClass().getName();
+            String message = error.getMessage();
+            if (message != null) {
+                return String.format("%s: %s", className, message);
+            }
+            return className;
         } catch (Throwable t) {
             return "(failed to get message)";
         }

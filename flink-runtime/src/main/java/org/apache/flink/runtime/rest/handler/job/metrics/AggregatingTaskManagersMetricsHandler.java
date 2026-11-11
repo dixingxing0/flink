@@ -18,7 +18,6 @@
 
 package org.apache.flink.runtime.rest.handler.job.metrics;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.rest.handler.HandlerRequest;
 import org.apache.flink.runtime.rest.handler.legacy.metrics.MetricFetcher;
@@ -32,6 +31,7 @@ import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 
 import javax.annotation.Nonnull;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -50,7 +50,7 @@ public class AggregatingTaskManagersMetricsHandler
 
     public AggregatingTaskManagersMetricsHandler(
             GatewayRetriever<? extends RestfulGateway> leaderRetriever,
-            Time timeout,
+            Duration timeout,
             Map<String, String> responseHeaders,
             Executor executor,
             MetricFetcher fetcher) {
@@ -66,8 +66,7 @@ public class AggregatingTaskManagersMetricsHandler
     @Nonnull
     @Override
     Collection<? extends MetricStore.ComponentMetricStore> getStores(
-            MetricStore store,
-            HandlerRequest<EmptyRequestBody, AggregateTaskManagerMetricsParameters> request) {
+            MetricStore store, HandlerRequest<EmptyRequestBody> request) {
         List<ResourceID> taskmanagers =
                 request.getQueryParameter(TaskManagersFilterQueryParameter.class);
         if (taskmanagers.isEmpty()) {

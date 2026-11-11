@@ -21,14 +21,16 @@ package org.apache.flink.runtime.minicluster;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.api.common.accumulators.AccumulatorHelper;
 import org.apache.flink.core.execution.JobClient;
-import org.apache.flink.runtime.concurrent.FutureUtils;
-import org.apache.flink.runtime.jobgraph.OperatorID;
+import org.apache.flink.core.execution.SavepointFormatType;
+import org.apache.flink.runtime.executiongraph.AccessExecutionGraph;
 import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.operators.coordination.CoordinationRequest;
 import org.apache.flink.runtime.operators.coordination.CoordinationRequestGateway;
 import org.apache.flink.runtime.operators.coordination.CoordinationResponse;
 import org.apache.flink.util.SerializedValue;
+import org.apache.flink.util.concurrent.FutureUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -95,18 +97,39 @@ public final class MiniClusterJobClient implements JobClient, CoordinationReques
 
     @Override
     public CompletableFuture<String> stopWithSavepoint(
-            boolean advanceToEndOfEventTime, @Nullable String savepointDirectory) {
-        return miniCluster.stopWithSavepoint(jobID, savepointDirectory, advanceToEndOfEventTime);
+            boolean terminate,
+            @Nullable String savepointDirectory,
+            SavepointFormatType formatType) {
+        return miniCluster.stopWithSavepoint(jobID, savepointDirectory, terminate, formatType);
     }
 
     @Override
-    public CompletableFuture<String> triggerSavepoint(@Nullable String savepointDirectory) {
-        return miniCluster.triggerSavepoint(jobID, savepointDirectory, false);
+    public CompletableFuture<String> triggerSavepoint(
+            @Nullable String savepointDirectory, SavepointFormatType formatType) {
+        return miniCluster.triggerSavepoint(jobID, savepointDirectory, false, formatType);
     }
 
     @Override
     public CompletableFuture<Map<String, Object>> getAccumulators() {
-        return getJobExecutionResult().thenApply(JobExecutionResult::getAllAccumulatorResults);
+        final CompletableFuture<JobExecutionResult> jobExecutionResult = getJobExecutionResult();
+        if (jobExecutionResult.isDone()) {
+            return jobExecutionResult.thenApply(JobExecutionResult::getAllAccumulatorResults);
+        } else {
+            return miniCluster
+                    .getExecutionGraph(jobID)
+                    .thenApply(AccessExecutionGraph::getAccumulatorsSerialized)
+                    .thenApply(
+                            accumulators -> {
+                                try {
+                                    return AccumulatorHelper.deserializeAndUnwrapAccumulators(
+                                            accumulators, classLoader);
+                                } catch (Exception e) {
+                                    throw new CompletionException(
+                                            "Cannot deserialize and unwrap accumulators properly.",
+                                            e);
+                                }
+                            });
+        }
     }
 
     @Override
@@ -124,14 +147,19 @@ public final class MiniClusterJobClient implements JobClient, CoordinationReques
 
     @Override
     public CompletableFuture<CoordinationResponse> sendCoordinationRequest(
-            OperatorID operatorId, CoordinationRequest request) {
+            String operatorUid, CoordinationRequest request) {
         try {
             SerializedValue<CoordinationRequest> serializedRequest = new SerializedValue<>(request);
             return miniCluster.deliverCoordinationRequestToCoordinator(
-                    jobID, operatorId, serializedRequest);
+                    jobID, operatorUid, serializedRequest);
         } catch (IOException e) {
             return FutureUtils.completedExceptionally(e);
         }
+    }
+
+    @Override
+    public void reportHeartbeat(long expiredTimestamp) {
+        miniCluster.reportHeartbeat(jobID, expiredTimestamp);
     }
 
     private static void shutDownCluster(MiniCluster miniCluster) {

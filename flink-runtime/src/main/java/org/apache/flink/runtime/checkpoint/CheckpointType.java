@@ -18,40 +18,67 @@
 
 package org.apache.flink.runtime.checkpoint;
 
+import org.apache.flink.annotation.Internal;
+
+import java.util.Objects;
+
 /** The type of checkpoint to perform. */
-public enum CheckpointType {
+@Internal
+public final class CheckpointType implements SnapshotType {
 
     /** A checkpoint, full or incremental. */
-    CHECKPOINT(false, false, "Checkpoint"),
+    public static final CheckpointType CHECKPOINT =
+            new CheckpointType("Checkpoint", SharingFilesStrategy.FORWARD_BACKWARD);
 
-    /** A regular savepoint. */
-    SAVEPOINT(true, false, "Savepoint"),
-
-    /** A savepoint taken while suspending/terminating the job. */
-    SYNC_SAVEPOINT(true, true, "Synchronous Savepoint");
-
-    private final boolean isSavepoint;
-
-    private final boolean isSynchronous;
+    public static final CheckpointType FULL_CHECKPOINT =
+            new CheckpointType("Full Checkpoint", SharingFilesStrategy.FORWARD);
 
     private final String name;
 
-    CheckpointType(final boolean isSavepoint, final boolean isSynchronous, final String name) {
+    private final SharingFilesStrategy sharingFilesStrategy;
 
-        this.isSavepoint = isSavepoint;
-        this.isSynchronous = isSynchronous;
+    private CheckpointType(final String name, SharingFilesStrategy sharingFilesStrategy) {
         this.name = name;
+        this.sharingFilesStrategy = sharingFilesStrategy;
     }
 
     public boolean isSavepoint() {
-        return isSavepoint;
-    }
-
-    public boolean isSynchronous() {
-        return isSynchronous;
+        return false;
     }
 
     public String getName() {
         return name;
+    }
+
+    public SharingFilesStrategy getSharingFilesStrategy() {
+        return sharingFilesStrategy;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        CheckpointType type = (CheckpointType) o;
+        return name.equals(type.name) && sharingFilesStrategy == type.sharingFilesStrategy;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(name, sharingFilesStrategy);
+    }
+
+    @Override
+    public String toString() {
+        return "CheckpointType{"
+                + "name='"
+                + name
+                + '\''
+                + ", sharingFilesStrategy="
+                + sharingFilesStrategy
+                + '}';
     }
 }

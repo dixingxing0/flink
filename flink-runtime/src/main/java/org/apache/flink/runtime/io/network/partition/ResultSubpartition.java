@@ -19,6 +19,7 @@
 package org.apache.flink.runtime.io.network.partition;
 
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.runtime.checkpoint.CheckpointException;
 import org.apache.flink.runtime.checkpoint.channel.ResultSubpartitionInfo;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.BufferConsumer;
@@ -29,6 +30,9 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /** A single subpartition of a {@link ResultPartition} instance. */
 public abstract class ResultSubpartition {
+
+    // The error code when adding a buffer fails.
+    public static final int ADD_BUFFER_ERROR_CODE = -1;
 
     /** The info of the subpartition to identify it globally within a task. */
     protected final ResultSubpartitionInfo subpartitionInfo;
@@ -48,9 +52,9 @@ public abstract class ResultSubpartition {
     }
 
     /** Gets the total numbers of buffers (data buffers plus events). */
-    protected abstract long getTotalNumberOfBuffers();
+    protected abstract long getTotalNumberOfBuffersUnsafe();
 
-    protected abstract long getTotalNumberOfBytes();
+    protected abstract long getTotalNumberOfBytesUnsafe();
 
     public int getSubPartitionIndex() {
         return subpartitionInfo.getSubPartitionIdx();
@@ -61,8 +65,12 @@ public abstract class ResultSubpartition {
         parent.onConsumedSubpartition(getSubPartitionIndex());
     }
 
+    public abstract void alignedBarrierTimeout(long checkpointId) throws IOException;
+
+    public abstract void abortCheckpoint(long checkpointId, CheckpointException cause);
+
     @VisibleForTesting
-    public final boolean add(BufferConsumer bufferConsumer) throws IOException {
+    public final int add(BufferConsumer bufferConsumer) throws IOException {
         return add(bufferConsumer, 0);
     }
 
@@ -80,15 +88,21 @@ public abstract class ResultSubpartition {
      * @param bufferConsumer the buffer to add (transferring ownership to this writer)
      * @param partialRecordLength the length of bytes to skip in order to start with a complete
      *     record, from position index 0 of the underlying {@cite MemorySegment}.
-     * @return true if operation succeeded and bufferConsumer was enqueued for consumption.
+     * @return the preferable buffer size for this subpartition or {@link #ADD_BUFFER_ERROR_CODE} if
+     *     the add operation fails.
      * @throws IOException thrown in case of errors while adding the buffer
      */
-    public abstract boolean add(BufferConsumer bufferConsumer, int partialRecordLength)
+    public abstract int add(BufferConsumer bufferConsumer, int partialRecordLength)
             throws IOException;
 
     public abstract void flush();
 
-    public abstract void finish() throws IOException;
+    /**
+     * Writing of data is finished.
+     *
+     * @return the size of data written for this subpartition inside of finish.
+     */
+    public abstract int finish() throws IOException;
 
     public abstract void release() throws IOException;
 
@@ -97,20 +111,19 @@ public abstract class ResultSubpartition {
 
     public abstract boolean isReleased();
 
-    /**
-     * Gets the number of non-event buffers in this subpartition.
-     *
-     * <p><strong>Beware:</strong> This method should only be used in tests in non-concurrent access
-     * scenarios since it does not make any concurrency guarantees.
-     */
-    @VisibleForTesting
-    abstract int getBuffersInBacklog();
+    /** Gets the number of non-event buffers in this subpartition. */
+    abstract int getBuffersInBacklogUnsafe();
 
     /**
      * Makes a best effort to get the current size of the queue. This method must not acquire locks
      * or interfere with the task and network threads in any way.
      */
     public abstract int unsynchronizedGetNumberOfQueuedBuffers();
+
+    /** Get the current size of the queue. */
+    public abstract int getNumberOfQueuedBuffers();
+
+    public abstract void bufferSize(int desirableNewBufferSize);
 
     // ------------------------------------------------------------------------
 

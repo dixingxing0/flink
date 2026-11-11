@@ -20,75 +20,76 @@ package org.apache.flink.runtime.checkpoint;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
-import org.apache.flink.api.common.time.Deadline;
-import org.apache.flink.runtime.concurrent.ManuallyTriggeredScheduledExecutor;
-import org.apache.flink.runtime.state.RetrievableStateHandle;
+import org.apache.flink.core.execution.RecoveryClaimMode;
+import org.apache.flink.core.testutils.EachCallbackWrapper;
 import org.apache.flink.runtime.state.SharedStateRegistry;
+import org.apache.flink.runtime.state.SharedStateRegistryImpl;
 import org.apache.flink.runtime.testutils.CommonTestUtils;
+import org.apache.flink.runtime.util.TestingFatalErrorHandlerExtension;
 import org.apache.flink.runtime.util.ZooKeeperUtils;
+import org.apache.flink.runtime.zookeeper.ZooKeeperExtension;
 import org.apache.flink.runtime.zookeeper.ZooKeeperStateHandleStore;
-import org.apache.flink.runtime.zookeeper.ZooKeeperTestEnvironment;
 import org.apache.flink.util.clock.ManualClock;
+import org.apache.flink.util.concurrent.Executors;
+import org.apache.flink.util.concurrent.ManuallyTriggeredScheduledExecutor;
 
-import org.apache.flink.shaded.curator4.org.apache.curator.framework.CuratorFramework;
+import org.apache.flink.shaded.curator5.org.apache.curator.framework.CuratorFramework;
+import org.apache.flink.shaded.guava33.com.google.common.collect.Iterables;
 import org.apache.flink.shaded.zookeeper3.org.apache.zookeeper.data.Stat;
 
-import org.junit.AfterClass;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
-import java.io.Serializable;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static java.util.Collections.emptyList;
 import static org.apache.flink.runtime.checkpoint.CheckpointRequestDeciderTest.regularCheckpoint;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for basic {@link CompletedCheckpointStore} contract and ZooKeeper state handling. */
-public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpointStoreTest {
+class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpointStoreTest {
 
-    private static final ZooKeeperTestEnvironment ZOOKEEPER = new ZooKeeperTestEnvironment(1);
+    private final ZooKeeperExtension zooKeeperExtension = new ZooKeeperExtension();
+
+    @RegisterExtension
+    final EachCallbackWrapper<ZooKeeperExtension> zooKeeperResource =
+            new EachCallbackWrapper<>(zooKeeperExtension);
+
+    @RegisterExtension
+    final TestingFatalErrorHandlerExtension testingFatalErrorHandlerResource =
+            new TestingFatalErrorHandlerExtension();
+
+    private CuratorFramework getZooKeeperClient() {
+        return zooKeeperExtension.getZooKeeperClient(
+                testingFatalErrorHandlerResource.getTestingFatalErrorHandler());
+    }
 
     private static final String CHECKPOINT_PATH = "/checkpoints";
 
     private static final ZooKeeperCheckpointStoreUtil checkpointStoreUtil =
             ZooKeeperCheckpointStoreUtil.INSTANCE;
 
-    @AfterClass
-    public static void tearDown() throws Exception {
-        if (ZOOKEEPER != null) {
-            ZOOKEEPER.shutdown();
-        }
-    }
-
-    @Before
-    public void cleanUp() throws Exception {
-        ZOOKEEPER.deleteAll();
-    }
-
     @Override
-    protected CompletedCheckpointStore createCompletedCheckpoints(
+    protected CompletedCheckpointStore createRecoveredCompletedCheckpointStore(
             int maxNumberOfCheckpointsToRetain, Executor executor) throws Exception {
         final ZooKeeperStateHandleStore<CompletedCheckpoint> checkpointsInZooKeeper =
                 ZooKeeperUtils.createZooKeeperStateHandleStore(
-                        ZOOKEEPER.getClient(),
+                        getZooKeeperClient(),
                         CHECKPOINT_PATH,
                         new TestingRetrievableStateStorageHelper<>());
-
         return new DefaultCompletedCheckpointStore<>(
                 maxNumberOfCheckpointsToRetain,
                 checkpointsInZooKeeper,
                 checkpointStoreUtil,
+                DefaultCompletedCheckpointStoreUtils.retrieveCompletedCheckpoints(
+                        checkpointsInZooKeeper, checkpointStoreUtil),
+                SharedStateRegistry.DEFAULT_FACTORY.create(
+                        Executors.directExecutor(), emptyList(), RecoveryClaimMode.DEFAULT),
                 executor);
     }
 
@@ -100,10 +101,10 @@ public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpoint
      * to retain will be removed.
      */
     @Test
-    public void testRecover() throws Exception {
+    void testRecover() throws Exception {
 
-        SharedStateRegistry sharedStateRegistry = new SharedStateRegistry();
-        CompletedCheckpointStore checkpoints = createCompletedCheckpoints(3);
+        SharedStateRegistry sharedStateRegistry = new SharedStateRegistryImpl();
+        CompletedCheckpointStore checkpoints = createRecoveredCompletedCheckpointStore(3);
 
         TestCompletedCheckpoint[] expected =
                 new TestCompletedCheckpoint[] {
@@ -113,75 +114,79 @@ public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpoint
                 };
 
         // Add multiple checkpoints
-        checkpoints.addCheckpoint(expected[0], new CheckpointsCleaner(), () -> {});
-        checkpoints.addCheckpoint(expected[1], new CheckpointsCleaner(), () -> {});
-        checkpoints.addCheckpoint(expected[2], new CheckpointsCleaner(), () -> {});
+        checkpoints.addCheckpointAndSubsumeOldestOne(
+                expected[0], new CheckpointsCleaner(), () -> {});
+        checkpoints.addCheckpointAndSubsumeOldestOne(
+                expected[1], new CheckpointsCleaner(), () -> {});
+        checkpoints.addCheckpointAndSubsumeOldestOne(
+                expected[2], new CheckpointsCleaner(), () -> {});
 
-        verifyCheckpointRegistered(expected[0].getOperatorStates().values(), sharedStateRegistry);
-        verifyCheckpointRegistered(expected[1].getOperatorStates().values(), sharedStateRegistry);
-        verifyCheckpointRegistered(expected[2].getOperatorStates().values(), sharedStateRegistry);
+        verifyCheckpointRegistered(expected[0].getOperatorStates().values());
+        verifyCheckpointRegistered(expected[1].getOperatorStates().values());
+        verifyCheckpointRegistered(expected[2].getOperatorStates().values());
 
         // All three should be in ZK
-        assertEquals(3, ZOOKEEPER.getClient().getChildren().forPath(CHECKPOINT_PATH).size());
-        assertEquals(3, checkpoints.getNumberOfRetainedCheckpoints());
+        assertThat(getZooKeeperClient().getChildren().forPath(CHECKPOINT_PATH)).hasSize(3);
+        assertThat(checkpoints.getNumberOfRetainedCheckpoints()).isEqualTo(3);
 
         // Recover
         sharedStateRegistry.close();
-        sharedStateRegistry = new SharedStateRegistry();
-        checkpoints.recover();
+        sharedStateRegistry = new SharedStateRegistryImpl();
 
-        assertEquals(3, ZOOKEEPER.getClient().getChildren().forPath(CHECKPOINT_PATH).size());
-        assertEquals(3, checkpoints.getNumberOfRetainedCheckpoints());
-        assertEquals(expected[2], checkpoints.getLatestCheckpoint(false));
+        assertThat(getZooKeeperClient().getChildren().forPath(CHECKPOINT_PATH)).hasSize(3);
+        assertThat(checkpoints.getNumberOfRetainedCheckpoints()).isEqualTo(3);
+        assertThat(checkpoints.getLatestCheckpoint()).isEqualTo(expected[2]);
 
         List<CompletedCheckpoint> expectedCheckpoints = new ArrayList<>(3);
         expectedCheckpoints.add(expected[1]);
         expectedCheckpoints.add(expected[2]);
         expectedCheckpoints.add(createCheckpoint(3, sharedStateRegistry));
 
-        checkpoints.addCheckpoint(expectedCheckpoints.get(2), new CheckpointsCleaner(), () -> {});
+        checkpoints.addCheckpointAndSubsumeOldestOne(
+                expectedCheckpoints.get(2), new CheckpointsCleaner(), () -> {});
 
         List<CompletedCheckpoint> actualCheckpoints = checkpoints.getAllCheckpoints();
 
-        assertEquals(expectedCheckpoints, actualCheckpoints);
+        assertThat(actualCheckpoints).isEqualTo(expectedCheckpoints);
 
         for (CompletedCheckpoint actualCheckpoint : actualCheckpoints) {
-            verifyCheckpointRegistered(
-                    actualCheckpoint.getOperatorStates().values(), sharedStateRegistry);
+            verifyCheckpointRegistered(actualCheckpoint.getOperatorStates().values());
         }
     }
 
     /** Tests that shutdown discards all checkpoints. */
     @Test
-    public void testShutdownDiscardsCheckpoints() throws Exception {
-        CuratorFramework client = ZOOKEEPER.getClient();
+    void testShutdownDiscardsCheckpoints() throws Exception {
+        CuratorFramework client = getZooKeeperClient();
 
-        SharedStateRegistry sharedStateRegistry = new SharedStateRegistry();
-        CompletedCheckpointStore store = createCompletedCheckpoints(1);
+        SharedStateRegistry sharedStateRegistry = new SharedStateRegistryImpl();
+        CompletedCheckpointStore store = createRecoveredCompletedCheckpointStore(1);
         TestCompletedCheckpoint checkpoint = createCheckpoint(0, sharedStateRegistry);
 
-        store.addCheckpoint(checkpoint, new CheckpointsCleaner(), () -> {});
-        assertEquals(1, store.getNumberOfRetainedCheckpoints());
-        assertNotNull(
-                client.checkExists()
-                        .forPath(
-                                CHECKPOINT_PATH
-                                        + checkpointStoreUtil.checkpointIDToName(
-                                                checkpoint.getCheckpointID())));
+        store.addCheckpointAndSubsumeOldestOne(checkpoint, new CheckpointsCleaner(), () -> {});
+        assertThat(store.getNumberOfRetainedCheckpoints()).isOne();
+        assertThat(
+                        client.checkExists()
+                                .forPath(
+                                        CHECKPOINT_PATH
+                                                + checkpointStoreUtil.checkpointIDToName(
+                                                        checkpoint.getCheckpointID())))
+                .isNotNull();
 
-        store.shutdown(JobStatus.FINISHED, new CheckpointsCleaner(), () -> {});
-        assertEquals(0, store.getNumberOfRetainedCheckpoints());
-        assertNull(
-                client.checkExists()
-                        .forPath(
-                                CHECKPOINT_PATH
-                                        + checkpointStoreUtil.checkpointIDToName(
-                                                checkpoint.getCheckpointID())));
+        store.shutdown(JobStatus.FINISHED, new CheckpointsCleaner());
+        assertThat(store.getNumberOfRetainedCheckpoints()).isZero();
+        assertThat(
+                        client.checkExists()
+                                .forPath(
+                                        CHECKPOINT_PATH
+                                                + checkpointStoreUtil.checkpointIDToName(
+                                                        checkpoint.getCheckpointID())))
+                .isNull();
 
         sharedStateRegistry.close();
-        store.recover();
 
-        assertEquals(0, store.getNumberOfRetainedCheckpoints());
+        assertThat(createRecoveredCompletedCheckpointStore(1).getNumberOfRetainedCheckpoints())
+                .isZero();
     }
 
     /**
@@ -189,40 +194,50 @@ public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpoint
      * ZooKeeper store). Furthermore, suspending a job should release all locks.
      */
     @Test
-    public void testSuspendKeepsCheckpoints() throws Exception {
-        CuratorFramework client = ZOOKEEPER.getClient();
+    void testSuspendKeepsCheckpoints() throws Exception {
+        CuratorFramework client = getZooKeeperClient();
 
-        SharedStateRegistry sharedStateRegistry = new SharedStateRegistry();
-        CompletedCheckpointStore store = createCompletedCheckpoints(1);
+        SharedStateRegistry sharedStateRegistry = new SharedStateRegistryImpl();
+        CompletedCheckpointStore store = createRecoveredCompletedCheckpointStore(1);
         TestCompletedCheckpoint checkpoint = createCheckpoint(0, sharedStateRegistry);
 
-        store.addCheckpoint(checkpoint, new CheckpointsCleaner(), () -> {});
-        assertEquals(1, store.getNumberOfRetainedCheckpoints());
-        assertNotNull(
-                client.checkExists()
-                        .forPath(
-                                CHECKPOINT_PATH
-                                        + checkpointStoreUtil.checkpointIDToName(
-                                                checkpoint.getCheckpointID())));
+        store.addCheckpointAndSubsumeOldestOne(checkpoint, new CheckpointsCleaner(), () -> {});
+        assertThat(store.getNumberOfRetainedCheckpoints()).isOne();
+        assertThat(
+                        client.checkExists()
+                                .forPath(
+                                        CHECKPOINT_PATH
+                                                + checkpointStoreUtil.checkpointIDToName(
+                                                        checkpoint.getCheckpointID())))
+                .isNotNull();
 
-        store.shutdown(JobStatus.SUSPENDED, new CheckpointsCleaner(), () -> {});
+        store.shutdown(JobStatus.SUSPENDED, new CheckpointsCleaner());
 
-        assertEquals(0, store.getNumberOfRetainedCheckpoints());
+        assertThat(store.getNumberOfRetainedCheckpoints()).isZero();
 
         final String checkpointPath =
                 CHECKPOINT_PATH
                         + checkpointStoreUtil.checkpointIDToName(checkpoint.getCheckpointID());
-        Stat stat = client.checkExists().forPath(checkpointPath);
+        final List<String> checkpointPathChildren = client.getChildren().forPath(checkpointPath);
+        assertThat(checkpointPathChildren)
+                .as("The checkpoint node should not be marked for deletion.")
+                .hasSize(1);
 
-        assertNotNull("The checkpoint node should exist.", stat);
-        assertEquals("The checkpoint node should not be locked.", 0, stat.getNumChildren());
+        final String locksNodeName = Iterables.getOnlyElement(checkpointPathChildren);
+        final String locksNodePath =
+                ZooKeeperUtils.generateZookeeperPath(checkpointPath, locksNodeName);
+
+        final Stat locksStat = client.checkExists().forPath(locksNodePath);
+        assertThat(locksStat.getNumChildren())
+                .as("There shouldn't be any lock node available for the checkpoint")
+                .isZero();
 
         // Recover again
         sharedStateRegistry.close();
-        store.recover();
+        store = createRecoveredCompletedCheckpointStore(1);
 
-        CompletedCheckpoint recovered = store.getLatestCheckpoint(false);
-        assertEquals(checkpoint, recovered);
+        CompletedCheckpoint recovered = store.getLatestCheckpoint();
+        assertThat(recovered).isEqualTo(checkpoint);
     }
 
     /**
@@ -231,10 +246,11 @@ public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpoint
      * <p>Tests that the latest recovered checkpoint is the one with the highest checkpoint id
      */
     @Test
-    public void testLatestCheckpointRecovery() throws Exception {
+    void testLatestCheckpointRecovery() throws Exception {
         final int numCheckpoints = 3;
-        SharedStateRegistry sharedStateRegistry = new SharedStateRegistry();
-        CompletedCheckpointStore checkpointStore = createCompletedCheckpoints(numCheckpoints);
+        SharedStateRegistry sharedStateRegistry = new SharedStateRegistryImpl();
+        CompletedCheckpointStore checkpointStore =
+                createRecoveredCompletedCheckpointStore(numCheckpoints);
         List<CompletedCheckpoint> checkpoints = new ArrayList<>(numCheckpoints);
 
         checkpoints.add(createCheckpoint(9, sharedStateRegistry));
@@ -242,15 +258,15 @@ public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpoint
         checkpoints.add(createCheckpoint(11, sharedStateRegistry));
 
         for (CompletedCheckpoint checkpoint : checkpoints) {
-            checkpointStore.addCheckpoint(checkpoint, new CheckpointsCleaner(), () -> {});
+            checkpointStore.addCheckpointAndSubsumeOldestOne(
+                    checkpoint, new CheckpointsCleaner(), () -> {});
         }
 
         sharedStateRegistry.close();
-        checkpointStore.recover();
 
-        CompletedCheckpoint latestCheckpoint = checkpointStore.getLatestCheckpoint(false);
-
-        assertEquals(checkpoints.get(checkpoints.size() - 1), latestCheckpoint);
+        final CompletedCheckpoint latestCheckpoint =
+                createRecoveredCompletedCheckpointStore(numCheckpoints).getLatestCheckpoint();
+        assertThat(latestCheckpoint).isEqualTo(checkpoints.get(checkpoints.size() - 1));
     }
 
     /**
@@ -260,57 +276,59 @@ public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpoint
      * recovered by a different completed checkpoint store.
      */
     @Test
-    public void testConcurrentCheckpointOperations() throws Exception {
+    void testConcurrentCheckpointOperations() throws Exception {
         final int numberOfCheckpoints = 1;
         final long waitingTimeout = 50L;
 
-        CompletedCheckpointStore zkCheckpointStore1 =
-                createCompletedCheckpoints(numberOfCheckpoints);
-        CompletedCheckpointStore zkCheckpointStore2 =
-                createCompletedCheckpoints(numberOfCheckpoints);
+        final CompletedCheckpointStore zkCheckpointStore1 =
+                createRecoveredCompletedCheckpointStore(numberOfCheckpoints);
 
-        SharedStateRegistry sharedStateRegistry = new SharedStateRegistry();
+        SharedStateRegistry sharedStateRegistry = new SharedStateRegistryImpl();
 
         TestCompletedCheckpoint completedCheckpoint = createCheckpoint(1, sharedStateRegistry);
 
         // complete the first checkpoint
-        zkCheckpointStore1.addCheckpoint(completedCheckpoint, new CheckpointsCleaner(), () -> {});
+        zkCheckpointStore1.addCheckpointAndSubsumeOldestOne(
+                completedCheckpoint, new CheckpointsCleaner(), () -> {});
 
         // recover the checkpoint by a different checkpoint store
         sharedStateRegistry.close();
-        sharedStateRegistry = new SharedStateRegistry();
-        zkCheckpointStore2.recover();
+        sharedStateRegistry = new SharedStateRegistryImpl();
+        final CompletedCheckpointStore zkCheckpointStore2 =
+                createRecoveredCompletedCheckpointStore(numberOfCheckpoints);
 
-        CompletedCheckpoint recoveredCheckpoint = zkCheckpointStore2.getLatestCheckpoint(false);
-        assertTrue(recoveredCheckpoint instanceof TestCompletedCheckpoint);
+        CompletedCheckpoint recoveredCheckpoint = zkCheckpointStore2.getLatestCheckpoint();
+        assertThat(recoveredCheckpoint).isInstanceOf(TestCompletedCheckpoint.class);
         TestCompletedCheckpoint recoveredTestCheckpoint =
                 (TestCompletedCheckpoint) recoveredCheckpoint;
 
         // Check that the recovered checkpoint is not yet discarded
-        assertFalse(recoveredTestCheckpoint.isDiscarded());
+        assertThat(recoveredTestCheckpoint.isDiscarded()).isFalse();
 
         // complete another checkpoint --> this should remove the first checkpoint from the store
         // because the number of retained checkpoints == 1
         TestCompletedCheckpoint completedCheckpoint2 = createCheckpoint(2, sharedStateRegistry);
-        zkCheckpointStore1.addCheckpoint(completedCheckpoint2, new CheckpointsCleaner(), () -> {});
+        zkCheckpointStore1.addCheckpointAndSubsumeOldestOne(
+                completedCheckpoint2, new CheckpointsCleaner(), () -> {});
 
         List<CompletedCheckpoint> allCheckpoints = zkCheckpointStore1.getAllCheckpoints();
 
         // check that we have removed the first checkpoint from zkCompletedStore1
-        assertEquals(Collections.singletonList(completedCheckpoint2), allCheckpoints);
+        assertThat(allCheckpoints).isEqualTo(Collections.singletonList(completedCheckpoint2));
 
         // lets wait a little bit to see that no discard operation will be executed
-        assertFalse(
-                "The checkpoint should not have been discarded.",
-                recoveredTestCheckpoint.awaitDiscard(waitingTimeout));
+        assertThat(recoveredTestCheckpoint.awaitDiscard(waitingTimeout))
+                .as("The checkpoint should not have been discarded.")
+                .isFalse();
 
         // check that we have not discarded the first completed checkpoint
-        assertFalse(recoveredTestCheckpoint.isDiscarded());
+        assertThat(recoveredTestCheckpoint.isDiscarded()).isFalse();
 
         TestCompletedCheckpoint completedCheckpoint3 = createCheckpoint(3, sharedStateRegistry);
 
         // this should release the last lock on completedCheckpoint and thus discard it
-        zkCheckpointStore2.addCheckpoint(completedCheckpoint3, new CheckpointsCleaner(), () -> {});
+        zkCheckpointStore2.addCheckpointAndSubsumeOldestOne(
+                completedCheckpoint3, new CheckpointsCleaner(), () -> {});
 
         // the checkpoint should be discarded eventually because there is no lock on it anymore
         recoveredTestCheckpoint.awaitDiscard();
@@ -322,7 +340,7 @@ public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpoint
      * threshold.
      */
     @Test
-    public void testChekpointingPausesAndResumeWhenTooManyCheckpoints() throws Exception {
+    void testChekpointingPausesAndResumeWhenTooManyCheckpoints() throws Exception {
         ManualClock clock = new ManualClock();
         clock.advanceTime(1, TimeUnit.DAYS);
         int maxCleaningCheckpoints = 1;
@@ -330,7 +348,7 @@ public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpoint
         CheckpointRequestDecider checkpointRequestDecider =
                 new CheckpointRequestDecider(
                         maxCleaningCheckpoints,
-                        unused -> {},
+                        (currentTimeMillis, tillNextMillis) -> {},
                         clock,
                         1,
                         new AtomicInteger(0)::get,
@@ -339,7 +357,7 @@ public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpoint
         final int maxCheckpointsToRetain = 1;
         ManuallyTriggeredScheduledExecutor executor = new ManuallyTriggeredScheduledExecutor();
         CompletedCheckpointStore checkpointStore =
-                createCompletedCheckpoints(maxCheckpointsToRetain, executor);
+                createRecoveredCompletedCheckpointStore(maxCheckpointsToRetain, executor);
 
         int nbCheckpointsToInject = 3;
         for (int i = 1; i <= nbCheckpointsToInject; i++) {
@@ -353,7 +371,8 @@ public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpoint
                             Collections.emptyMap(),
                             CheckpointProperties.forCheckpoint(
                                     CheckpointRetentionPolicy.RETAIN_ON_FAILURE));
-            checkpointStore.addCheckpoint(completedCheckpoint, checkpointsCleaner, () -> {});
+            checkpointStore.addCheckpointAndSubsumeOldestOne(
+                    completedCheckpoint, checkpointsCleaner, () -> {});
         }
 
         int nbCheckpointsSubmittedForCleaning = nbCheckpointsToInject - maxCheckpointsToRetain;
@@ -361,17 +380,13 @@ public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpoint
         CommonTestUtils.waitUntilCondition(
                 () ->
                         checkpointsCleaner.getNumberOfCheckpointsToClean()
-                                == nbCheckpointsSubmittedForCleaning,
-                Deadline.fromNow(Duration.ofSeconds(3)));
-        assertEquals(
-                nbCheckpointsSubmittedForCleaning,
-                checkpointsCleaner.getNumberOfCheckpointsToClean());
+                                == nbCheckpointsSubmittedForCleaning);
+        assertThat(checkpointsCleaner.getNumberOfCheckpointsToClean())
+                .isEqualTo(nbCheckpointsSubmittedForCleaning);
         // checkpointing is on hold because checkpointsCleaner.getNumberOfCheckpointsToClean() >
         // maxCleaningCheckpoints
-        assertFalse(
-                checkpointRequestDecider
-                        .chooseRequestToExecute(regularCheckpoint(), false, 0)
-                        .isPresent());
+        assertThat(checkpointRequestDecider.chooseRequestToExecute(regularCheckpoint(), false, 0))
+                .isNotPresent();
 
         // make the executor execute checkpoint requests.
         executor.triggerAll();
@@ -379,51 +394,14 @@ public class ZooKeeperCompletedCheckpointStoreITCase extends CompletedCheckpoint
         CommonTestUtils.waitUntilCondition(
                 () ->
                         checkpointsCleaner.getNumberOfCheckpointsToClean()
-                                < nbCheckpointsSubmittedForCleaning,
-                Deadline.fromNow(Duration.ofSeconds(3)));
+                                < nbCheckpointsSubmittedForCleaning);
         // some checkpoints were cleaned
-        assertTrue(
-                checkpointsCleaner.getNumberOfCheckpointsToClean()
-                        < nbCheckpointsSubmittedForCleaning);
+        assertThat(checkpointsCleaner.getNumberOfCheckpointsToClean())
+                .isLessThan(nbCheckpointsSubmittedForCleaning);
         // checkpointing is resumed because checkpointsCleaner.getNumberOfCheckpointsToClean() <=
         // maxCleaningCheckpoints
-        assertTrue(
-                checkpointRequestDecider
-                        .chooseRequestToExecute(regularCheckpoint(), false, 0)
-                        .isPresent());
-        checkpointStore.shutdown(JobStatus.FINISHED, checkpointsCleaner, () -> {});
-    }
-
-    static class HeapRetrievableStateHandle<T extends Serializable>
-            implements RetrievableStateHandle<T> {
-
-        private static final long serialVersionUID = -268548467968932L;
-
-        private static AtomicInteger nextKey = new AtomicInteger(0);
-
-        private static HashMap<Integer, Object> stateMap = new HashMap<>();
-
-        private final int key;
-
-        public HeapRetrievableStateHandle(T state) {
-            key = nextKey.getAndIncrement();
-            stateMap.put(key, state);
-        }
-
-        @SuppressWarnings("unchecked")
-        @Override
-        public T retrieveState() {
-            return (T) stateMap.get(key);
-        }
-
-        @Override
-        public void discardState() throws Exception {
-            stateMap.remove(key);
-        }
-
-        @Override
-        public long getStateSize() {
-            return 0;
-        }
+        assertThat(checkpointRequestDecider.chooseRequestToExecute(regularCheckpoint(), false, 0))
+                .isPresent();
+        checkpointStore.shutdown(JobStatus.FINISHED, checkpointsCleaner);
     }
 }

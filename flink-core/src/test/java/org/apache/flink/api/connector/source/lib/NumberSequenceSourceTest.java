@@ -24,24 +24,31 @@ import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SourceOutput;
 import org.apache.flink.api.connector.source.SourceReader;
 import org.apache.flink.api.connector.source.SourceReaderContext;
+import org.apache.flink.api.connector.source.SplitEnumerator;
+import org.apache.flink.api.connector.source.mocks.MockSplitEnumeratorContext;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.io.InputStatus;
-import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.groups.SourceReaderMetricGroup;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
+import org.apache.flink.util.SimpleUserCodeClassLoader;
+import org.apache.flink.util.UserCodeClassLoader;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 
-import static org.junit.Assert.fail;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.fail;
 
 /** Tests for the {@link NumberSequenceSource}. */
-public class NumberSequenceSourceTest {
+class NumberSequenceSourceTest {
 
     @Test
-    public void testReaderCheckpoints() throws Exception {
+    void testReaderCheckpoints() throws Exception {
         final long from = 177;
         final long mid = 333;
         final long to = 563;
@@ -64,12 +71,34 @@ public class NumberSequenceSourceTest {
 
                 // re-create and restore
                 reader = createReader();
-                reader.addSplits(splits);
+                if (splits.isEmpty()) {
+                    reader.notifyNoMoreSplits();
+                } else {
+                    reader.addSplits(splits);
+                }
             }
         }
 
         final List<Long> result = out.getEmittedRecords();
         validateSequence(result, from, to);
+    }
+
+    @Test
+    void testEmptySequence() throws Exception {
+        final NumberSequenceSource source = new NumberSequenceSource(5, 4);
+
+        final SplitEnumerator<
+                        NumberSequenceSource.NumberSequenceSplit,
+                        Collection<NumberSequenceSource.NumberSequenceSplit>>
+                enumerator = source.createEnumerator(new MockSplitEnumeratorContext<>(2));
+
+        assertThat(enumerator.snapshotState(1L)).isEmpty();
+    }
+
+    @Test
+    void testToBeforeFromMinusOne() {
+        assertThatThrownBy(() -> new NumberSequenceSource(5, 3))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     private static void validateSequence(
@@ -108,8 +137,8 @@ public class NumberSequenceSourceTest {
     private static final class DummyReaderContext implements SourceReaderContext {
 
         @Override
-        public MetricGroup metricGroup() {
-            return new UnregisteredMetricsGroup();
+        public SourceReaderMetricGroup metricGroup() {
+            return UnregisteredMetricsGroup.createSourceReaderMetricGroup();
         }
 
         @Override
@@ -132,6 +161,16 @@ public class NumberSequenceSourceTest {
 
         @Override
         public void sendSourceEventToCoordinator(SourceEvent sourceEvent) {}
+
+        @Override
+        public UserCodeClassLoader getUserCodeClassLoader() {
+            return SimpleUserCodeClassLoader.create(getClass().getClassLoader());
+        }
+
+        @Override
+        public int currentParallelism() {
+            return 1;
+        }
     }
 
     private static final class TestingReaderOutput<E> implements ReaderOutput<E> {
@@ -155,6 +194,11 @@ public class NumberSequenceSourceTest {
 
         @Override
         public void markIdle() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void markActive() {
             throw new UnsupportedOperationException();
         }
 

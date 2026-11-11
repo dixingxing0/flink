@@ -18,14 +18,18 @@
 
 package org.apache.flink.runtime.checkpoint;
 
+import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
+import org.apache.flink.runtime.util.stats.StatsSummary;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
 import java.util.Map;
 
-import static org.junit.Assert.assertEquals;
+import static java.util.Collections.singletonMap;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.data.Offset.offset;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -33,18 +37,20 @@ public class CompletedCheckpointStatsSummaryTest {
 
     /** Tests simple updates of the completed checkpoint stats. */
     @Test
-    public void testSimpleUpdates() throws Exception {
+    void testSimpleUpdates() {
         long triggerTimestamp = 123123L;
         long ackTimestamp = 123123 + 1212312399L;
         long stateSize = Integer.MAX_VALUE + 17787L;
+        long metadataSize = Integer.MAX_VALUE + 1984L;
         long processedData = Integer.MAX_VALUE + 123123L;
         long persistedData = Integer.MAX_VALUE + 42L;
+        boolean unalignedCheckpoint = true;
 
         CompletedCheckpointStatsSummary summary = new CompletedCheckpointStatsSummary();
-        assertEquals(0, summary.getStateSizeStats().getCount());
-        assertEquals(0, summary.getEndToEndDurationStats().getCount());
-        assertEquals(0, summary.getProcessedDataStats().getCount());
-        assertEquals(0, summary.getPersistedDataStats().getCount());
+        assertThat(summary.getStateSizeStats().getCount()).isZero();
+        assertThat(summary.getEndToEndDurationStats().getCount()).isZero();
+        assertThat(summary.getProcessedDataStats().getCount()).isZero();
+        assertThat(summary.getPersistedDataStats().getCount()).isZero();
 
         int numCheckpoints = 10;
 
@@ -55,33 +61,35 @@ public class CompletedCheckpointStatsSummaryTest {
                             triggerTimestamp,
                             ackTimestamp + i,
                             stateSize + i,
+                            metadataSize + i,
                             processedData + i,
-                            persistedData + i);
+                            persistedData + i,
+                            unalignedCheckpoint);
 
             summary.updateSummary(completed);
 
-            assertEquals(i + 1, summary.getStateSizeStats().getCount());
-            assertEquals(i + 1, summary.getEndToEndDurationStats().getCount());
-            assertEquals(i + 1, summary.getProcessedDataStats().getCount());
-            assertEquals(i + 1, summary.getPersistedDataStats().getCount());
+            assertThat(summary.getStateSizeStats().getCount()).isEqualTo(i + 1);
+            assertThat(summary.getEndToEndDurationStats().getCount()).isEqualTo(i + 1);
+            assertThat(summary.getProcessedDataStats().getCount()).isEqualTo(i + 1);
+            assertThat(summary.getPersistedDataStats().getCount()).isEqualTo(i + 1);
         }
 
-        MinMaxAvgStats stateSizeStats = summary.getStateSizeStats();
-        assertEquals(stateSize, stateSizeStats.getMinimum());
-        assertEquals(stateSize + numCheckpoints - 1, stateSizeStats.getMaximum());
+        StatsSummary stateSizeStats = summary.getStateSizeStats();
+        assertThat(stateSizeStats.getMinimum()).isEqualTo(stateSize);
+        assertThat(stateSizeStats.getMaximum()).isEqualTo(stateSize + numCheckpoints - 1);
 
-        MinMaxAvgStats durationStats = summary.getEndToEndDurationStats();
-        assertEquals(ackTimestamp - triggerTimestamp, durationStats.getMinimum());
-        assertEquals(
-                ackTimestamp - triggerTimestamp + numCheckpoints - 1, durationStats.getMaximum());
+        StatsSummary durationStats = summary.getEndToEndDurationStats();
+        assertThat(durationStats.getMinimum()).isEqualTo(ackTimestamp - triggerTimestamp);
+        assertThat(durationStats.getMaximum())
+                .isEqualTo(ackTimestamp - triggerTimestamp + numCheckpoints - 1);
 
-        MinMaxAvgStats processedDataStats = summary.getProcessedDataStats();
-        assertEquals(processedData, processedDataStats.getMinimum());
-        assertEquals(processedData + numCheckpoints - 1, processedDataStats.getMaximum());
+        StatsSummary processedDataStats = summary.getProcessedDataStats();
+        assertThat(processedDataStats.getMinimum()).isEqualTo(processedData);
+        assertThat(processedDataStats.getMaximum()).isEqualTo(processedData + numCheckpoints - 1);
 
-        MinMaxAvgStats persistedDataStats = summary.getPersistedDataStats();
-        assertEquals(persistedData, persistedDataStats.getMinimum());
-        assertEquals(persistedData + numCheckpoints - 1, persistedDataStats.getMaximum());
+        StatsSummary persistedDataStats = summary.getPersistedDataStats();
+        assertThat(persistedDataStats.getMinimum()).isEqualTo(persistedData);
+        assertThat(persistedDataStats.getMaximum()).isEqualTo(persistedData + numCheckpoints - 1);
     }
 
     private CompletedCheckpointStats createCompletedCheckpoint(
@@ -89,8 +97,10 @@ public class CompletedCheckpointStatsSummaryTest {
             long triggerTimestamp,
             long ackTimestamp,
             long stateSize,
+            long metadataSize,
             long processedData,
-            long persistedData) {
+            long persistedData,
+            boolean unalignedCheckpoint) {
 
         SubtaskStateStats latest = mock(SubtaskStateStats.class);
         when(latest.getAckTimestamp()).thenReturn(ackTimestamp);
@@ -108,9 +118,48 @@ public class CompletedCheckpointStatsSummaryTest {
                 taskStats,
                 1,
                 stateSize,
+                metadataSize,
                 processedData,
                 persistedData,
+                unalignedCheckpoint,
                 latest,
                 null);
+    }
+
+    /** Simply test that quantiles can be computed and fields are not permuted. */
+    @Test
+    void testQuantiles() {
+        int stateSize = 100;
+        int metadataSize = 110;
+        int processedData = 200;
+        int persistedData = 300;
+        boolean unalignedCheckpoint = true;
+        long triggerTimestamp = 1234;
+        long lastAck = triggerTimestamp + 123;
+
+        CompletedCheckpointStatsSummary summary = new CompletedCheckpointStatsSummary();
+        summary.updateSummary(
+                new CompletedCheckpointStats(
+                        1L,
+                        triggerTimestamp,
+                        CheckpointProperties.forSavepoint(false, SavepointFormatType.CANONICAL),
+                        1,
+                        singletonMap(new JobVertexID(), new TaskStateStats(new JobVertexID(), 1)),
+                        1,
+                        stateSize,
+                        metadataSize,
+                        processedData,
+                        persistedData,
+                        unalignedCheckpoint,
+                        new SubtaskStateStats(0, lastAck),
+                        ""));
+        CompletedCheckpointStatsSummarySnapshot snapshot = summary.createSnapshot();
+        assertThat(snapshot.getStateSizeStats().getQuantile(1)).isCloseTo(stateSize, offset(0d));
+        assertThat(snapshot.getProcessedDataStats().getQuantile(1))
+                .isCloseTo(processedData, offset(0d));
+        assertThat(snapshot.getPersistedDataStats().getQuantile(1))
+                .isCloseTo(persistedData, offset(0d));
+        assertThat(snapshot.getEndToEndDurationStats().getQuantile(1))
+                .isCloseTo(lastAck - triggerTimestamp, offset(0d));
     }
 }

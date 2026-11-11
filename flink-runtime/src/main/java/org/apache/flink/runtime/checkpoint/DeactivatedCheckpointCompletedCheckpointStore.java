@@ -19,23 +19,21 @@
 package org.apache.flink.runtime.checkpoint;
 
 import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.runtime.state.SharedStateRegistry;
 
+import java.util.Collections;
 import java.util.List;
 
 /**
- * This class represents a {@link CompletedCheckpointStore} if checkpointing has been enabled.
- * Consequently, no component should use methods other than {@link #shutdown}.
+ * This class represents a {@link CompletedCheckpointStore} if checkpointing has been disabled.
+ * Consequently, no component should use methods other than {@link
+ * CompletedCheckpointStore#shutdown}.
  */
 public enum DeactivatedCheckpointCompletedCheckpointStore implements CompletedCheckpointStore {
     INSTANCE;
 
     @Override
-    public void recover() throws Exception {
-        throw unsupportedOperationException();
-    }
-
-    @Override
-    public void addCheckpoint(
+    public CompletedCheckpoint addCheckpointAndSubsumeOldestOne(
             CompletedCheckpoint checkpoint,
             CheckpointsCleaner checkpointsCleaner,
             Runnable postCleanup)
@@ -44,13 +42,12 @@ public enum DeactivatedCheckpointCompletedCheckpointStore implements CompletedCh
     }
 
     @Override
-    public void shutdown(
-            JobStatus jobStatus, CheckpointsCleaner checkpointsCleaner, Runnable postCleanup)
+    public void shutdown(JobStatus jobStatus, CheckpointsCleaner checkpointsCleaner)
             throws Exception {}
 
     @Override
-    public List<CompletedCheckpoint> getAllCheckpoints() throws Exception {
-        throw unsupportedOperationException();
+    public List<CompletedCheckpoint> getAllCheckpoints() {
+        return Collections.emptyList();
     }
 
     @Override
@@ -65,6 +62,11 @@ public enum DeactivatedCheckpointCompletedCheckpointStore implements CompletedCh
 
     @Override
     public boolean requiresExternalizedCheckpoints() {
+        throw unsupportedOperationException();
+    }
+
+    @Override
+    public SharedStateRegistry getSharedStateRegistry() {
         throw unsupportedOperationException();
     }
 

@@ -18,55 +18,56 @@ limitations under the License.
 
 package org.apache.flink.runtime.operators.coordination;
 
+import org.apache.flink.api.common.JobID;
+import org.apache.flink.api.common.JobInfo;
+import org.apache.flink.api.common.JobInfoImpl;
+import org.apache.flink.metrics.groups.OperatorCoordinatorMetricGroup;
+import org.apache.flink.runtime.checkpoint.CheckpointCoordinator;
 import org.apache.flink.runtime.jobgraph.OperatorID;
-import org.apache.flink.runtime.messages.Acknowledge;
-import org.apache.flink.util.FlinkRuntimeException;
+import org.apache.flink.runtime.metrics.groups.InternalOperatorCoordinatorMetricGroup;
+import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
+/** A simple implementation of {@link OperatorCoordinator.Context} for testing purposes. */
 public class MockOperatorCoordinatorContext implements OperatorCoordinator.Context {
+
+    private final JobID jobID = new JobID();
+    private final JobInfo jobInfo = new JobInfoImpl(jobID, "mock-job");
     private final OperatorID operatorID;
     private final ClassLoader userCodeClassLoader;
     private final int numSubtasks;
-    private final boolean failEventSending;
+    private final CoordinatorStore coordinatorStore = new CoordinatorStoreImpl();
 
-    private final Map<Integer, List<OperatorEvent>> eventsToOperator;
     private boolean jobFailed;
     private Throwable jobFailureReason;
+    private final CompletableFuture<Void> jobFailedFuture = new CompletableFuture<>();
 
     public MockOperatorCoordinatorContext(OperatorID operatorID, int numSubtasks) {
-        this(operatorID, numSubtasks, true);
-    }
-
-    public MockOperatorCoordinatorContext(
-            OperatorID operatorID, int numSubtasks, boolean failEventSending) {
-        this(
-                operatorID,
-                numSubtasks,
-                failEventSending,
-                MockOperatorCoordinatorContext.class.getClassLoader());
+        this(operatorID, numSubtasks, MockOperatorCoordinatorContext.class.getClassLoader());
     }
 
     public MockOperatorCoordinatorContext(OperatorID operatorID, ClassLoader userCodeClassLoader) {
-        this(operatorID, 1, true, userCodeClassLoader);
+        this(operatorID, 1, userCodeClassLoader);
     }
 
     public MockOperatorCoordinatorContext(
-            OperatorID operatorID,
-            int numSubtasks,
-            boolean failEventSending,
-            ClassLoader userCodeClassLoader) {
+            OperatorID operatorID, int numSubtasks, ClassLoader userCodeClassLoader) {
         this.operatorID = operatorID;
         this.numSubtasks = numSubtasks;
-        this.eventsToOperator = new HashMap<>();
         this.jobFailed = false;
         this.jobFailureReason = null;
-        this.failEventSending = failEventSending;
         this.userCodeClassLoader = userCodeClassLoader;
+    }
+
+    @Override
+    public JobID getJobID() {
+        return jobID;
+    }
+
+    @Override
+    public JobInfo getJobInfo() {
+        return jobInfo;
     }
 
     @Override
@@ -75,23 +76,16 @@ public class MockOperatorCoordinatorContext implements OperatorCoordinator.Conte
     }
 
     @Override
-    public CompletableFuture<Acknowledge> sendEvent(OperatorEvent evt, int targetSubtask)
-            throws TaskNotRunningException {
-        eventsToOperator.computeIfAbsent(targetSubtask, subtaskId -> new ArrayList<>()).add(evt);
-        if (failEventSending) {
-            CompletableFuture<Acknowledge> future = new CompletableFuture<>();
-            future.completeExceptionally(
-                    new FlinkRuntimeException("Testing Exception to fail event sending."));
-            return future;
-        } else {
-            return CompletableFuture.completedFuture(Acknowledge.get());
-        }
+    public OperatorCoordinatorMetricGroup metricGroup() {
+        return new InternalOperatorCoordinatorMetricGroup(
+                UnregisteredMetricGroups.createUnregisteredJobManagerOperatorMetricGroup());
     }
 
     @Override
     public void failJob(Throwable cause) {
         jobFailed = true;
         jobFailureReason = cause;
+        jobFailedFuture.complete(null);
     }
 
     @Override
@@ -104,15 +98,22 @@ public class MockOperatorCoordinatorContext implements OperatorCoordinator.Conte
         return userCodeClassLoader;
     }
 
+    @Override
+    public CoordinatorStore getCoordinatorStore() {
+        return coordinatorStore;
+    }
+
+    @Override
+    public boolean isConcurrentExecutionAttemptsSupported() {
+        return false;
+    }
+
+    @Override
+    public CheckpointCoordinator getCheckpointCoordinator() {
+        return null;
+    }
+
     // -------------------------------
-
-    public List<OperatorEvent> getEventsToOperatorBySubtaskId(int subtaskId) {
-        return eventsToOperator.get(subtaskId);
-    }
-
-    public Map<Integer, List<OperatorEvent>> getEventsToOperator() {
-        return eventsToOperator;
-    }
 
     public boolean isJobFailed() {
         return jobFailed;
@@ -120,5 +121,9 @@ public class MockOperatorCoordinatorContext implements OperatorCoordinator.Conte
 
     public Throwable getJobFailureReason() {
         return jobFailureReason;
+    }
+
+    public CompletableFuture<Void> getJobFailedFuture() {
+        return jobFailedFuture;
     }
 }

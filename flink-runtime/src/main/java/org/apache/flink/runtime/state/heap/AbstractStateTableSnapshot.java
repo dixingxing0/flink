@@ -21,6 +21,8 @@ package org.apache.flink.runtime.state.heap;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.core.memory.DataOutputView;
+import org.apache.flink.runtime.state.IterableStateSnapshot;
+import org.apache.flink.runtime.state.StateEntry;
 import org.apache.flink.runtime.state.StateSnapshot;
 import org.apache.flink.runtime.state.StateSnapshotTransformer;
 import org.apache.flink.runtime.state.metainfo.StateMetaInfoSnapshot;
@@ -30,6 +32,7 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.Iterator;
 
 /**
  * Abstract base class for snapshots of a {@link StateTable}. Offers a way to serialize the snapshot
@@ -37,7 +40,7 @@ import java.io.IOException;
  */
 @Internal
 abstract class AbstractStateTableSnapshot<K, N, S>
-        implements StateSnapshot, StateSnapshot.StateKeyGroupWriter {
+        implements IterableStateSnapshot<K, N, S>, StateSnapshot.StateKeyGroupWriter {
 
     /** The {@link StateTable} from which this snapshot was created. */
     protected final StateTable<K, N, S> owningStateTable;
@@ -88,11 +91,19 @@ abstract class AbstractStateTableSnapshot<K, N, S>
         return this;
     }
 
+    @Override
+    public Iterator<StateEntry<K, N, S>> getIterator(int keyGroupId) {
+        StateMapSnapshot<K, N, S, ? extends StateMap<K, N, S>> stateMapSnapshot =
+                getStateMapSnapshotForKeyGroup(keyGroupId);
+        return stateMapSnapshot.getIterator(
+                localKeySerializer,
+                localNamespaceSerializer,
+                localStateSerializer,
+                stateSnapshotTransformer);
+    }
+
     /**
-     * Implementation note: we currently chose the same format between {@link NestedMapsStateTable}
-     * and {@link CopyOnWriteStateTable}.
-     *
-     * <p>{@link NestedMapsStateTable} could naturally support a kind of prefix-compressed format
+     * {@link CopyOnWriteStateTable} could naturally support a kind of prefix-compressed format
      * (grouping by namespace, writing the namespace only once per group instead for each mapping).
      * We might implement support for different formats later (tailored towards different state
      * table implementations).

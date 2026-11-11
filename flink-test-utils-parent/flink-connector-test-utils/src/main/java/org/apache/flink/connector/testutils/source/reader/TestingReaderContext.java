@@ -18,11 +18,16 @@
 
 package org.apache.flink.connector.testutils.source.reader;
 
+import org.apache.flink.api.common.JobID;
+import org.apache.flink.api.common.JobInfo;
+import org.apache.flink.api.common.JobInfoImpl;
 import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.groups.SourceReaderMetricGroup;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
+import org.apache.flink.util.SimpleUserCodeClassLoader;
+import org.apache.flink.util.UserCodeClassLoader;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -30,26 +35,34 @@ import java.util.List;
 /** A testing implementation of the {@link SourceReaderContext}. */
 public class TestingReaderContext implements SourceReaderContext {
 
-    private final UnregisteredMetricsGroup metrics = new UnregisteredMetricsGroup();
+    private final SourceReaderMetricGroup metrics;
 
     private final Configuration config;
+
+    private final JobInfo jobInfo = new JobInfoImpl(new JobID(), "test-job");
 
     private final ArrayList<SourceEvent> sentEvents = new ArrayList<>();
 
     private int numSplitRequests;
 
     public TestingReaderContext() {
-        this(new Configuration());
+        this(new Configuration(), UnregisteredMetricsGroup.createSourceReaderMetricGroup());
     }
 
-    public TestingReaderContext(Configuration config) {
+    public TestingReaderContext(Configuration config, SourceReaderMetricGroup metricGroup) {
         this.config = config;
+        this.metrics = metricGroup;
     }
 
     // ------------------------------------------------------------------------
 
     @Override
-    public MetricGroup metricGroup() {
+    public JobInfo getJobInfo() {
+        return jobInfo;
+    }
+
+    @Override
+    public SourceReaderMetricGroup metricGroup() {
         return metrics;
     }
 
@@ -76,6 +89,16 @@ public class TestingReaderContext implements SourceReaderContext {
     @Override
     public void sendSourceEventToCoordinator(SourceEvent sourceEvent) {
         sentEvents.add(sourceEvent);
+    }
+
+    @Override
+    public UserCodeClassLoader getUserCodeClassLoader() {
+        return SimpleUserCodeClassLoader.create(getClass().getClassLoader());
+    }
+
+    @Override
+    public int currentParallelism() {
+        return 1;
     }
 
     // ------------------------------------------------------------------------

@@ -20,63 +20,82 @@ package org.apache.flink.runtime.scheduler;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.configuration.JobManagerOptions;
+import org.apache.flink.core.execution.CheckpointType;
+import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.queryablestate.KvStateID;
 import org.apache.flink.runtime.accumulators.AccumulatorSnapshot;
 import org.apache.flink.runtime.checkpoint.CheckpointMetrics;
+import org.apache.flink.runtime.checkpoint.CheckpointStatsSnapshot;
+import org.apache.flink.runtime.checkpoint.CompletedCheckpoint;
+import org.apache.flink.runtime.checkpoint.SubTaskInitializationMetrics;
 import org.apache.flink.runtime.checkpoint.TaskStateSnapshot;
-import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
 import org.apache.flink.runtime.execution.ExecutionState;
-import org.apache.flink.runtime.executiongraph.ArchivedExecutionGraph;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
-import org.apache.flink.runtime.executiongraph.JobStatusListener;
 import org.apache.flink.runtime.executiongraph.TaskExecutionStateTransition;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
+import org.apache.flink.runtime.jobgraph.JobResourceRequirements;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobmanager.PartitionProducerDisposedException;
 import org.apache.flink.runtime.jobmaster.SerializedInputSplit;
 import org.apache.flink.runtime.messages.checkpoint.DeclineCheckpoint;
-import org.apache.flink.runtime.messages.webmonitor.JobDetails;
 import org.apache.flink.runtime.operators.coordination.CoordinationRequest;
 import org.apache.flink.runtime.operators.coordination.CoordinationResponse;
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
 import org.apache.flink.runtime.query.KvStateLocation;
-import org.apache.flink.runtime.rest.handler.legacy.backpressure.OperatorBackPressureStats;
 import org.apache.flink.runtime.state.KeyGroupRange;
+import org.apache.flink.util.concurrent.FutureUtils;
+import org.apache.flink.util.function.TriFunction;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.BiFunction;
 import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 /** Testing implementation of the {@link SchedulerNG}. */
 public class TestingSchedulerNG implements SchedulerNG {
-    private final CompletableFuture<Void> terminationFuture;
+    private final CompletableFuture<JobStatus> jobTerminationFuture;
     private final Runnable startSchedulingRunnable;
-    private final Consumer<Throwable> suspendConsumer;
-    private final BiFunction<String, Boolean, CompletableFuture<String>> triggerSavepointFunction;
+    private final Supplier<CompletableFuture<Void>> closeAsyncSupplier;
+    private final TriFunction<String, Boolean, SavepointFormatType, CompletableFuture<String>>
+            triggerSavepointFunction;
+    private final Function<CheckpointType, CompletableFuture<CompletedCheckpoint>>
+            triggerCheckpointFunction;
+    private final Consumer<Throwable> handleGlobalFailureConsumer;
+    private final Supplier<JobResourceRequirements> requestJobResourceRequirementsSupplier;
+    private final Consumer<JobResourceRequirements> updateJobResourceRequirementsConsumer;
 
     private TestingSchedulerNG(
-            CompletableFuture<Void> terminationFuture,
+            CompletableFuture<JobStatus> jobTerminationFuture,
             Runnable startSchedulingRunnable,
-            Consumer<Throwable> suspendConsumer,
-            BiFunction<String, Boolean, CompletableFuture<String>> triggerSavepointFunction) {
-        this.terminationFuture = terminationFuture;
+            Supplier<CompletableFuture<Void>> closeAsyncSupplier,
+            TriFunction<String, Boolean, SavepointFormatType, CompletableFuture<String>>
+                    triggerSavepointFunction,
+            Function<CheckpointType, CompletableFuture<CompletedCheckpoint>>
+                    triggerCheckpointFunction,
+            Consumer<Throwable> handleGlobalFailureConsumer,
+            Supplier<JobResourceRequirements> requestJobResourceRequirementsSupplier,
+            Consumer<JobResourceRequirements> updateJobResourceRequirementsConsumer) {
+        this.jobTerminationFuture = jobTerminationFuture;
         this.startSchedulingRunnable = startSchedulingRunnable;
-        this.suspendConsumer = suspendConsumer;
+        this.closeAsyncSupplier = closeAsyncSupplier;
         this.triggerSavepointFunction = triggerSavepointFunction;
+        this.triggerCheckpointFunction = triggerCheckpointFunction;
+        this.handleGlobalFailureConsumer = handleGlobalFailureConsumer;
+        this.requestJobResourceRequirementsSupplier = requestJobResourceRequirementsSupplier;
+        this.updateJobResourceRequirementsConsumer = updateJobResourceRequirementsConsumer;
     }
 
     @Override
-    public void initialize(ComponentMainThreadExecutor mainThreadExecutor) {}
-
-    @Override
-    public void registerJobStatusListener(JobStatusListener jobStatusListener) {}
+    public JobManagerOptions.SchedulerType getSchedulerType() {
+        return JobManagerOptions.SchedulerType.Default;
+    }
 
     @Override
     public void startScheduling() {
@@ -88,20 +107,22 @@ public class TestingSchedulerNG implements SchedulerNG {
     }
 
     @Override
-    public void suspend(Throwable cause) {
-        suspendConsumer.accept(cause);
+    public CompletableFuture<Void> closeAsync() {
+        return closeAsyncSupplier.get();
     }
 
     @Override
     public void cancel() {}
 
     @Override
-    public CompletableFuture<Void> getTerminationFuture() {
-        return terminationFuture;
+    public CompletableFuture<JobStatus> getJobTerminationFuture() {
+        return jobTerminationFuture;
     }
 
     @Override
-    public void handleGlobalFailure(Throwable cause) {}
+    public void handleGlobalFailure(Throwable cause) {
+        handleGlobalFailureConsumer.accept(cause);
+    }
 
     @Override
     public boolean updateTaskExecutionState(TaskExecutionStateTransition taskExecutionState) {
@@ -125,12 +146,13 @@ public class TestingSchedulerNG implements SchedulerNG {
     }
 
     @Override
-    public void notifyPartitionDataAvailable(ResultPartitionID partitionID) {
+    public ExecutionGraphInfo requestJob() {
         failOperation();
+        return null;
     }
 
     @Override
-    public ArchivedExecutionGraph requestJob() {
+    public CheckpointStatsSnapshot requestCheckpointStats() {
         failOperation();
         return null;
     }
@@ -138,12 +160,6 @@ public class TestingSchedulerNG implements SchedulerNG {
     @Override
     public JobStatus requestJobStatus() {
         return JobStatus.CREATED;
-    }
-
-    @Override
-    public JobDetails requestJobDetails() {
-        failOperation();
-        return null;
     }
 
     @Override
@@ -178,16 +194,14 @@ public class TestingSchedulerNG implements SchedulerNG {
     }
 
     @Override
-    public Optional<OperatorBackPressureStats> requestOperatorBackPressureStats(
-            JobVertexID jobVertexId) {
-        failOperation();
-        return Optional.empty();
+    public CompletableFuture<String> triggerSavepoint(
+            @Nullable String targetDirectory, boolean cancelJob, SavepointFormatType formatType) {
+        return triggerSavepointFunction.apply(targetDirectory, cancelJob, formatType);
     }
 
     @Override
-    public CompletableFuture<String> triggerSavepoint(
-            @Nullable String targetDirectory, boolean cancelJob) {
-        return triggerSavepointFunction.apply(targetDirectory, cancelJob);
+    public CompletableFuture<CompletedCheckpoint> triggerCheckpoint(CheckpointType checkpointType) {
+        return triggerCheckpointFunction.apply(checkpointType);
     }
 
     @Override
@@ -207,7 +221,7 @@ public class TestingSchedulerNG implements SchedulerNG {
 
     @Override
     public CompletableFuture<String> stopWithSavepoint(
-            String targetDirectory, boolean advanceToEndOfEventTime) {
+            String targetDirectory, boolean terminate, SavepointFormatType formatType) {
         failOperation();
         return null;
     }
@@ -225,20 +239,59 @@ public class TestingSchedulerNG implements SchedulerNG {
         return null;
     }
 
+    @Override
+    public void notifyEndOfData(ExecutionAttemptID executionAttemptID) {}
+
+    @Override
+    public void reportInitializationMetrics(
+            JobID jobId,
+            ExecutionAttemptID executionAttemptId,
+            SubTaskInitializationMetrics initializationMetrics) {}
+
+    @Override
+    public void reportCheckpointMetrics(
+            JobID jobID,
+            ExecutionAttemptID executionAttemptID,
+            long checkpointId,
+            CheckpointMetrics checkpointMetrics) {}
+
+    @Override
+    public JobResourceRequirements requestJobResourceRequirements() {
+        return requestJobResourceRequirementsSupplier.get();
+    }
+
+    @Override
+    public void updateJobResourceRequirements(JobResourceRequirements jobResourceRequirements) {
+        updateJobResourceRequirementsConsumer.accept(jobResourceRequirements);
+    }
+
     public static Builder newBuilder() {
         return new Builder();
     }
 
     /** Builder for the TestingSchedulerNG. */
     public static final class Builder {
-        private CompletableFuture<Void> terminationFuture = new CompletableFuture<>();
+        private CompletableFuture<JobStatus> jobTerminationFuture = new CompletableFuture<>();
         private Runnable startSchedulingRunnable = () -> {};
-        private Consumer<Throwable> suspendConsumer = ignored -> {};
-        private BiFunction<String, Boolean, CompletableFuture<String>> triggerSavepointFunction =
-                (ignoredA, ignoredB) -> new CompletableFuture<>();
+        private Supplier<CompletableFuture<Void>> closeAsyncSupplier =
+                FutureUtils::completedVoidFuture;
+        private TriFunction<String, Boolean, SavepointFormatType, CompletableFuture<String>>
+                triggerSavepointFunction =
+                        (ignoredA, ignoredB, formatType) -> new CompletableFuture<>();
+        private Function<CheckpointType, CompletableFuture<CompletedCheckpoint>>
+                triggerCheckpointFunction = (ignored) -> new CompletableFuture<>();
+        private Consumer<Throwable> handleGlobalFailureConsumer = (ignored) -> {};
+        private Supplier<JobResourceRequirements> requestJobResourceRequirementsSupplier =
+                () -> {
+                    throw new UnsupportedOperationException("Not supported.");
+                };
+        private Consumer<JobResourceRequirements> updateJobResourceRequirementsConsumer =
+                ignored -> {
+                    throw new UnsupportedOperationException("Not supported.");
+                };
 
-        public Builder setTerminationFuture(CompletableFuture<Void> terminationFuture) {
-            this.terminationFuture = terminationFuture;
+        public Builder setJobTerminationFuture(CompletableFuture<JobStatus> jobTerminationFuture) {
+            this.jobTerminationFuture = jobTerminationFuture;
             return this;
         }
 
@@ -247,23 +300,53 @@ public class TestingSchedulerNG implements SchedulerNG {
             return this;
         }
 
-        public Builder setSuspendConsumer(Consumer<Throwable> suspendConsumer) {
-            this.suspendConsumer = suspendConsumer;
+        public Builder setCloseAsyncSupplier(Supplier<CompletableFuture<Void>> closeAsyncSupplier) {
+            this.closeAsyncSupplier = closeAsyncSupplier;
             return this;
         }
 
         public Builder setTriggerSavepointFunction(
-                BiFunction<String, Boolean, CompletableFuture<String>> triggerSavepointFunction) {
+                TriFunction<String, Boolean, SavepointFormatType, CompletableFuture<String>>
+                        triggerSavepointFunction) {
             this.triggerSavepointFunction = triggerSavepointFunction;
+            return this;
+        }
+
+        public Builder setTriggerCheckpointFunction(
+                Function<CheckpointType, CompletableFuture<CompletedCheckpoint>>
+                        triggerCheckpointFunction) {
+            this.triggerCheckpointFunction = triggerCheckpointFunction;
+            return this;
+        }
+
+        public Builder setHandleGlobalFailureConsumer(
+                Consumer<Throwable> handleGlobalFailureConsumer) {
+            this.handleGlobalFailureConsumer = handleGlobalFailureConsumer;
+            return this;
+        }
+
+        public Builder setRequestJobResourceRequirementsSupplier(
+                Supplier<JobResourceRequirements> requestJobResourceRequirementsSupplier) {
+            this.requestJobResourceRequirementsSupplier = requestJobResourceRequirementsSupplier;
+            return this;
+        }
+
+        public Builder setUpdateJobResourceRequirementsConsumer(
+                Consumer<JobResourceRequirements> updateJobResourceRequirementsConsumer) {
+            this.updateJobResourceRequirementsConsumer = updateJobResourceRequirementsConsumer;
             return this;
         }
 
         public TestingSchedulerNG build() {
             return new TestingSchedulerNG(
-                    terminationFuture,
+                    jobTerminationFuture,
                     startSchedulingRunnable,
-                    suspendConsumer,
-                    triggerSavepointFunction);
+                    closeAsyncSupplier,
+                    triggerSavepointFunction,
+                    triggerCheckpointFunction,
+                    handleGlobalFailureConsumer,
+                    requestJobResourceRequirementsSupplier,
+                    updateJobResourceRequirementsConsumer);
         }
     }
 }

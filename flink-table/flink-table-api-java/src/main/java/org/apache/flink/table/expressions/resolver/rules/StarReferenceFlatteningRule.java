@@ -19,7 +19,10 @@
 package org.apache.flink.table.expressions.resolver.rules;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.table.api.config.TableConfigOptions;
+import org.apache.flink.table.api.config.TableConfigOptions.ColumnExpansionStrategy;
 import org.apache.flink.table.expressions.Expression;
+import org.apache.flink.table.expressions.UnresolvedCallExpression;
 import org.apache.flink.table.expressions.UnresolvedReferenceExpression;
 
 import java.util.ArrayList;
@@ -37,24 +40,40 @@ final class StarReferenceFlatteningRule implements ResolverRule {
 
     @Override
     public List<Expression> apply(List<Expression> expression, ResolutionContext context) {
+        final List<ColumnExpansionStrategy> strategies =
+                context.configuration().get(TableConfigOptions.TABLE_COLUMN_EXPANSION_STRATEGY);
         return expression.stream()
-                .flatMap(expr -> expr.accept(new FieldFlatteningVisitor(context)).stream())
+                .flatMap(e -> e.accept(new FieldFlatteningVisitor(context, strategies)).stream())
                 .collect(Collectors.toList());
     }
 
     private static class FieldFlatteningVisitor extends RuleExpressionVisitor<List<Expression>> {
 
-        FieldFlatteningVisitor(ResolutionContext resolutionContext) {
+        private final List<ColumnExpansionStrategy> strategies;
+
+        FieldFlatteningVisitor(
+                ResolutionContext resolutionContext, List<ColumnExpansionStrategy> strategies) {
             super(resolutionContext);
+            this.strategies = strategies;
         }
 
         @Override
         public List<Expression> visit(UnresolvedReferenceExpression unresolvedReference) {
             if (unresolvedReference.getName().equals("*")) {
-                return new ArrayList<>(resolutionContext.referenceLookup().getAllInputFields());
+                return new ArrayList<>(
+                        resolutionContext.referenceLookup().getInputFields(strategies));
             } else {
                 return singletonList(unresolvedReference);
             }
+        }
+
+        @Override
+        public List<Expression> visit(UnresolvedCallExpression unresolvedCall) {
+            final List<Expression> newArgs =
+                    unresolvedCall.getChildren().stream()
+                            .flatMap(e -> e.accept(this).stream())
+                            .collect(Collectors.toList());
+            return singletonList(unresolvedCall.replaceArgs(newArgs));
         }
 
         @Override

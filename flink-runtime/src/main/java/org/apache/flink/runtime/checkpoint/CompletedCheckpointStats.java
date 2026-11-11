@@ -38,12 +38,20 @@ public class CompletedCheckpointStats extends AbstractCheckpointStats {
 
     private static final long serialVersionUID = 138833868551861344L;
 
+    /** Total persisted data size over all subtasks of this checkpoint. */
+    private final long checkpointedSize;
+
     /** Total checkpoint state size over all subtasks. */
     private final long stateSize;
+
+    /** The persisted metadata file size. */
+    private final long metadataSize;
 
     private final long processedData;
 
     private final long persistedData;
+
+    private final boolean unalignedCheckpoint;
 
     /** The latest acknowledged subtask stats. */
     private final SubtaskStateStats latestAcknowledgedSubtask;
@@ -54,6 +62,37 @@ public class CompletedCheckpointStats extends AbstractCheckpointStats {
     /** Flag indicating whether the checkpoint was discarded. */
     private volatile boolean discarded;
 
+    CompletedCheckpointStats(
+            long checkpointId,
+            long triggerTimestamp,
+            CheckpointProperties props,
+            int totalSubtaskCount,
+            Map<JobVertexID, TaskStateStats> taskStats,
+            int numAcknowledgedSubtasks,
+            long stateSize,
+            long metadataSize,
+            long processedData,
+            long persistedData,
+            boolean unalignedCheckpoint,
+            SubtaskStateStats latestAcknowledgedSubtask,
+            String externalPointer) {
+        this(
+                checkpointId,
+                triggerTimestamp,
+                props,
+                totalSubtaskCount,
+                taskStats,
+                numAcknowledgedSubtasks,
+                stateSize,
+                stateSize,
+                metadataSize,
+                processedData,
+                persistedData,
+                unalignedCheckpoint,
+                latestAcknowledgedSubtask,
+                externalPointer);
+    }
+
     /**
      * Creates a tracker for a {@link CompletedCheckpoint}.
      *
@@ -63,9 +102,13 @@ public class CompletedCheckpointStats extends AbstractCheckpointStats {
      * @param totalSubtaskCount Total number of subtasks for the checkpoint.
      * @param taskStats Task stats for each involved operator.
      * @param numAcknowledgedSubtasks Number of acknowledged subtasks.
+     * @param checkpointedSize Total persisted data size over all subtasks during the sync and async
+     *     phases of this checkpoint.
      * @param stateSize Total checkpoint state size over all subtasks.
+     * @param metadataSize The metadata file size
      * @param processedData Processed data during the checkpoint.
      * @param persistedData Persisted data during the checkpoint.
+     * @param unalignedCheckpoint Whether the checkpoint is unaligned.
      * @param latestAcknowledgedSubtask The latest acknowledged subtask stats.
      * @param externalPointer Optional external path if persisted externally.
      */
@@ -76,19 +119,26 @@ public class CompletedCheckpointStats extends AbstractCheckpointStats {
             int totalSubtaskCount,
             Map<JobVertexID, TaskStateStats> taskStats,
             int numAcknowledgedSubtasks,
+            long checkpointedSize,
             long stateSize,
+            long metadataSize,
             long processedData,
             long persistedData,
+            boolean unalignedCheckpoint,
             SubtaskStateStats latestAcknowledgedSubtask,
             String externalPointer) {
 
         super(checkpointId, triggerTimestamp, props, totalSubtaskCount, taskStats);
         checkArgument(
                 numAcknowledgedSubtasks == totalSubtaskCount, "Did not acknowledge all subtasks.");
+        checkArgument(checkpointedSize >= 0, "Negative checkpointed size");
+        this.checkpointedSize = checkpointedSize;
         checkArgument(stateSize >= 0, "Negative state size");
         this.stateSize = stateSize;
+        this.metadataSize = metadataSize;
         this.processedData = processedData;
         this.persistedData = persistedData;
+        this.unalignedCheckpoint = unalignedCheckpoint;
         this.latestAcknowledgedSubtask = checkNotNull(latestAcknowledgedSubtask);
         this.externalPointer = externalPointer;
     }
@@ -109,6 +159,16 @@ public class CompletedCheckpointStats extends AbstractCheckpointStats {
     }
 
     @Override
+    public long getCheckpointedSize() {
+        return checkpointedSize;
+    }
+
+    @Override
+    public long getMetadataSize() {
+        return metadataSize;
+    }
+
+    @Override
     public long getProcessedData() {
         return processedData;
     }
@@ -116,6 +176,11 @@ public class CompletedCheckpointStats extends AbstractCheckpointStats {
     @Override
     public long getPersistedData() {
         return persistedData;
+    }
+
+    @Override
+    public boolean isUnalignedCheckpoint() {
+        return unalignedCheckpoint;
     }
 
     @Override
@@ -142,29 +207,9 @@ public class CompletedCheckpointStats extends AbstractCheckpointStats {
         return discarded;
     }
 
-    /**
-     * Returns the callback for the {@link CompletedCheckpoint}.
-     *
-     * @return Callback for the {@link CompletedCheckpoint}.
-     */
-    DiscardCallback getDiscardCallback() {
-        return new DiscardCallback();
-    }
-
-    /**
-     * Callback for the {@link CompletedCheckpoint} instance to notify about disposal of the
-     * checkpoint (most commonly when the checkpoint has been subsumed by a newer one).
-     */
-    class DiscardCallback {
-
-        /**
-         * Updates the discarded flag of the checkpoint stats.
-         *
-         * <p>After this notification, {@link #isDiscarded()} will return <code>true</code>.
-         */
-        void notifyDiscardedCheckpoint() {
-            discarded = true;
-        }
+    /** Mark the checkpoint has been discarded. */
+    void discard() {
+        discarded = true;
     }
 
     @Override

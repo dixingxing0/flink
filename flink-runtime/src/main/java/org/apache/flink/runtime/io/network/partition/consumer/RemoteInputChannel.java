@@ -19,10 +19,13 @@
 package org.apache.flink.runtime.io.network.partition.consumer;
 
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.core.memory.MemorySegment;
+import org.apache.flink.core.memory.MemorySegmentFactory;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.runtime.checkpoint.CheckpointException;
 import org.apache.flink.runtime.checkpoint.CheckpointFailureReason;
 import org.apache.flink.runtime.checkpoint.channel.ChannelStateWriter;
+import org.apache.flink.runtime.checkpoint.channel.RecoveryCheckpointBarrier;
 import org.apache.flink.runtime.event.AbstractEvent;
 import org.apache.flink.runtime.event.TaskEvent;
 import org.apache.flink.runtime.execution.CancelTaskException;
@@ -31,15 +34,24 @@ import org.apache.flink.runtime.io.network.ConnectionManager;
 import org.apache.flink.runtime.io.network.PartitionRequestClient;
 import org.apache.flink.runtime.io.network.api.CheckpointBarrier;
 import org.apache.flink.runtime.io.network.api.EventAnnouncement;
+import org.apache.flink.runtime.io.network.api.RecoveryMetadata;
 import org.apache.flink.runtime.io.network.api.serialization.EventSerializer;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.Buffer.DataType;
 import org.apache.flink.runtime.io.network.buffer.BufferProvider;
+import org.apache.flink.runtime.io.network.buffer.FreeingBufferRecycler;
+import org.apache.flink.runtime.io.network.buffer.NetworkBuffer;
+import org.apache.flink.runtime.io.network.logger.NetworkActionsLogger;
 import org.apache.flink.runtime.io.network.partition.PartitionNotFoundException;
 import org.apache.flink.runtime.io.network.partition.PrioritizedDeque;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
+import org.apache.flink.runtime.io.network.partition.ResultSubpartitionIndexSet;
+import org.apache.flink.util.ExceptionUtils;
 
-import org.apache.flink.shaded.guava18.com.google.common.collect.Iterators;
+import org.apache.flink.shaded.guava33.com.google.common.collect.Iterators;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
@@ -50,15 +62,22 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
+import static org.apache.flink.runtime.io.network.buffer.Buffer.DataType.RECOVERY_METADATA;
+import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkState;
 
 /** An input channel, which requests a remote partition queue. */
-public class RemoteInputChannel extends InputChannel {
+public class RemoteInputChannel extends InputChannel implements RecoverableInputChannel {
+    private static final Logger LOG = LoggerFactory.getLogger(RemoteInputChannel.class);
 
     private static final int NONE = -1;
 
@@ -92,6 +111,11 @@ public class RemoteInputChannel extends InputChannel {
     /** The initial number of exclusive buffers assigned to this channel. */
     private final int initialCredit;
 
+    private final boolean needsRecovery;
+
+    /** The milliseconds timeout for partition request listener in result partition manager. */
+    private final int partitionRequestListenerTimeout;
+
     /** The number of available buffers that have not been announced to the producer yet. */
     private final AtomicInteger unannouncedCredit = new AtomicInteger(0);
 
@@ -105,33 +129,123 @@ public class RemoteInputChannel extends InputChannel {
 
     private final ChannelStatePersister channelStatePersister;
 
+    /**
+     * Whether the channel is still replaying recovered state. Recovered buffers delivered by the
+     * spill drain are appended directly to {@link #receivedBuffers}, so the consume path needs no
+     * recovery-specific branch. Starts {@code false} for channels that do not need recovery and is
+     * flipped to {@code false} the moment the consume path polls the {@code
+     * EndOfFetchedChannelStateEvent} sentinel that the drain appended after the last recovered
+     * buffer (see {@link #onRecoveredStateConsumed()}).
+     */
+    @GuardedBy("receivedBuffers")
+    private boolean inRecovery;
+
+    private final CompletableFuture<Void> stateConsumedFuture = new CompletableFuture<>();
+
+    /**
+     * Sequence number assigned to recovered buffers, starting at {@link Integer#MIN_VALUE},
+     * consistent with {@link RecoveredInputChannel}.
+     */
+    @GuardedBy("receivedBuffers")
+    private int recoverySequenceNumber = Integer.MIN_VALUE;
+
+    /**
+     * Ordinary (non-priority) upstream events received while recovery is still in progress. They
+     * cannot enter {@link #receivedBuffers} ahead of the recovered buffers, so they are stashed
+     * here and appended once recovery delivery finishes. Credit is suppressed during recovery, so
+     * the upstream can only send events (never data buffers) before {@link
+     * #finishRecoveredBufferDelivery()}.
+     */
+    @GuardedBy("receivedBuffers")
+    private final ArrayDeque<SequenceBuffer> recoveryEventStash = new ArrayDeque<>();
+
+    /**
+     * One-shot latch that opens once the upstream reader is registered and the connection is live
+     * (signalled by the first {@link #onBuffer} or by {@link #releaseAllResources()}).
+     * Recovery-side awaiters block on it before handing off; once open, {@link
+     * CountDownLatch#countDown()} on the hot path is a cheap idempotent no-op, unlike completing a
+     * {@code CompletableFuture}.
+     */
+    private final CountDownLatch upstreamReady;
+
+    private long totalQueueSizeInBytes;
+
     public RemoteInputChannel(
             SingleInputGate inputGate,
             int channelIndex,
             ResultPartitionID partitionId,
+            ResultSubpartitionIndexSet consumedSubpartitionIndexSet,
             ConnectionID connectionId,
             ConnectionManager connectionManager,
             int initialBackOff,
             int maxBackoff,
+            int partitionRequestListenerTimeout,
             int networkBuffersPerChannel,
             Counter numBytesIn,
             Counter numBuffersIn,
-            ChannelStateWriter stateWriter) {
+            ChannelStateWriter stateWriter,
+            boolean needsRecovery) {
+        this(
+                inputGate,
+                channelIndex,
+                partitionId,
+                consumedSubpartitionIndexSet,
+                connectionId,
+                connectionManager,
+                initialBackOff,
+                maxBackoff,
+                partitionRequestListenerTimeout,
+                networkBuffersPerChannel,
+                numBytesIn,
+                numBuffersIn,
+                stateWriter,
+                needsRecovery,
+                new CountDownLatch(1));
+    }
+
+    @VisibleForTesting
+    RemoteInputChannel(
+            SingleInputGate inputGate,
+            int channelIndex,
+            ResultPartitionID partitionId,
+            ResultSubpartitionIndexSet consumedSubpartitionIndexSet,
+            ConnectionID connectionId,
+            ConnectionManager connectionManager,
+            int initialBackOff,
+            int maxBackoff,
+            int partitionRequestListenerTimeout,
+            int networkBuffersPerChannel,
+            Counter numBytesIn,
+            Counter numBuffersIn,
+            ChannelStateWriter stateWriter,
+            boolean needsRecovery,
+            CountDownLatch upstreamReady) {
 
         super(
                 inputGate,
                 channelIndex,
                 partitionId,
+                consumedSubpartitionIndexSet,
                 initialBackOff,
                 maxBackoff,
                 numBytesIn,
                 numBuffersIn);
+        checkArgument(networkBuffersPerChannel >= 0, "Must be non-negative.");
 
+        this.partitionRequestListenerTimeout = partitionRequestListenerTimeout;
         this.initialCredit = networkBuffersPerChannel;
         this.connectionId = checkNotNull(connectionId);
         this.connectionManager = checkNotNull(connectionManager);
-        this.bufferManager = new BufferManager(inputGate.getMemorySegmentProvider(), this, 0);
-        this.channelStatePersister = new ChannelStatePersister(stateWriter, getChannelInfo());
+        this.needsRecovery = needsRecovery;
+        this.bufferManager =
+                new BufferManager(inputGate.getMemorySegmentProvider(), this, 0, !needsRecovery);
+        this.channelStatePersister =
+                new ChannelStatePersister(checkNotNull(stateWriter), getChannelInfo());
+        this.inRecovery = needsRecovery;
+        this.upstreamReady = checkNotNull(upstreamReady);
+        if (!needsRecovery) {
+            stateConsumedFuture.complete(null);
+        }
     }
 
     @VisibleForTesting
@@ -153,15 +267,131 @@ public class RemoteInputChannel extends InputChannel {
     }
 
     // ------------------------------------------------------------------------
+    // RecoverableInputChannel implementation
+    // ------------------------------------------------------------------------
+
+    @Override
+    public void onRecoveredStateBuffer(Buffer buffer) {
+        boolean wasEmpty;
+        synchronized (receivedBuffers) {
+            if (isReleased.get()) {
+                buffer.recycleBuffer();
+                return;
+            }
+            // Migrate recovered buffers from RecoveredInputChannel. These buffers have been
+            // filtered but not yet consumed by the Task. They are appended to receivedBuffers so
+            // the consume path stays identical to the non-recovery case.
+            wasEmpty = appendRecoveredBuffer(buffer);
+        }
+        if (wasEmpty) {
+            notifyChannelNonEmpty();
+        }
+    }
+
+    @Override
+    public void finishRecoveredBufferDelivery() throws IOException, InterruptedException {
+        upstreamReady.await();
+        boolean wasEmpty;
+        synchronized (receivedBuffers) {
+            // A release may have opened the latch instead of the first buffer; bail out so we never
+            // append to a queue that releaseAllResources() already cleared.
+            if (isReleased.get()) {
+                return;
+            }
+            checkState(inRecovery, "Recovery delivery already finished.");
+            // Append the sentinel after the last recovered buffer. The consume path flips out of
+            // recovery (unstash + reopen credit) only once it polls this sentinel, guaranteeing all
+            // recovered buffers are consumed first.
+            wasEmpty =
+                    appendRecoveredBuffer(
+                            EventSerializer.toBuffer(
+                                    EndOfFetchedChannelStateEvent.INSTANCE, false));
+        }
+        if (wasEmpty) {
+            notifyChannelNonEmpty();
+        }
+    }
+
+    /**
+     * Flips out of recovery once the consume path polls the {@code EndOfFetchedChannelStateEvent}
+     * sentinel: releases the upstream events stashed during recovery so they are consumed after the
+     * recovered buffers, then reopens the suppressed credit notifications.
+     */
+    @Override
+    public void onRecoveredStateConsumed() throws IOException {
+        synchronized (receivedBuffers) {
+            checkState(inRecovery, "Recovery already finished.");
+            inRecovery = false;
+            recoveryEventStash.forEach(receivedBuffers::add);
+            recoveryEventStash.clear();
+        }
+        notifyChannelNonEmpty();
+        // Credit notifications are suppressed while recovery borrows the exclusive buffers.
+        bufferManager.enableNotify();
+        stateConsumedFuture.complete(null);
+    }
+
+    @Override
+    public CompletableFuture<Void> getStateConsumedFuture() {
+        return stateConsumedFuture;
+    }
+
+    @Override
+    public Buffer requestRecoveryBufferBlocking() throws InterruptedException, IOException {
+        upstreamReady.await();
+        // If a release opened the latch instead of the first buffer, requestBufferBlocking()
+        // detects the released channel and throws CancelTaskException.
+        return bufferManager.requestBufferBlocking();
+    }
+
+    @Override
+    public void insertRecoveryCheckpointBarrierIfInRecovery(long checkpointId) throws IOException {
+        boolean wasEmpty = false;
+        synchronized (receivedBuffers) {
+            if (!isReleased.get() && inRecovery) {
+                wasEmpty =
+                        appendRecoveredBuffer(
+                                EventSerializer.toBuffer(
+                                        new RecoveryCheckpointBarrier(checkpointId), false));
+            }
+        }
+        if (wasEmpty) {
+            notifyChannelNonEmpty();
+        }
+    }
+
+    /**
+     * Appends a recovered buffer (or {@code RecoveryCheckpointBarrier} sentinel) to {@link
+     * #receivedBuffers} with a recovery sequence number.
+     *
+     * @return {@code true} iff {@code receivedBuffers} transitioned from empty to non-empty.
+     */
+    @GuardedBy("receivedBuffers")
+    private boolean appendRecoveredBuffer(Buffer buffer) {
+        boolean wasEmpty = receivedBuffers.isEmpty();
+        // Recovered buffers carry no per-buffer subpartition id (NONE): they are snapshotted via
+        // the recovery path, never via getInflightBuffersUnsafe which is the only consumer of that
+        // field.
+        receivedBuffers.add(new SequenceBuffer(buffer, recoverySequenceNumber++, NONE));
+        totalQueueSizeInBytes += buffer.getSize();
+        return wasEmpty;
+    }
+
+    // ------------------------------------------------------------------------
     // Consume
     // ------------------------------------------------------------------------
 
     /** Requests a remote subpartition. */
     @VisibleForTesting
     @Override
-    public void requestSubpartition(int subpartitionIndex)
-            throws IOException, InterruptedException {
+    public void requestSubpartitions() throws IOException, InterruptedException {
         if (partitionRequestClient == null) {
+            LOG.debug(
+                    "{}: Requesting REMOTE subpartitions {} of partition {}. {}",
+                    this,
+                    consumedSubpartitionIndexSet,
+                    partitionId,
+                    channelStatePersister);
             // Create a client and request the partition
             try {
                 partitionRequestClient =
@@ -172,31 +402,69 @@ public class RemoteInputChannel extends InputChannel {
                 throw new PartitionConnectionException(partitionId, e);
             }
 
-            partitionRequestClient.requestSubpartition(partitionId, subpartitionIndex, this, 0);
+            partitionRequestClient.requestSubpartition(
+                    partitionId, consumedSubpartitionIndexSet, this, 0);
         }
     }
 
     /** Retriggers a remote subpartition request. */
-    void retriggerSubpartitionRequest(int subpartitionIndex) throws IOException {
+    void retriggerSubpartitionRequest() throws IOException {
         checkPartitionRequestQueueInitialized();
 
         if (increaseBackoff()) {
             partitionRequestClient.requestSubpartition(
-                    partitionId, subpartitionIndex, this, getCurrentBackoff());
+                    partitionId, consumedSubpartitionIndexSet, this, 0);
         } else {
             failPartitionRequest();
         }
     }
 
+    /**
+     * The remote task manager creates partition request listener and returns {@link
+     * PartitionNotFoundException} until the listener is timeout, so the backoff should add the
+     * timeout milliseconds if it exists.
+     *
+     * @return <code>true</code>, iff the operation was successful. Otherwise, <code>false</code>.
+     */
     @Override
-    Optional<BufferAndAvailability> getNextBuffer() throws IOException {
-        checkPartitionRequestQueueInitialized();
+    protected boolean increaseBackoff() {
+        if (partitionRequestListenerTimeout > 0) {
+            currentBackoff += partitionRequestListenerTimeout;
+            return currentBackoff < 2 * maxBackoff;
+        }
 
+        // Backoff is disabled
+        return false;
+    }
+
+    @Override
+    protected int peekNextBufferSubpartitionIdInternal() throws IOException {
+        synchronized (receivedBuffers) {
+            checkReadability();
+
+            final SequenceBuffer next = receivedBuffers.peek();
+
+            if (next != null) {
+                return next.subpartitionId;
+            } else {
+                return -1;
+            }
+        }
+    }
+
+    @Override
+    public Optional<BufferAndAvailability> getNextBuffer() throws IOException {
         final SequenceBuffer next;
         final DataType nextDataType;
 
         synchronized (receivedBuffers) {
+            checkReadability();
+
             next = receivedBuffers.poll();
+
+            if (next != null) {
+                totalQueueSizeInBytes -= next.buffer.getSize();
+            }
             nextDataType =
                     receivedBuffers.peek() != null
                             ? receivedBuffers.peek().buffer.getDataType()
@@ -211,6 +479,13 @@ public class RemoteInputChannel extends InputChannel {
             return Optional.empty();
         }
 
+        NetworkActionsLogger.traceInput(
+                "RemoteInputChannel#getNextBuffer",
+                next.buffer,
+                inputGate.getOwningTaskName(),
+                channelInfo,
+                channelStatePersister,
+                next.sequenceNumber);
         numBytesIn.inc(next.buffer.getSize());
         numBuffersIn.inc();
         return Optional.of(
@@ -244,14 +519,21 @@ public class RemoteInputChannel extends InputChannel {
     @Override
     void releaseAllResources() throws IOException {
         if (isReleased.compareAndSet(false, true)) {
+            // Unblock any thread awaiting upstreamReady (drain still in flight) so it falls
+            // through and observes the released state instead of deadlocking.
+            upstreamReady.countDown();
+
+            // Recovery will never be consumed on a released channel; unblock anyone gating on it.
+            stateConsumedFuture.completeExceptionally(new CancelTaskException("Channel released."));
 
             final ArrayDeque<Buffer> releasedBuffers;
             synchronized (receivedBuffers) {
                 releasedBuffers =
-                        receivedBuffers.stream()
+                        Stream.concat(receivedBuffers.stream(), recoveryEventStash.stream())
                                 .map(sb -> sb.buffer)
                                 .collect(Collectors.toCollection(ArrayDeque::new));
                 receivedBuffers.clear();
+                recoveryEventStash.clear();
             }
             bufferManager.releaseAllBuffers(releasedBuffers);
 
@@ -262,6 +544,21 @@ public class RemoteInputChannel extends InputChannel {
             } else {
                 connectionManager.closeOpenChannelConnections(connectionId);
             }
+        }
+    }
+
+    @Override
+    int getBuffersInUseCount() {
+        return getNumberOfQueuedBuffers()
+                + Math.max(0, bufferManager.getNumberOfRequiredBuffers() - initialCredit);
+    }
+
+    @Override
+    void announceBufferSize(int newBufferSize) {
+        try {
+            notifyNewBufferSize(newBufferSize);
+        } catch (Throwable t) {
+            ExceptionUtils.rethrow(t);
         }
     }
 
@@ -287,6 +584,13 @@ public class RemoteInputChannel extends InputChannel {
         partitionRequestClient.notifyCreditAvailable(this);
     }
 
+    private void notifyNewBufferSize(int newBufferSize) throws IOException {
+        checkState(!isReleased.get(), "Channel released.");
+        checkPartitionRequestQueueInitialized();
+
+        partitionRequestClient.notifyNewBufferSize(this, newBufferSize);
+    }
+
     @VisibleForTesting
     public int getNumberOfAvailableBuffers() {
         return bufferManager.getNumberOfAvailableBuffers();
@@ -310,7 +614,12 @@ public class RemoteInputChannel extends InputChannel {
     @VisibleForTesting
     public Buffer getNextReceivedBuffer() {
         final SequenceBuffer sequenceBuffer = receivedBuffers.poll();
-        return sequenceBuffer != null ? sequenceBuffer.buffer : null;
+        if (sequenceBuffer != null) {
+            totalQueueSizeInBytes -= sequenceBuffer.buffer.getSize();
+            return sequenceBuffer.buffer;
+        } else {
+            return null;
+        }
     }
 
     @VisibleForTesting
@@ -339,9 +648,37 @@ public class RemoteInputChannel extends InputChannel {
         checkState(!isReleased.get(), "Channel released.");
         checkPartitionRequestQueueInitialized();
 
+        if (initialCredit == 0) {
+            // this unannounced credit can be a positive value because credit assignment and the
+            // increase of this value is not an atomic operation and as a result, this unannounced
+            // credit value can be get increased even after this channel has been blocked and all
+            // floating credits are released, it is important to clear this unannounced credit and
+            // at the same time reset the sender's available credits to keep consistency
+            unannouncedCredit.set(0);
+        }
+
         // notifies the producer that this channel is ready to
         // unblock from checkpoint and resume data consumption
         partitionRequestClient.resumeConsumption(this);
+    }
+
+    @Override
+    public void acknowledgeAllRecordsProcessed() throws IOException {
+        checkState(!isReleased.get(), "Channel released.");
+        checkPartitionRequestQueueInitialized();
+
+        partitionRequestClient.acknowledgeAllRecordsProcessed(this);
+    }
+
+    private void onBlockingUpstream() {
+        if (initialCredit == 0) {
+            // release the allocated floating buffers so that they can be used by other channels if
+            // no exclusive buffer is configured, it is important because a blocked channel can not
+            // transmit any data so the allocated floating buffers can not be recycled, as a result,
+            // other channels may can't allocate new buffers for data transmission (an extreme case
+            // is that we only have 1 floating buffer and 0 exclusive buffer)
+            bufferManager.releaseFloatingBuffers();
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -382,6 +719,11 @@ public class RemoteInputChannel extends InputChannel {
         return Math.max(0, receivedBuffers.size());
     }
 
+    @Override
+    public long unsynchronizedGetSizeOfQueuedBuffers() {
+        return Math.max(0, totalQueueSizeInBytes);
+    }
+
     public int unsynchronizedGetExclusiveBuffersUsed() {
         return Math.max(
                 0, initialCredit - bufferManager.unsynchronizedGetAvailableExclusiveBuffers());
@@ -397,6 +739,10 @@ public class RemoteInputChannel extends InputChannel {
 
     public int getInitialCredit() {
         return initialCredit;
+    }
+
+    public boolean needsRecovery() {
+        return needsRecovery;
     }
 
     public BufferProvider getBufferProvider() throws IOException {
@@ -425,15 +771,24 @@ public class RemoteInputChannel extends InputChannel {
      *
      * @param backlog The number of unsent buffers in the producer's sub partition.
      */
-    void onSenderBacklog(int backlog) throws IOException {
-        int numRequestedBuffers = bufferManager.requestFloatingBuffers(backlog + initialCredit);
-        if (numRequestedBuffers > 0 && unannouncedCredit.getAndAdd(numRequestedBuffers) == 0) {
-            notifyCreditAvailable();
-        }
+    public void onSenderBacklog(int backlog) throws IOException {
+        notifyBufferAvailable(bufferManager.requestFloatingBuffers(backlog + initialCredit));
     }
 
-    public void onBuffer(Buffer buffer, int sequenceNumber, int backlog) throws IOException {
+    /**
+     * Handles the input buffer. This method is taking over the ownership of the buffer and is fully
+     * responsible for cleaning it up both on the happy path and in case of an error.
+     */
+    public void onBuffer(Buffer buffer, int sequenceNumber, int backlog, int subpartitionId)
+            throws IOException {
         boolean recycleBuffer = true;
+
+        // The first buffer from the producer proves the upstream reader is registered and the
+        // connection is live; release any recovery-side awaiter
+        // (see requestRecoveryBufferBlocking). During recovery this first arrival is typically the
+        // upstream's EndOfOutputChannelStateEvent, which is guaranteed and passes the zero-credit
+        // gate. On later buffers this is a cheap idempotent no-op (the latch is already at zero).
+        upstreamReady.countDown();
 
         try {
             if (expectedSequenceNumber != sequenceNumber) {
@@ -441,9 +796,21 @@ public class RemoteInputChannel extends InputChannel {
                 return;
             }
 
+            if (buffer.getDataType().isBlockingUpstream()) {
+                onBlockingUpstream();
+                checkArgument(backlog == 0, "Illegal number of backlog: %s, should be 0.", backlog);
+            }
+
             final boolean wasEmpty;
             boolean firstPriorityEvent = false;
             synchronized (receivedBuffers) {
+                NetworkActionsLogger.traceInput(
+                        "RemoteInputChannel#onBuffer",
+                        buffer,
+                        inputGate.getOwningTaskName(),
+                        channelInfo,
+                        channelStatePersister,
+                        sequenceNumber);
                 // Similar to notifyBufferAvailable(), make sure that we never add a buffer
                 // after releaseAllResources() released all buffers from receivedBuffers
                 // (see above for details).
@@ -453,31 +820,45 @@ public class RemoteInputChannel extends InputChannel {
 
                 wasEmpty = receivedBuffers.isEmpty();
 
-                SequenceBuffer sequenceBuffer = new SequenceBuffer(buffer, sequenceNumber);
+                SequenceBuffer sequenceBuffer =
+                        new SequenceBuffer(buffer, sequenceNumber, subpartitionId);
                 DataType dataType = buffer.getDataType();
                 if (dataType.hasPriority()) {
                     firstPriorityEvent = addPriorityBuffer(sequenceBuffer);
+                    recycleBuffer = false;
                 } else {
-                    receivedBuffers.add(sequenceBuffer);
+                    if (inRecovery) {
+                        // The upstream has no credit until recovery delivery finishes, so it can
+                        // only
+                        // send events here, never data buffers. Stash ordinary events so they are
+                        // consumed after the recovered buffers; data buffers are a protocol
+                        // violation.
+                        checkState(
+                                !buffer.isBuffer(),
+                                "Received live data buffer during recovery on channel %s",
+                                getChannelInfo());
+                        recoveryEventStash.add(sequenceBuffer);
+                    } else {
+                        receivedBuffers.add(sequenceBuffer);
+                    }
+                    recycleBuffer = false;
                     if (dataType.requiresAnnouncement()) {
                         firstPriorityEvent = addPriorityBuffer(announce(sequenceBuffer));
                     }
                 }
-                channelStatePersister
-                        .checkForBarrier(sequenceBuffer.buffer)
-                        .filter(id -> id > lastBarrierId)
-                        .ifPresent(
-                                id -> {
-                                    // checkpoint was not yet started by task thread,
-                                    // so remember the numbers of buffers to spill for the time when
-                                    // it will be started
-                                    lastBarrierId = id;
-                                    lastBarrierSequenceNumber = sequenceBuffer.sequenceNumber;
-                                });
+                totalQueueSizeInBytes += buffer.getSize();
+                final OptionalLong barrierId =
+                        channelStatePersister.checkForBarrier(sequenceBuffer.buffer);
+                if (barrierId.isPresent() && barrierId.getAsLong() > lastBarrierId) {
+                    // checkpoint was not yet started by task thread,
+                    // so remember the numbers of buffers to spill for the time when
+                    // it will be started
+                    lastBarrierId = barrierId.getAsLong();
+                    lastBarrierSequenceNumber = sequenceBuffer.sequenceNumber;
+                }
                 channelStatePersister.maybePersist(buffer);
                 ++expectedSequenceNumber;
             }
-            recycleBuffer = false;
 
             if (firstPriorityEvent) {
                 notifyPriorityEvent(sequenceNumber);
@@ -496,7 +877,9 @@ public class RemoteInputChannel extends InputChannel {
         }
     }
 
-    /** @return {@code true} if this was first priority buffer added. */
+    /**
+     * @return {@code true} if this was first priority buffer added.
+     */
     private boolean addPriorityBuffer(SequenceBuffer sequenceBuffer) {
         receivedBuffers.addPriorityElement(sequenceBuffer);
         return receivedBuffers.getNumPriorityElements() == 1;
@@ -518,7 +901,8 @@ public class RemoteInputChannel extends InputChannel {
         return new SequenceBuffer(
                 EventSerializer.toBuffer(
                         new EventAnnouncement(barrier, sequenceBuffer.sequenceNumber), true),
-                sequenceBuffer.sequenceNumber);
+                sequenceBuffer.sequenceNumber,
+                sequenceBuffer.subpartitionId);
     }
 
     private void checkAnnouncedOnlyOnce(SequenceBuffer sequenceBuffer) {
@@ -536,28 +920,147 @@ public class RemoteInputChannel extends InputChannel {
     }
 
     /**
-     * Spills all queued buffers on checkpoint start. If barrier has already been received (and
-     * reordered), spill only the overtaken buffers.
+     * Persists inflight data on checkpoint start. During recovery, persists recovered buffers
+     * before the matching RecoveryCheckpointBarrier sentinel; after recovery, uses the normal
+     * remote-channel barrier sequence tracking and persists overtaken live buffers.
      */
     public void checkpointStarted(CheckpointBarrier barrier) throws CheckpointException {
-        synchronized (receivedBuffers) {
-            channelStatePersister.startPersisting(
-                    barrier.getId(), getInflightBuffersUnsafe(barrier.getId()));
+        try {
+            List<Buffer> toPersist;
+            synchronized (receivedBuffers) {
+                if (inRecovery) {
+                    toPersist = collectPreRecoveryBarrier(barrier.getId());
+                } else {
+                    if (barrier.getId() < lastBarrierId) {
+                        // Currently, at most one active unaligned checkpoint is possible.
+                        throw new CheckpointException(
+                                String.format(
+                                        "Sequence number for checkpoint %d is not known (it was likely been overwritten by a newer checkpoint %d)",
+                                        barrier.getId(), lastBarrierId),
+                                CheckpointFailureReason.CHECKPOINT_SUBSUMED);
+                    } else if (barrier.getId() > lastBarrierId) {
+                        // This channel has received some obsolete barrier, older compared to the
+                        // checkpointId which we are processing right now, and we should ignore that
+                        // obsoleted checkpoint barrier sequence number.
+                        resetLastBarrier();
+                    }
+                    toPersist = getInflightBuffersUnsafe(barrier.getId());
+                }
+                channelStatePersister.startPersisting(barrier.getId(), toPersist);
+            }
+        } catch (IOException e) {
+            throw new CheckpointException(
+                    "Failed to extract recovered buffers for checkpoint " + barrier.getId(),
+                    CheckpointFailureReason.CHECKPOINT_DECLINED,
+                    e);
         }
+    }
+
+    /**
+     * Walks {@link #receivedBuffers} (skipping priority events) up to the {@link
+     * RecoveryCheckpointBarrier} sentinel matching {@code checkpointId}, retaining each pre-barrier
+     * recovered data buffer and removing the sentinel. During recovery the upstream has no credit,
+     * so {@code receivedBuffers} holds only recovered buffers, sentinels, and priority events — no
+     * live data buffers.
+     *
+     * <p>The scan runs on any checkpoint that starts while the channel is still {@code inRecovery},
+     * whether or not the drain has finished delivering. It must skip the {@code
+     * EndOfFetchedChannelStateEvent} because that sentinel can sit ahead of the {@code
+     * RecoveryCheckpointBarrier}: once the drain finishes it appends {@code
+     * EndOfFetchedChannelStateEvent}, and if a checkpoint is then triggered before the consume path
+     * polls it, {@link #insertRecoveryCheckpointBarrierIfInRecovery} appends the {@code
+     * RecoveryCheckpointBarrier} behind it. The incoming {@link CheckpointBarrier} is a priority
+     * event kept at the head, skipped by advancing past the priority region.
+     *
+     * @throws IOException if a barrier for a later checkpoint is encountered before {@code
+     *     checkpointId}, or if no sentinel matching {@code checkpointId} is found (the snapshot
+     *     protocol guarantees one must be present while the channel is in recovery).
+     */
+    @GuardedBy("receivedBuffers")
+    private List<Buffer> collectPreRecoveryBarrier(long checkpointId) throws IOException {
+        assert Thread.holdsLock(receivedBuffers);
+        List<Buffer> retained = new ArrayList<>();
+        List<SequenceBuffer> subsumed = new ArrayList<>();
+        SequenceBuffer sentinel = null;
+        try {
+            Iterator<SequenceBuffer> it = receivedBuffers.iterator();
+            // Priority events are stored separately at the head and never carry recovered data.
+            Iterators.advance(it, receivedBuffers.getNumPriorityElements());
+            while (it.hasNext()) {
+                SequenceBuffer sb = it.next();
+                RecoveryCheckpointBarrier barrier =
+                        RecoveryCheckpointBarrierUtils.asRecoveryCheckpointBarrier(sb.buffer);
+                if (barrier != null) {
+                    long barrierId = barrier.getCheckpointId();
+                    if (barrierId == checkpointId) {
+                        sentinel = sb;
+                        break;
+                    }
+                    if (barrierId > checkpointId) {
+                        throw new IOException(
+                                "Found RecoveryCheckpointBarrier for a later checkpoint "
+                                        + barrierId
+                                        + " before the target checkpoint "
+                                        + checkpointId
+                                        + " in receivedBuffers for channel "
+                                        + getChannelInfo());
+                    }
+                    // barrierId < checkpointId: the checkpoint was subsumed; drop its stale
+                    // barrier and keep scanning for the target.
+                    LOG.warn(
+                            "Discarding subsumed RecoveryCheckpointBarrier for checkpoint {} while "
+                                    + "collecting checkpoint {} on channel {}.",
+                            barrierId,
+                            checkpointId,
+                            getChannelInfo());
+                    subsumed.add(sb);
+                    continue;
+                }
+                // Skip non-data events (e.g. the EndOfFetchedChannelStateEvent sentinel appended
+                // after the recovered buffers): only recovered data buffers are snapshotted.
+                if (sb.buffer.isBuffer()) {
+                    retained.add(sb.buffer.retainBuffer());
+                }
+            }
+        } catch (IOException e) {
+            RecoveryCheckpointBarrierUtils.releaseRetainedBuffers(retained);
+            throw e;
+        }
+        if (sentinel == null) {
+            RecoveryCheckpointBarrierUtils.releaseRetainedBuffers(retained);
+            throw new IOException(
+                    "Missing RecoveryCheckpointBarrier for checkpoint "
+                            + checkpointId
+                            + " in receivedBuffers for channel "
+                            + getChannelInfo());
+        }
+        // receivedBuffers is a PrioritizedDeque whose iterator() is read-only; remove matched and
+        // subsumed sentinels by identity through its mutable removal API.
+        for (SequenceBuffer s : subsumed) {
+            removeRecoverySentinel(s);
+        }
+        removeRecoverySentinel(sentinel);
+        return retained;
+    }
+
+    @GuardedBy("receivedBuffers")
+    private void removeRecoverySentinel(SequenceBuffer sentinel) {
+        receivedBuffers.getAndRemove(sb -> sb == sentinel);
+        totalQueueSizeInBytes -= sentinel.buffer.getSize();
+        sentinel.buffer.recycleBuffer();
     }
 
     public void checkpointStopped(long checkpointId) {
         synchronized (receivedBuffers) {
             channelStatePersister.stopPersisting(checkpointId);
             if (lastBarrierId == checkpointId) {
-                lastBarrierId = NONE;
-                lastBarrierSequenceNumber = NONE;
+                resetLastBarrier();
             }
         }
     }
 
     @VisibleForTesting
-    List<Buffer> getInflightBuffers(long checkpointId) throws CheckpointException {
+    List<Buffer> getInflightBuffers(long checkpointId) {
         synchronized (receivedBuffers) {
             return getInflightBuffersUnsafe(checkpointId);
         }
@@ -588,7 +1091,9 @@ public class RemoteInputChannel extends InputChannel {
             toPrioritize.buffer.setReaderIndex(0);
             toPrioritize =
                     new SequenceBuffer(
-                            EventSerializer.toBuffer(e, true), toPrioritize.sequenceNumber);
+                            EventSerializer.toBuffer(e, true),
+                            toPrioritize.sequenceNumber,
+                            toPrioritize.subpartitionId);
             firstPriorityEvent =
                     addPriorityBuffer(
                             toPrioritize); // note that only position of the element is changed
@@ -609,36 +1114,54 @@ public class RemoteInputChannel extends InputChannel {
      * Returns a list of buffers, checking the first n non-priority buffers, and skipping all
      * events.
      */
-    private List<Buffer> getInflightBuffersUnsafe(long checkpointId) throws CheckpointException {
+    private List<Buffer> getInflightBuffersUnsafe(long checkpointId) {
         assert Thread.holdsLock(receivedBuffers);
 
-        if (checkpointId < lastBarrierId) {
-            throw new CheckpointException(
-                    String.format(
-                            "Sequence number for checkpoint %d is not known (it was likely been overwritten by a newer checkpoint %d)",
-                            checkpointId, lastBarrierId),
-                    CheckpointFailureReason
-                            .CHECKPOINT_SUBSUMED); // currently, at most one active unaligned
-            // checkpoint is possible
-        }
+        checkState(checkpointId == lastBarrierId || lastBarrierId == NONE);
 
         final List<Buffer> inflightBuffers = new ArrayList<>();
         Iterator<SequenceBuffer> iterator = receivedBuffers.iterator();
         // skip all priority events (only buffers are stored anyways)
         Iterators.advance(iterator, receivedBuffers.getNumPriorityElements());
 
+        int finalBufferSubpartitionId = -1;
         while (iterator.hasNext()) {
             SequenceBuffer sequenceBuffer = iterator.next();
             if (sequenceBuffer.buffer.isBuffer()) {
                 if (shouldBeSpilled(sequenceBuffer.sequenceNumber)) {
                     inflightBuffers.add(sequenceBuffer.buffer.retainBuffer());
+                    finalBufferSubpartitionId = sequenceBuffer.subpartitionId;
                 } else {
                     break;
                 }
             }
         }
 
+        if (finalBufferSubpartitionId >= 0 && consumedSubpartitionIndexSet.size() > 1) {
+            MemorySegment memorySegment;
+            try {
+                memorySegment =
+                        MemorySegmentFactory.wrap(
+                                EventSerializer.toSerializedEvent(
+                                                new RecoveryMetadata(finalBufferSubpartitionId))
+                                        .array());
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            inflightBuffers.add(
+                    new NetworkBuffer(
+                            memorySegment,
+                            FreeingBufferRecycler.INSTANCE,
+                            RECOVERY_METADATA,
+                            memorySegment.size()));
+        }
+
         return inflightBuffers;
+    }
+
+    private void resetLastBarrier() {
+        lastBarrierId = NONE;
+        lastBarrierSequenceNumber = NONE;
     }
 
     /**
@@ -689,11 +1212,25 @@ public class RemoteInputChannel extends InputChannel {
     }
 
     public void onFailedPartitionRequest() {
-        inputGate.triggerPartitionStateCheck(partitionId);
+        inputGate.triggerPartitionStateCheck(partitionId, channelInfo);
     }
 
     public void onError(Throwable cause) {
         setError(cause);
+    }
+
+    /**
+     * Allows reads while recovery data or already queued network data is available before the
+     * remote partition request is fully initialized. If neither recovery nor queued data can
+     * satisfy the read, require the partition request client to be initialized.
+     */
+    private void checkReadability() throws IOException {
+        assert Thread.holdsLock(receivedBuffers);
+        if (!inRecovery && receivedBuffers.isEmpty()) {
+            checkPartitionRequestQueueInitialized();
+        } else {
+            checkError();
+        }
     }
 
     private void checkPartitionRequestQueueInitialized() throws IOException {
@@ -701,6 +1238,13 @@ public class RemoteInputChannel extends InputChannel {
         checkState(
                 partitionRequestClient != null,
                 "Bug: partitionRequestClient is not initialized before processing data and no error is detected.");
+    }
+
+    @Override
+    public void notifyRequiredSegmentId(int subpartitionId, int segmentId) throws IOException {
+        checkState(!isReleased.get(), "Channel released.");
+        checkPartitionRequestQueueInitialized();
+        partitionRequestClient.notifyRequiredSegmentId(this, subpartitionId, segmentId);
     }
 
     private static class BufferReorderingException extends IOException {
@@ -728,9 +1272,12 @@ public class RemoteInputChannel extends InputChannel {
         final Buffer buffer;
         final int sequenceNumber;
 
-        private SequenceBuffer(Buffer buffer, int sequenceNumber) {
+        final int subpartitionId;
+
+        private SequenceBuffer(Buffer buffer, int sequenceNumber, int subpartitionId) {
             this.buffer = buffer;
             this.sequenceNumber = sequenceNumber;
+            this.subpartitionId = subpartitionId;
         }
 
         @Override

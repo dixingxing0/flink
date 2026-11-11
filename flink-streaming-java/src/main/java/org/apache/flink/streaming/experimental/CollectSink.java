@@ -18,10 +18,10 @@
 package org.apache.flink.streaming.experimental;
 
 import org.apache.flink.annotation.Experimental;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
-import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.memory.DataOutputViewStreamWrapper;
-import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
+import org.apache.flink.streaming.api.functions.sink.legacy.RichSinkFunction;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -74,16 +74,21 @@ public class CollectSink<IN> extends RichSinkFunction<IN> {
     /**
      * Initialize the connection with the Socket in the server.
      *
-     * @param parameters Configuration.
+     * @param openContext the context.
      */
     @Override
-    public void open(Configuration parameters) throws Exception {
+    public void open(OpenContext openContext) throws Exception {
         try {
             client = new Socket(hostIp, port);
             outputStream = client.getOutputStream();
             streamWriter = new DataOutputViewStreamWrapper(outputStream);
         } catch (IOException e) {
-            throw new IOException("Cannot connect to the client to send back the stream", e);
+            throw new IOException(
+                    "Cannot get back the stream while opening connection to client at "
+                            + hostIp.toString()
+                            + ":"
+                            + port,
+                    e);
         }
     }
 

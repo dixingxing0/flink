@@ -18,8 +18,8 @@
 
 package org.apache.flink.runtime.jobmanager;
 
-import org.apache.flink.configuration.AkkaOptions;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.RpcOptions;
 import org.apache.flink.runtime.client.JobExecutionException;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.io.network.api.reader.RecordReader;
@@ -28,18 +28,23 @@ import org.apache.flink.runtime.io.network.api.writer.RecordWriterBuilder;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
 import org.apache.flink.runtime.jobgraph.DistributionPattern;
 import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobgraph.JobGraphBuilder;
 import org.apache.flink.runtime.jobgraph.JobVertex;
 import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
-import org.apache.flink.runtime.testingUtils.TestingUtils;
 import org.apache.flink.runtime.testutils.MiniClusterResource;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
+import org.apache.flink.testutils.TestingUtils;
 import org.apache.flink.types.IntValue;
 import org.apache.flink.util.TestLogger;
 
 import org.junit.ClassRule;
 import org.junit.Test;
 
+import java.util.Arrays;
 import java.util.BitSet;
+
+import static org.apache.flink.configuration.ConfigurationUtils.getIntConfigOption;
+import static org.apache.flink.runtime.util.JobVertexConnectionUtils.connectNewDataSetAsInput;
 
 /**
  * Tests that Flink can execute jobs with a higher parallelism than available number of slots. This
@@ -66,7 +71,7 @@ public class SlotCountExceedingParallelismTest extends TestLogger {
 
     private static Configuration getFlinkConfiguration() {
         final Configuration config = new Configuration();
-        config.setString(AkkaOptions.ASK_TIMEOUT, TestingUtils.DEFAULT_AKKA_ASK_TIMEOUT());
+        config.set(RpcOptions.ASK_TIMEOUT_DURATION, TestingUtils.DEFAULT_ASK_TIMEOUT);
 
         return config;
     }
@@ -106,18 +111,24 @@ public class SlotCountExceedingParallelismTest extends TestLogger {
         final JobVertex sender = new JobVertex("Sender");
         sender.setInvokableClass(RoundRobinSubtaskIndexSender.class);
         sender.getConfiguration()
-                .setInteger(RoundRobinSubtaskIndexSender.CONFIG_KEY, receiverParallelism);
+                .get(
+                        getIntConfigOption(RoundRobinSubtaskIndexSender.CONFIG_KEY),
+                        receiverParallelism);
         sender.setParallelism(senderParallelism);
 
         final JobVertex receiver = new JobVertex("Receiver");
         receiver.setInvokableClass(SubtaskIndexReceiver.class);
-        receiver.getConfiguration().setInteger(SubtaskIndexReceiver.CONFIG_KEY, senderParallelism);
+        receiver.getConfiguration()
+                .get(getIntConfigOption(SubtaskIndexReceiver.CONFIG_KEY), senderParallelism);
         receiver.setParallelism(receiverParallelism);
 
-        receiver.connectNewDataSetAsInput(
-                sender, DistributionPattern.ALL_TO_ALL, ResultPartitionType.BLOCKING);
+        connectNewDataSetAsInput(
+                receiver, sender, DistributionPattern.ALL_TO_ALL, ResultPartitionType.BLOCKING);
 
-        return new JobGraph(jobName, sender, receiver);
+        return JobGraphBuilder.newBatchJobGraphBuilder()
+                .setJobName(jobName)
+                .addJobVertices(Arrays.asList(sender, receiver))
+                .build();
     }
 
     /** Sends the subtask index a configurable number of times in a round-robin fashion. */
@@ -133,7 +144,8 @@ public class SlotCountExceedingParallelismTest extends TestLogger {
         public void invoke() throws Exception {
             RecordWriter<IntValue> writer =
                     new RecordWriterBuilder<IntValue>().build(getEnvironment().getWriter(0));
-            final int numberOfTimesToSend = getTaskConfiguration().getInteger(CONFIG_KEY, 0);
+            final int numberOfTimesToSend =
+                    getTaskConfiguration().get(getIntConfigOption(CONFIG_KEY), 0);
 
             final IntValue subtaskIndex =
                     new IntValue(getEnvironment().getTaskInfo().getIndexOfThisSubtask());
@@ -168,7 +180,7 @@ public class SlotCountExceedingParallelismTest extends TestLogger {
 
             try {
                 final int numberOfSubtaskIndexesToReceive =
-                        getTaskConfiguration().getInteger(CONFIG_KEY, 0);
+                        getTaskConfiguration().get(getIntConfigOption(CONFIG_KEY), 0);
                 final BitSet receivedSubtaskIndexes = new BitSet(numberOfSubtaskIndexesToReceive);
 
                 IntValue record;

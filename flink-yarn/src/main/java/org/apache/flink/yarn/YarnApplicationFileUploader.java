@@ -21,7 +21,9 @@ package org.apache.flink.yarn;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.client.deployment.ClusterDeploymentException;
 import org.apache.flink.configuration.ConfigConstants;
+import org.apache.flink.util.FileUtils;
 import org.apache.flink.util.IOUtils;
+import org.apache.flink.util.StringUtils;
 import org.apache.flink.util.function.FunctionUtils;
 import org.apache.flink.yarn.configuration.YarnConfigOptions;
 
@@ -43,10 +45,6 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URI;
-import java.nio.file.FileVisitResult;
-import java.nio.file.Files;
-import java.nio.file.SimpleFileVisitor;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -103,6 +101,11 @@ class YarnApplicationFileUploader implements AutoCloseable {
 
         this.localResources = new HashMap<>();
         this.applicationDir = getApplicationDir(applicationId);
+        checkArgument(
+                !isUsrLibDirIncludedInProvidedLib(providedLibDirs),
+                "Provided lib directories, configured via %s, should not include %s.",
+                YarnConfigOptions.PROVIDED_LIB_DIRS.key(),
+                ConfigConstants.DEFAULT_FLINK_USR_LIB_DIR);
         this.providedSharedLibs = getAllFilesInProvidedLibDirs(providedLibDirs);
 
         this.remotePaths = new ArrayList<>();
@@ -226,7 +229,7 @@ class YarnApplicationFileUploader implements AutoCloseable {
      * @param shipFiles local or remote files to register as Yarn local resources
      * @param localResourcesDirectory the directory the localResources are uploaded to
      * @param resourceType type of the resource, which can be one of FILE, PATTERN, or ARCHIVE
-     * @return list of class paths with the the proper resource keys from the registration
+     * @return list of class paths with the proper resource keys from the registration
      */
     List<String> registerMultipleLocalResources(
             final Collection<Path> shipFiles,
@@ -255,22 +258,17 @@ class YarnApplicationFileUploader implements AutoCloseable {
             } else {
                 final File file = new File(shipFile.toUri().getPath());
                 if (file.isDirectory()) {
-                    final java.nio.file.Path shipPath = file.toPath();
+                    final java.nio.file.Path shipPath = file.toPath().toRealPath();
                     final java.nio.file.Path parentPath = shipPath.getParent();
-                    Files.walkFileTree(
-                            shipPath,
-                            new SimpleFileVisitor<java.nio.file.Path>() {
-                                @Override
-                                public FileVisitResult visitFile(
-                                        java.nio.file.Path file, BasicFileAttributes attrs) {
-                                    localPaths.add(new Path(file.toUri()));
-                                    relativePaths.add(
-                                            new Path(
-                                                    localResourcesDirectory,
-                                                    parentPath.relativize(file).toString()));
-                                    return FileVisitResult.CONTINUE;
-                                }
-                            });
+                    Collection<java.nio.file.Path> paths =
+                            FileUtils.listFilesInDirectory(shipPath, path -> true);
+                    for (java.nio.file.Path javaPath : paths) {
+                        localPaths.add(new Path(javaPath.toUri()));
+                        relativePaths.add(
+                                new Path(
+                                        localResourcesDirectory,
+                                        parentPath.relativize(javaPath).toString()));
+                    }
                     continue;
                 }
             }
@@ -347,6 +345,8 @@ class YarnApplicationFileUploader implements AutoCloseable {
         checkNotNull(localResources);
 
         final ArrayList<String> classPaths = new ArrayList<>();
+        final Set<String> resourcesJar = new HashSet<>();
+        final Set<String> resourcesDir = new HashSet<>();
         providedSharedLibs.forEach(
                 (fileName, fileStatus) -> {
                     final Path filePath = fileStatus.getPath();
@@ -363,11 +363,21 @@ class YarnApplicationFileUploader implements AutoCloseable {
                     envShipResourceList.add(descriptor);
 
                     if (!isFlinkDistJar(filePath.getName()) && !isPlugin(filePath)) {
-                        classPaths.add(fileName);
+                        if (fileName.endsWith("jar")) {
+                            resourcesJar.add(fileName);
+                        } else {
+                            resourcesDir.add(new Path(fileName).getParent().toString());
+                        }
                     } else if (isFlinkDistJar(filePath.getName())) {
                         flinkDist = descriptor;
                     }
                 });
+
+        // Construct classpath where resource directories go first followed
+        // by resource files. Sort both resources and resource directories in
+        // order to make classpath deterministic.
+        resourcesDir.stream().sorted().forEach(classPaths::add);
+        resourcesJar.stream().sorted().forEach(classPaths::add);
         return classPaths;
     }
 
@@ -391,13 +401,20 @@ class YarnApplicationFileUploader implements AutoCloseable {
                 (relativeDstPath.isEmpty() ? "" : relativeDstPath + "/") + localSrcPath.getName();
         final Path dst = new Path(applicationDir, suffix);
 
+        final Path localSrcPathWithScheme;
+        if (StringUtils.isNullOrWhitespaceOnly(localSrcPath.toUri().getScheme())) {
+            localSrcPathWithScheme = new Path(URI.create("file:///").resolve(localSrcPath.toUri()));
+        } else {
+            localSrcPathWithScheme = localSrcPath;
+        }
+
         LOG.debug(
                 "Copying from {} to {} with replication factor {}",
-                localSrcPath,
+                localSrcPathWithScheme,
                 dst,
                 replicationFactor);
 
-        fileSystem.copyFromLocalFile(false, true, localSrcPath, dst);
+        fileSystem.copyFromLocalFile(false, true, localSrcPathWithScheme, dst);
         fileSystem.setReplication(dst, (short) replicationFactor);
         return dst;
     }
@@ -512,6 +529,16 @@ class YarnApplicationFileUploader implements AutoCloseable {
                                     }
                                 }));
         return Collections.unmodifiableMap(allFiles);
+    }
+
+    private boolean isUsrLibDirIncludedInProvidedLib(final List<Path> providedLibDirs)
+            throws IOException {
+        for (Path path : providedLibDirs) {
+            if (Utils.isUsrLibDirectory(fileSystem, path)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void addToRemotePaths(boolean add, Path path) {

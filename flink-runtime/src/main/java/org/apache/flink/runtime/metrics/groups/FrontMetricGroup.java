@@ -18,8 +18,14 @@
 
 package org.apache.flink.runtime.metrics.groups;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.metrics.CharacterFilter;
+import org.apache.flink.metrics.LogicalScopeProvider;
+import org.apache.flink.metrics.MetricGroup;
 
+import org.apache.commons.collections.map.CompositeMap;
+
+import java.util.Collections;
 import java.util.Map;
 
 /**
@@ -31,11 +37,15 @@ import java.util.Map;
  *
  * @param <P> parentMetricGroup to {@link AbstractMetricGroup AbstractMetricGroup}
  */
-public class FrontMetricGroup<P extends AbstractMetricGroup<?>> extends ProxyMetricGroup<P> {
+public class FrontMetricGroup<P extends AbstractMetricGroup<?>> extends ProxyMetricGroup<P>
+        implements LogicalScopeProvider {
 
-    private final ReporterScopedSettings settings;
+    @VisibleForTesting static final char DEFAULT_REPLACEMENT = '_';
+    @VisibleForTesting static final char DEFAULT_REPLACEMENT_ALTERNATIVE = '-';
 
-    public FrontMetricGroup(ReporterScopedSettings settings, P reference) {
+    private final ReporterScopedSettings<?> settings;
+
+    public FrontMetricGroup(ReporterScopedSettings<?> settings, P reference) {
         super(reference);
         this.settings = settings;
     }
@@ -43,27 +53,68 @@ public class FrontMetricGroup<P extends AbstractMetricGroup<?>> extends ProxyMet
     @Override
     public String getMetricIdentifier(String metricName) {
         return parentMetricGroup.getMetricIdentifier(
-                metricName, null, this.settings.getReporterIndex(), this.settings.getDelimiter());
+                metricName,
+                getDelimiterFilter(this.settings, CharacterFilter.NO_OP_FILTER),
+                this.settings.getReporterIndex(),
+                this.settings.getDelimiter());
     }
 
     @Override
     public String getMetricIdentifier(String metricName, CharacterFilter filter) {
         return parentMetricGroup.getMetricIdentifier(
-                metricName, filter, this.settings.getReporterIndex(), this.settings.getDelimiter());
+                metricName,
+                getDelimiterFilter(this.settings, filter),
+                this.settings.getReporterIndex(),
+                this.settings.getDelimiter());
+    }
+
+    @Override
+    public MetricGroup getWrappedMetricGroup() {
+        return parentMetricGroup;
     }
 
     @Override
     public Map<String, String> getAllVariables() {
-        return parentMetricGroup.getAllVariables(
-                this.settings.getReporterIndex(), this.settings.getExcludedVariables());
+        Map<String, String> allVariables =
+                parentMetricGroup.getAllVariables(
+                        this.settings.getReporterIndex(), this.settings.getExcludedVariables());
+
+        if (!this.settings.getAdditionalVariables().isEmpty()) {
+            allVariables = new CompositeMap(allVariables, this.settings.getAdditionalVariables());
+        }
+
+        return Collections.unmodifiableMap(allVariables);
     }
 
+    @Override
     public String getLogicalScope(CharacterFilter filter) {
-        return parentMetricGroup.getLogicalScope(filter, this.settings.getDelimiter());
+        return parentMetricGroup.getLogicalScope(
+                getDelimiterFilter(this.settings, filter), this.settings.getDelimiter());
     }
 
+    @Override
     public String getLogicalScope(CharacterFilter filter, char delimiter) {
         return parentMetricGroup.getLogicalScope(
-                filter, delimiter, this.settings.getReporterIndex());
+                getDelimiterFilter(this.settings, filter),
+                delimiter,
+                this.settings.getReporterIndex());
+    }
+
+    private static CharacterFilter getDelimiterFilter(
+            ReporterScopedSettings<?> reporterScopedSettings,
+            CharacterFilter generalCharacterFilter) {
+
+        if (reporterScopedSettings.getDelimiter() != DEFAULT_REPLACEMENT) {
+            return input ->
+                    generalCharacterFilter.filterCharacters(
+                            input.replace(
+                                    reporterScopedSettings.getDelimiter(), DEFAULT_REPLACEMENT));
+        } else {
+            return input ->
+                    generalCharacterFilter.filterCharacters(
+                            input.replace(
+                                    reporterScopedSettings.getDelimiter(),
+                                    DEFAULT_REPLACEMENT_ALTERNATIVE));
+        }
     }
 }

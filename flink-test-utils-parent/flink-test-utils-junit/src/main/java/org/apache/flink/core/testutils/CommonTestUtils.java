@@ -19,6 +19,8 @@
 package org.apache.flink.core.testutils;
 
 import org.junit.Assert;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedWriter;
 import java.io.ByteArrayInputStream;
@@ -41,6 +43,8 @@ import static org.hamcrest.MatcherAssert.assertThat;
 
 /** This class contains reusable utility methods for unit tests. */
 public class CommonTestUtils {
+
+    private static final Logger LOG = LoggerFactory.getLogger(CommonTestUtils.class);
 
     /**
      * Creates a copy of an object via Java Serialization.
@@ -190,24 +194,72 @@ public class CommonTestUtils {
      *
      * @param condition the condition to wait for.
      * @param timeout the maximum time to wait for the condition to become true.
+     * @param pause delay between condition checks.
      * @param errorMsg the error message to include in the <code>TimeoutException</code> if the
      *     condition was not met before timeout.
      * @throws TimeoutException if the condition is not met before timeout.
      * @throws InterruptedException if the thread is interrupted.
      */
     @SuppressWarnings("BusyWait")
-    public static void waitUtil(Supplier<Boolean> condition, Duration timeout, String errorMsg)
+    public static void waitUtil(
+            Supplier<Boolean> condition, Duration timeout, Duration pause, String errorMsg)
             throws TimeoutException, InterruptedException {
         long timeoutMs = timeout.toMillis();
         if (timeoutMs <= 0) {
             throw new IllegalArgumentException("The timeout must be positive.");
         }
         long startingTime = System.currentTimeMillis();
-        while (!condition.get() && System.currentTimeMillis() - startingTime < timeoutMs) {
-            Thread.sleep(1);
+        boolean conditionResult = condition.get();
+        while (!conditionResult && System.currentTimeMillis() - startingTime < timeoutMs) {
+            conditionResult = condition.get();
+            Thread.sleep(pause.toMillis());
         }
-        if (!condition.get()) {
+        if (!conditionResult) {
             throw new TimeoutException(errorMsg);
         }
+    }
+
+    /**
+     * Wait until the given condition is met or timeout, ignoring any exceptions thrown by the
+     * condition.
+     *
+     * @param condition the condition to wait for.
+     * @param timeout the maximum time to wait for the condition to become true.
+     * @param pause delay between condition checks.
+     * @param errorMsg the error message to include in the <code>TimeoutException</code> if the
+     *     condition was not met before timeout.
+     * @throws TimeoutException if the condition is not met before timeout.
+     * @throws InterruptedException if the thread is interrupted.
+     */
+    @SuppressWarnings("BusyWait")
+    public static void waitUntilIgnoringExceptions(
+            Supplier<Boolean> condition, Duration timeout, Duration pause, String errorMsg)
+            throws TimeoutException, InterruptedException {
+        Supplier<Boolean> safeCondition =
+                () -> {
+                    try {
+                        return condition.get();
+                    } catch (Exception ignored) {
+                        LOG.warn("Exception thrown while evaluating condition", ignored);
+                        return false;
+                    }
+                };
+
+        waitUtil(safeCondition, timeout, pause, errorMsg);
+    }
+
+    /**
+     * Wait util the given condition is met or timeout.
+     *
+     * @param condition the condition to wait for.
+     * @param timeout the maximum time to wait for the condition to become true.
+     * @param errorMsg the error message to include in the <code>TimeoutException</code> if the
+     *     condition was not met before timeout.
+     * @throws TimeoutException if the condition is not met before timeout.
+     * @throws InterruptedException if the thread is interrupted.
+     */
+    public static void waitUtil(Supplier<Boolean> condition, Duration timeout, String errorMsg)
+            throws TimeoutException, InterruptedException {
+        waitUtil(condition, timeout, Duration.ofMillis(1), errorMsg);
     }
 }

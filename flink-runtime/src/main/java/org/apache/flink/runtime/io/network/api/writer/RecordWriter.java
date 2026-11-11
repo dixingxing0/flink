@@ -19,10 +19,13 @@
 package org.apache.flink.runtime.io.network.api.writer;
 
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.configuration.ExecutionOptions;
 import org.apache.flink.core.io.IOReadableWritable;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.runtime.checkpoint.CheckpointException;
 import org.apache.flink.runtime.event.AbstractEvent;
 import org.apache.flink.runtime.io.AvailabilityProvider;
+import org.apache.flink.runtime.io.network.partition.ResultPartition;
 import org.apache.flink.runtime.metrics.groups.TaskIOMetricGroup;
 import org.apache.flink.util.XORShiftRandom;
 
@@ -41,8 +44,8 @@ import static org.apache.flink.util.Preconditions.checkArgument;
 /**
  * An abstract record-oriented runtime result writer.
  *
- * <p>The RecordWriter wraps the runtime's {@link ResultPartitionWriter} and takes care of channel
- * selection and serializing records into bytes.
+ * <p>The RecordWriter wraps the runtime's {@link ResultPartitionWriter} and takes care of
+ * subpartition selection and serializing records into bytes.
  *
  * @param <T> the type of the record that can be emitted with this record writer
  */
@@ -56,7 +59,7 @@ public abstract class RecordWriter<T extends IOReadableWritable> implements Avai
 
     protected final ResultPartitionWriter targetPartition;
 
-    protected final int numberOfChannels;
+    protected final int numberOfSubpartitions;
 
     protected final DataOutputSerializer serializer;
 
@@ -79,13 +82,14 @@ public abstract class RecordWriter<T extends IOReadableWritable> implements Avai
 
     RecordWriter(ResultPartitionWriter writer, long timeout, String taskName) {
         this.targetPartition = writer;
-        this.numberOfChannels = writer.getNumberOfSubpartitions();
+        this.numberOfSubpartitions = writer.getNumberOfSubpartitions();
 
         this.serializer = new DataOutputSerializer(128);
 
-        checkArgument(timeout >= -1);
-        this.flushAlways = (timeout == 0);
-        if (timeout == -1 || timeout == 0) {
+        checkArgument(timeout >= ExecutionOptions.DISABLED_NETWORK_BUFFER_TIMEOUT);
+        this.flushAlways = (timeout == ExecutionOptions.FLUSH_AFTER_EVERY_RECORD);
+        if (timeout == ExecutionOptions.DISABLED_NETWORK_BUFFER_TIMEOUT
+                || timeout == ExecutionOptions.FLUSH_AFTER_EVERY_RECORD) {
             outputFlusher = null;
         } else {
             String threadName =
@@ -98,10 +102,20 @@ public abstract class RecordWriter<T extends IOReadableWritable> implements Avai
         }
     }
 
-    protected void emit(T record, int targetSubpartition) throws IOException {
+    public void emit(T record, int targetSubpartition) throws IOException {
         checkErroneous();
 
         targetPartition.emitRecord(serializeRecord(serializer, record), targetSubpartition);
+
+        if (flushAlways) {
+            targetPartition.flush(targetSubpartition);
+        }
+    }
+
+    protected void emit(ByteBuffer record, int targetSubpartition) throws IOException {
+        checkErroneous();
+
+        targetPartition.emitRecord(record, targetSubpartition);
 
         if (flushAlways) {
             targetPartition.flush(targetSubpartition);
@@ -118,6 +132,14 @@ public abstract class RecordWriter<T extends IOReadableWritable> implements Avai
         if (flushAlways) {
             flushAll();
         }
+    }
+
+    public void alignedBarrierTimeout(long checkpointId) throws IOException {
+        targetPartition.alignedBarrierTimeout(checkpointId);
+    }
+
+    public void abortCheckpoint(long checkpointId, CheckpointException cause) {
+        targetPartition.abortCheckpoint(checkpointId, cause);
     }
 
     @VisibleForTesting
@@ -144,6 +166,21 @@ public abstract class RecordWriter<T extends IOReadableWritable> implements Avai
         targetPartition.setMetricGroup(metrics);
     }
 
+    public int getNumberOfSubpartitions() {
+        return numberOfSubpartitions;
+    }
+
+    /**
+     * Whether the subpartition where an element comes from can be derived from the existing
+     * information. If false, the caller of this writer should attach the subpartition information
+     * onto an element before writing it to a subpartition, if the element needs this information
+     * afterward.
+     */
+    public boolean isSubpartitionDerivable() {
+        return !(targetPartition instanceof ResultPartition
+                && ((ResultPartition) targetPartition).isNumberOfPartitionConsumerUndefined());
+    }
+
     @Override
     public CompletableFuture<?> getAvailableFuture() {
         return targetPartition.getAvailableFuture();
@@ -152,11 +189,11 @@ public abstract class RecordWriter<T extends IOReadableWritable> implements Avai
     /** This is used to send regular records. */
     public abstract void emit(T record) throws IOException;
 
-    /** This is used to send LatencyMarks to a random target channel. */
+    /** This is used to send LatencyMarks to a random target subpartition. */
     public void randomEmit(T record) throws IOException {
         checkErroneous();
 
-        int targetSubpartition = rng.nextInt(numberOfChannels);
+        int targetSubpartition = rng.nextInt(numberOfSubpartitions);
         emit(record, targetSubpartition);
     }
 
@@ -204,6 +241,11 @@ public abstract class RecordWriter<T extends IOReadableWritable> implements Avai
                 >= VOLATILE_FLUSHER_EXCEPTION_MAX_CHECK_SKIP_COUNT) {
             volatileFlusherExceptionCheckSkipCount = 0;
         }
+    }
+
+    /** Sets the max overdraft buffer size of per gate. */
+    public void setMaxOverdraftBuffersPerGate(int maxOverdraftBuffersPerGate) {
+        targetPartition.setMaxOverdraftBuffersPerGate(maxOverdraftBuffersPerGate);
     }
 
     // ------------------------------------------------------------------------

@@ -19,6 +19,7 @@
 package org.apache.flink.runtime.operators.testutils;
 
 import org.apache.flink.api.common.ExecutionConfig;
+import org.apache.flink.api.common.functions.DefaultOpenContext;
 import org.apache.flink.api.common.functions.Function;
 import org.apache.flink.api.common.functions.util.FunctionUtils;
 import org.apache.flink.api.common.typeutils.TypeComparator;
@@ -26,12 +27,12 @@ import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.TypeSerializerFactory;
 import org.apache.flink.api.java.typeutils.runtime.RuntimeSerializerFactory;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.metrics.groups.OperatorMetricGroup;
 import org.apache.flink.runtime.io.disk.iomanager.IOManager;
 import org.apache.flink.runtime.io.disk.iomanager.IOManagerAsync;
 import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
 import org.apache.flink.runtime.memory.MemoryManager;
 import org.apache.flink.runtime.memory.MemoryManagerBuilder;
-import org.apache.flink.runtime.metrics.groups.OperatorMetricGroup;
 import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
 import org.apache.flink.runtime.operators.Driver;
 import org.apache.flink.runtime.operators.ResettableDriver;
@@ -41,14 +42,13 @@ import org.apache.flink.runtime.operators.sort.Sorter;
 import org.apache.flink.runtime.operators.util.TaskConfig;
 import org.apache.flink.runtime.taskmanager.TaskManagerRuntimeInfo;
 import org.apache.flink.runtime.util.TestingTaskManagerRuntimeInfo;
+import org.apache.flink.testutils.junit.extensions.parameterized.ParameterizedTestExtension;
+import org.apache.flink.testutils.junit.extensions.parameterized.Parameters;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.MutableObjectIterator;
-import org.apache.flink.util.TestLogger;
 
-import org.junit.After;
-import org.junit.Assert;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.extension.ExtendWith;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -56,8 +56,10 @@ import java.util.Collection;
 import java.util.LinkedList;
 import java.util.List;
 
-@RunWith(Parameterized.class)
-public abstract class BinaryOperatorTestBase<S extends Function, IN, OUT> extends TestLogger
+import static org.assertj.core.api.Assertions.assertThat;
+
+@ExtendWith(ParameterizedTestExtension.class)
+public abstract class BinaryOperatorTestBase<S extends Function, IN, OUT>
         implements TaskContext<S, OUT> {
 
     protected static final int PAGE_SIZE = 32 * 1024;
@@ -122,8 +124,8 @@ public abstract class BinaryOperatorTestBase<S extends Function, IN, OUT> extend
         this.taskManageInfo = new TestingTaskManagerRuntimeInfo();
     }
 
-    @Parameterized.Parameters
-    public static Collection<Object[]> getConfigurations() throws IOException {
+    @Parameters
+    private static Collection<Object[]> getConfigurations() throws IOException {
         LinkedList<Object[]> configs = new LinkedList<>();
 
         ExecutionConfig withReuse = new ExecutionConfig();
@@ -140,13 +142,13 @@ public abstract class BinaryOperatorTestBase<S extends Function, IN, OUT> extend
         return configs;
     }
 
-    public void addInput(MutableObjectIterator<IN> input, TypeSerializer<IN> serializer) {
+    protected void addInput(MutableObjectIterator<IN> input, TypeSerializer<IN> serializer) {
         this.inputs.add(input);
         this.sorters.add(null);
         this.inputSerializers.add(serializer);
     }
 
-    public void addInputSorted(
+    protected void addInputSorted(
             MutableObjectIterator<IN> input, TypeSerializer<IN> serializer, TypeComparator<IN> comp)
             throws Exception {
         this.inputSerializers.add(serializer);
@@ -162,33 +164,33 @@ public abstract class BinaryOperatorTestBase<S extends Function, IN, OUT> extend
         this.inputs.add(null);
     }
 
-    public void addDriverComparator(TypeComparator<IN> comparator) {
+    protected void addDriverComparator(TypeComparator<IN> comparator) {
         this.comparators.add(comparator);
     }
 
-    public void setOutput(Collector<OUT> output) {
+    protected void setOutput(Collector<OUT> output) {
         this.output = output;
     }
 
-    public void setOutput(List<OUT> output, TypeSerializer<OUT> outSerializer) {
+    protected void setOutput(List<OUT> output, TypeSerializer<OUT> outSerializer) {
         this.output = new ListOutputCollector<>(output, outSerializer);
     }
 
-    public int getNumFileHandlesForSort() {
+    protected int getNumFileHandlesForSort() {
         return numFileHandles;
     }
 
-    public void setNumFileHandlesForSort(int numFileHandles) {
+    protected void setNumFileHandlesForSort(int numFileHandles) {
         this.numFileHandles = numFileHandles;
     }
 
     @SuppressWarnings("rawtypes")
-    public void testDriver(Driver driver, Class stubClass) throws Exception {
+    protected void testDriver(Driver driver, Class stubClass) throws Exception {
         testDriverInternal(driver, stubClass);
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    public void testDriverInternal(Driver driver, Class stubClass) throws Exception {
+    protected void testDriverInternal(Driver driver, Class stubClass) throws Exception {
 
         this.driver = driver;
         driver.setup(this);
@@ -209,7 +211,7 @@ public abstract class BinaryOperatorTestBase<S extends Function, IN, OUT> extend
 
             // open stub implementation
             try {
-                FunctionUtils.openFunction(this.stub, getTaskConfig().getStubParameters());
+                FunctionUtils.openFunction(this.stub, DefaultOpenContext.INSTANCE);
                 stubOpen = true;
             } catch (Throwable t) {
                 throw new Exception(
@@ -265,7 +267,7 @@ public abstract class BinaryOperatorTestBase<S extends Function, IN, OUT> extend
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    public void testResettableDriver(ResettableDriver driver, Class stubClass, int iterations)
+    protected void testResettableDriver(ResettableDriver driver, Class stubClass, int iterations)
             throws Exception {
         driver.setup(this);
 
@@ -283,11 +285,11 @@ public abstract class BinaryOperatorTestBase<S extends Function, IN, OUT> extend
         driver.teardown();
     }
 
-    public void cancel() throws Exception {
+    protected void cancel() throws Exception {
         this.running = false;
 
         // compensate for races, where cancel is called before the driver is set
-        // not that this is an artifact of a bad design of this test base, where the setup
+        // note that this is an artifact of a bad design of this test base, where the setup
         // of the basic properties is not separated from the invocation of the execution logic
         while (this.driver == null) {
             Thread.sleep(200);
@@ -388,8 +390,8 @@ public abstract class BinaryOperatorTestBase<S extends Function, IN, OUT> extend
 
     // --------------------------------------------------------------------------------------------
 
-    @After
-    public void shutdownAll() throws Exception {
+    @AfterEach
+    void shutdownAll() throws Exception {
         // 1st, shutdown sorters
         for (Sorter<?> sorter : this.sorters) {
             if (sorter != null) {
@@ -404,9 +406,9 @@ public abstract class BinaryOperatorTestBase<S extends Function, IN, OUT> extend
         // last, verify all memory is returned and shutdown mem manager
         MemoryManager memMan = getMemoryManager();
         if (memMan != null) {
-            Assert.assertTrue(
-                    "Memory Manager managed memory was not completely freed.",
-                    memMan.verifyEmpty());
+            assertThat(memMan.verifyEmpty())
+                    .withFailMessage("Memory Manager managed memory was not completely freed.")
+                    .isTrue();
             memMan.shutdown();
         }
     }

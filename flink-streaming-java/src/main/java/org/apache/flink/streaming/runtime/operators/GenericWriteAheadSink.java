@@ -25,8 +25,8 @@ import org.apache.flink.core.fs.FSDataInputStream;
 import org.apache.flink.core.memory.DataInputViewStreamWrapper;
 import org.apache.flink.core.memory.DataOutputViewStreamWrapper;
 import org.apache.flink.runtime.io.disk.InputViewIterator;
+import org.apache.flink.runtime.state.CheckpointStateOutputStream;
 import org.apache.flink.runtime.state.CheckpointStorageWorkerView;
-import org.apache.flink.runtime.state.CheckpointStreamFactory;
 import org.apache.flink.runtime.state.JavaSerializer;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
@@ -42,6 +42,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.Set;
 import java.util.TreeSet;
@@ -69,7 +70,7 @@ public abstract class GenericWriteAheadSink<IN> extends AbstractStreamOperator<I
     private final CheckpointCommitter committer;
     protected final TypeSerializer<IN> serializer;
 
-    private transient CheckpointStreamFactory.CheckpointStateOutputStream out;
+    private transient CheckpointStateOutputStream out;
     private transient CheckpointStorageWorkerView checkpointStorage;
 
     private transient ListState<PendingCheckpoint> checkpointedState;
@@ -105,7 +106,7 @@ public abstract class GenericWriteAheadSink<IN> extends AbstractStreamOperator<I
                                 new ListStateDescriptor<>(
                                         "pending-checkpoints", new JavaSerializer<>()));
 
-        int subtaskIdx = getRuntimeContext().getIndexOfThisSubtask();
+        int subtaskIdx = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
         if (context.isRestored()) {
             LOG.info("Restoring state for the GenericWriteAheadSink (taskIdx={}).", subtaskIdx);
 
@@ -137,6 +138,7 @@ public abstract class GenericWriteAheadSink<IN> extends AbstractStreamOperator<I
 
     public void close() throws Exception {
         committer.close();
+        super.close();
     }
 
     /**
@@ -150,7 +152,7 @@ public abstract class GenericWriteAheadSink<IN> extends AbstractStreamOperator<I
 
         // only add handle if a new OperatorState was created since the last snapshot
         if (out != null) {
-            int subtaskIdx = getRuntimeContext().getIndexOfThisSubtask();
+            int subtaskIdx = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
             StreamStateHandle handle = out.closeAndGetHandle();
 
             PendingCheckpoint pendingCheckpoint =
@@ -178,13 +180,9 @@ public abstract class GenericWriteAheadSink<IN> extends AbstractStreamOperator<I
 
         saveHandleInState(context.getCheckpointId(), context.getCheckpointTimestamp());
 
-        this.checkpointedState.clear();
-
         try {
-            for (PendingCheckpoint pendingCheckpoint : pendingCheckpoints) {
-                // create a new partition for each entry.
-                this.checkpointedState.add(pendingCheckpoint);
-            }
+            // create a new partition for each entry.
+            this.checkpointedState.update(new ArrayList<>(pendingCheckpoints));
         } catch (Exception e) {
             checkpointedState.clear();
 
@@ -196,7 +194,7 @@ public abstract class GenericWriteAheadSink<IN> extends AbstractStreamOperator<I
                     e);
         }
 
-        int subtaskIdx = getRuntimeContext().getIndexOfThisSubtask();
+        int subtaskIdx = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
         if (LOG.isDebugEnabled()) {
             LOG.debug(
                     "{} (taskIdx= {}) checkpointed {}.",

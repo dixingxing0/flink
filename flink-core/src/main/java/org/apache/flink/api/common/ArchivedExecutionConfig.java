@@ -32,23 +32,22 @@ import java.util.Map;
 @Internal
 public class ArchivedExecutionConfig implements Serializable {
 
-    private static final long serialVersionUID = 2126156250920316528L;
-
-    private final String executionMode;
+    private static final long serialVersionUID = 2907040336948181163L;
     private final String restartStrategyDescription;
     private final int parallelism;
+    private final int maxParallelism;
     private final boolean objectReuseEnabled;
+    private final long periodicMaterializeIntervalMillis;
     private final Map<String, String> globalJobParameters;
 
     public ArchivedExecutionConfig(ExecutionConfig ec) {
-        executionMode = ec.getExecutionMode().name();
-        if (ec.getRestartStrategy() != null) {
-            restartStrategyDescription = ec.getRestartStrategy().getDescription();
-        } else {
-            restartStrategyDescription = "default";
-        }
+        restartStrategyDescription =
+                RestartStrategyDescriptionUtils.getRestartStrategyDescription(ec.toConfiguration());
+
+        maxParallelism = ec.getMaxParallelism();
         parallelism = ec.getParallelism();
         objectReuseEnabled = ec.isObjectReuseEnabled();
+        periodicMaterializeIntervalMillis = ec.getPeriodicMaterializeIntervalMillis();
         if (ec.getGlobalJobParameters() != null && ec.getGlobalJobParameters().toMap() != null) {
             globalJobParameters = ec.getGlobalJobParameters().toMap();
         } else {
@@ -57,24 +56,26 @@ public class ArchivedExecutionConfig implements Serializable {
     }
 
     public ArchivedExecutionConfig(
-            String executionMode,
             String restartStrategyDescription,
+            int maxParallelism,
             int parallelism,
             boolean objectReuseEnabled,
+            long periodicMaterializeIntervalMillis,
             Map<String, String> globalJobParameters) {
-        this.executionMode = executionMode;
         this.restartStrategyDescription = restartStrategyDescription;
+        this.maxParallelism = maxParallelism;
         this.parallelism = parallelism;
         this.objectReuseEnabled = objectReuseEnabled;
+        this.periodicMaterializeIntervalMillis = periodicMaterializeIntervalMillis;
         this.globalJobParameters = globalJobParameters;
-    }
-
-    public String getExecutionMode() {
-        return executionMode;
     }
 
     public String getRestartStrategyDescription() {
         return restartStrategyDescription;
+    }
+
+    public int getMaxParallelism() {
+        return maxParallelism;
     }
 
     public int getParallelism() {
@@ -83,6 +84,10 @@ public class ArchivedExecutionConfig implements Serializable {
 
     public boolean getObjectReuseEnabled() {
         return objectReuseEnabled;
+    }
+
+    public long getPeriodicMaterializeIntervalMillis() {
+        return periodicMaterializeIntervalMillis;
     }
 
     public Map<String, String> getGlobalJobParameters() {

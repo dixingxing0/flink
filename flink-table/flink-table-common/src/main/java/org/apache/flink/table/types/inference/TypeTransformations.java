@@ -20,9 +20,9 @@ package org.apache.flink.table.types.inference;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.types.DataType;
-import org.apache.flink.table.types.inference.transforms.DataTypeConversionClassTransformation;
-import org.apache.flink.table.types.inference.transforms.LegacyDecimalTypeTransformation;
+import org.apache.flink.table.types.inference.transforms.ConversionClassTransformation;
 import org.apache.flink.table.types.inference.transforms.LegacyRawTypeTransformation;
+import org.apache.flink.table.types.inference.transforms.LegacyToNonLegacyTransformation;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
 
 import java.sql.Date;
@@ -55,14 +55,7 @@ public final class TypeTransformations {
         conversions.put(LogicalTypeRoot.TIMESTAMP_WITHOUT_TIME_ZONE, Timestamp.class);
         conversions.put(LogicalTypeRoot.TIME_WITHOUT_TIME_ZONE, Time.class);
         conversions.put(LogicalTypeRoot.DATE, Date.class);
-        return new DataTypeConversionClassTransformation(conversions);
-    }
-
-    /**
-     * Returns a type transformation that transforms legacy decimal data type to DECIMAL(38, 18).
-     */
-    public static TypeTransformation legacyDecimalToDefaultDecimal() {
-        return LegacyDecimalTypeTransformation.INSTANCE;
+        return new ConversionClassTransformation(conversions);
     }
 
     /**
@@ -71,6 +64,11 @@ public final class TypeTransformations {
      */
     public static TypeTransformation legacyRawToTypeInfoRaw() {
         return LegacyRawTypeTransformation.INSTANCE;
+    }
+
+    /** Returns a type transformation that transforms LEGACY(...) type to a non-legacy type. */
+    public static TypeTransformation legacyToNonLegacy() {
+        return LegacyToNonLegacyTransformation.INSTANCE;
     }
 
     /**

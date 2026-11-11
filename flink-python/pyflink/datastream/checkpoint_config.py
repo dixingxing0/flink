@@ -15,43 +15,19 @@
 #  See the License for the specific language governing permissions and
 # limitations under the License.
 ################################################################################
-from enum import Enum
 from typing import Optional
 
+from pyflink.common import Duration
+from pyflink.datastream.externalized_checkpoint_retention import ExternalizedCheckpointRetention
 from pyflink.datastream.checkpointing_mode import CheckpointingMode
-from pyflink.java_gateway import get_gateway
 
-__all__ = ['CheckpointConfig', 'ExternalizedCheckpointCleanup']
+__all__ = ['CheckpointConfig']
 
 
 class CheckpointConfig(object):
     """
     Configuration that captures all checkpointing related settings.
-
-    :data:`DEFAULT_MODE`:
-
-    The default checkpoint mode: exactly once.
-
-    :data:`DEFAULT_TIMEOUT`:
-
-    The default timeout of a checkpoint attempt: 10 minutes.
-
-    :data:`DEFAULT_MIN_PAUSE_BETWEEN_CHECKPOINTS`:
-
-    The default minimum pause to be made between checkpoints: none.
-
-    :data:`DEFAULT_MAX_CONCURRENT_CHECKPOINTS`:
-
-    The default limit of concurrently happening checkpoints: one.
     """
-
-    DEFAULT_MODE = CheckpointingMode.EXACTLY_ONCE
-
-    DEFAULT_TIMEOUT = 10 * 60 * 1000
-
-    DEFAULT_MIN_PAUSE_BETWEEN_CHECKPOINTS = 0
-
-    DEFAULT_MAX_CONCURRENT_CHECKPOINTS = 1
 
     def __init__(self, j_checkpoint_config):
         self._j_checkpoint_config = j_checkpoint_config
@@ -73,7 +49,7 @@ class CheckpointConfig(object):
         :return: The :class:`CheckpointingMode`.
         """
         return CheckpointingMode._from_j_checkpointing_mode(
-            self._j_checkpoint_config.getCheckpointingMode())
+            self._j_checkpoint_config.getCheckpointingConsistencyMode())
 
     def set_checkpointing_mode(self, checkpointing_mode: CheckpointingMode) -> 'CheckpointConfig':
         """
@@ -87,7 +63,7 @@ class CheckpointConfig(object):
 
         :param checkpointing_mode: The :class:`CheckpointingMode`.
         """
-        self._j_checkpoint_config.setCheckpointingMode(
+        self._j_checkpoint_config.setCheckpointingConsistencyMode(
             CheckpointingMode._to_j_checkpointing_mode(checkpointing_mode))
         return self
 
@@ -190,8 +166,10 @@ class CheckpointConfig(object):
         decline the failed checkpoint.
 
         :return: ``True`` if failing on checkpointing errors, false otherwise.
+
+        .. note:: Deprecated in 2.0. Use :func:`get_tolerable_checkpoint_failure_number` instead.
         """
-        return self._j_checkpoint_config.isFailOnCheckpointingErrors()
+        return self.get_tolerable_checkpoint_failure_number() == 0
 
     def set_fail_on_checkpointing_errors(self,
                                          fail_on_checkpointing_errors: bool) -> 'CheckpointConfig':
@@ -208,24 +186,60 @@ class CheckpointConfig(object):
 
         :param fail_on_checkpointing_errors: ``True`` if failing on checkpointing errors,
                                              false otherwise.
+
+        .. note:: Deprecated in 2.0. Use :func:`set_tolerable_checkpoint_failure_number` instead.
         """
-        self._j_checkpoint_config.setFailOnCheckpointingErrors(fail_on_checkpointing_errors)
+        if fail_on_checkpointing_errors:
+            self.set_tolerable_checkpoint_failure_number(0)
+        else:
+            self.set_tolerable_checkpoint_failure_number(2147483647)
         return self
 
-    def enable_externalized_checkpoints(
-            self,
-            cleanup_mode: 'ExternalizedCheckpointCleanup') -> 'CheckpointConfig':
+    def get_tolerable_checkpoint_failure_number(self) -> int:
         """
-        Enables checkpoints to be persisted externally.
+        Get the defined number of consecutive checkpoint failures that will be tolerated, before the
+        whole job is failed over.
+
+        :return: The maximum number of tolerated checkpoint failures.
+        """
+        return self._j_checkpoint_config.getTolerableCheckpointFailureNumber()
+
+    def set_tolerable_checkpoint_failure_number(self,
+                                                tolerable_checkpoint_failure_number: int
+                                                ) -> 'CheckpointConfig':
+        """
+        This defines how many consecutive checkpoint failures will be tolerated, before the whole
+        job is failed over. The default value is `0`, which means no checkpoint failures will be
+        tolerated, and the job will fail on first reported checkpoint failure.
+
+        Example:
+        ::
+
+            >>> config.set_tolerable_checkpoint_failure_number(2)
+
+        :param tolerable_checkpoint_failure_number: The maximum number of tolerated checkpoint
+                                                    failures.
+        """
+        self._j_checkpoint_config.setTolerableCheckpointFailureNumber(
+            tolerable_checkpoint_failure_number)
+        return self
+
+    def set_externalized_checkpoint_retention(
+            self,
+            retention_mode: 'ExternalizedCheckpointRetention') -> 'CheckpointConfig':
+        """
+        Sets the mode for externalized checkpoint clean-up. Externalized checkpoints will be enabled
+        automatically unless the mode is set to
+        :data:`ExternalizedCheckpointRetention.NO_EXTERNALIZED_CHECKPOINTS`.
 
         Externalized checkpoints write their meta data out to persistent storage and are **not**
         automatically cleaned up when the owning job fails or is suspended (terminating with job
         status ``FAILED`` or ``SUSPENDED``). In this case, you have to manually clean up the
         checkpoint state, both the meta data and actual program state.
 
-        The :class:`ExternalizedCheckpointCleanup` mode defines how an externalized checkpoint
+        The :class:`ExternalizedCheckpointRetention` mode defines how an externalized checkpoint
         should be cleaned up on job cancellation. If you choose to retain externalized checkpoints
-        on cancellation you have you handle checkpoint clean up manually when you cancel the job as
+        on cancellation you have to handle checkpoint clean-up manually when you cancel the job as
         well (terminating with job status ``CANCELED``).
 
         The target directory for externalized checkpoints is configured via
@@ -234,15 +248,16 @@ class CheckpointConfig(object):
         Example:
         ::
 
-            >>> config.enable_externalized_checkpoints(
-            ...     ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION)
+            >>> config.set_externalized_checkpoint_retention(
+            ...     ExternalizedCheckpointRetention.RETAIN_ON_CANCELLATION)
 
-        :param cleanup_mode: Externalized checkpoint cleanup behaviour, the mode could be
-                             :data:`ExternalizedCheckpointCleanup.DELETE_ON_CANCELLATION` or
-                             :data:`ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION`
+        :param retention_mode: Externalized checkpoint clean-up behaviour, the mode could be
+                             :data:`ExternalizedCheckpointRetention.DELETE_ON_CANCELLATION`,
+                             :data:`ExternalizedCheckpointRetention.RETAIN_ON_CANCELLATION` or
+                             :data:`ExternalizedCheckpointRetention.NO_EXTERNALIZED_CHECKPOINTS`
         """
-        self._j_checkpoint_config.enableExternalizedCheckpoints(
-            ExternalizedCheckpointCleanup._to_j_externalized_checkpoint_cleanup(cleanup_mode))
+        self._j_checkpoint_config.setExternalizedCheckpointRetention(
+            ExternalizedCheckpointRetention._to_j_externalized_checkpoint_retention(retention_mode))
         return self
 
     def is_externalized_checkpoints_enabled(self) -> bool:
@@ -253,41 +268,19 @@ class CheckpointConfig(object):
         """
         return self._j_checkpoint_config.isExternalizedCheckpointsEnabled()
 
-    def is_prefer_checkpoint_for_recovery(self) -> bool:
-        """
-        Returns whether a job recovery should fallback to checkpoint when there is a more recent
-        savepoint.
-
-        :return: ``True`` if a job recovery should fallback to checkpoint, false otherwise.
-        """
-        return self._j_checkpoint_config.isPreferCheckpointForRecovery()
-
-    def set_prefer_checkpoint_for_recovery(
-            self,
-            prefer_checkpoint_for_recovery: bool) -> 'CheckpointConfig':
-        """
-        Sets whether a job recovery should fallback to checkpoint when there is a more recent
-        savepoint.
-
-        :param prefer_checkpoint_for_recovery: ``True`` if a job recovery should fallback to
-                                               checkpoint, false otherwise.
-        """
-        self._j_checkpoint_config.setPreferCheckpointForRecovery(prefer_checkpoint_for_recovery)
-        return self
-
-    def get_externalized_checkpoint_cleanup(self) -> Optional['ExternalizedCheckpointCleanup']:
+    def get_externalized_checkpoint_retention(self) -> Optional['ExternalizedCheckpointRetention']:
         """
         Returns the cleanup behaviour for externalized checkpoints.
 
         :return: The cleanup behaviour for externalized checkpoints or ``None`` if none is
                  configured.
         """
-        cleanup_mode = self._j_checkpoint_config.getExternalizedCheckpointCleanup()
-        if cleanup_mode is None:
+        retention_mode = self._j_checkpoint_config.getExternalizedCheckpointRetention()
+        if retention_mode is None:
             return None
         else:
-            return ExternalizedCheckpointCleanup._from_j_externalized_checkpoint_cleanup(
-                cleanup_mode)
+            return ExternalizedCheckpointRetention._from_j_externalized_checkpoint_retention(
+                retention_mode)
 
     def is_unaligned_checkpoints_enabled(self) -> bool:
         """
@@ -330,47 +323,75 @@ class CheckpointConfig(object):
         self.enable_unaligned_checkpoints(False)
         return self
 
+    def set_aligned_checkpoint_timeout(self, alignment_timeout: Duration) -> 'CheckpointConfig':
+        """
+        Only relevant if :func:`enable_unaligned_checkpoints` is enabled.
 
-class ExternalizedCheckpointCleanup(Enum):
-    """
-    Cleanup behaviour for externalized checkpoints when the job is cancelled.
+        If ``alignment_timeout`` has value equal to ``0``, checkpoints will always start unaligned.
+        If ``alignment_timeout`` has value greater then ``0``, checkpoints will start aligned. If
+        during checkpointing, checkpoint start delay exceeds this ``alignment_timeout``, alignment
+        will timeout and checkpoint will start working as unaligned checkpoint.
 
-    :data:`DELETE_ON_CANCELLATION`:
+        :param alignment_timeout: The duration until the aligned checkpoint will be converted into
+                                  an unaligned checkpoint.
+        """
+        self._j_checkpoint_config.setAlignedCheckpointTimeout(alignment_timeout._j_duration)
+        return self
 
-    Delete externalized checkpoints on job cancellation.
+    def get_aligned_checkpoint_timeout(self) -> 'Duration':
+        """
+        Returns the alignment timeout, as configured via :func:`set_alignment_timeout` or
+        ``org.apache.flink.configuration.CheckpointingOptions#ALIGNED_CHECKPOINT_TIMEOUT``.
 
-    All checkpoint state will be deleted when you cancel the owning
-    job, both the meta data and actual program state. Therefore, you
-    cannot resume from externalized checkpoints after the job has been
-    cancelled.
+        :return: the alignment timeout.
+        """
+        return Duration(self._j_checkpoint_config.getAlignedCheckpointTimeout())
 
-    Note that checkpoint state is always kept if the job terminates
-    with state ``FAILED``.
+    def set_alignment_timeout(self, alignment_timeout: Duration) -> 'CheckpointConfig':
+        """
+        Only relevant if :func:`enable_unaligned_checkpoints` is enabled.
 
-    :data:`RETAIN_ON_CANCELLATION`:
+        If ``alignment_timeout`` has value equal to ``0``, checkpoints will always start unaligned.
+        If ``alignment_timeout`` has value greater then ``0``, checkpoints will start aligned. If
+        during checkpointing, checkpoint start delay exceeds this ``alignment_timeout``, alignment
+        will timeout and checkpoint will start working as unaligned checkpoint.
 
-    Retain externalized checkpoints on job cancellation.
+        :param alignment_timeout: The duration until the aligned checkpoint will be converted into
+                                  an unaligned checkpoint.
 
-    All checkpoint state is kept when you cancel the owning job. You
-    have to manually delete both the checkpoint meta data and actual
-    program state after cancelling the job.
+        .. note:: Deprecated in 2.0. Use :func:`set_aligned_checkpoint_timeout` instead.
+        """
+        self.set_aligned_checkpoint_timeout(alignment_timeout)
+        return self
 
-    Note that checkpoint state is always kept if the job terminates
-    with state ``FAILED``.
-    """
+    def get_alignment_timeout(self) -> 'Duration':
+        """
+        Returns the alignment timeout, as configured via :func:`set_alignment_timeout` or
+        ``org.apache.flink.configuration.CheckpointingOptions#ALIGNED_CHECKPOINT_TIMEOUT``.
 
-    DELETE_ON_CANCELLATION = 0
+        :return: the alignment timeout.
 
-    RETAIN_ON_CANCELLATION = 1
+        .. note:: Deprecated in 2.0. Use :func:`get_aligned_checkpoint_timeout` instead.
+        """
+        return self.get_aligned_checkpoint_timeout()
 
-    @staticmethod
-    def _from_j_externalized_checkpoint_cleanup(j_cleanup_mode) \
-            -> 'ExternalizedCheckpointCleanup':
-        return ExternalizedCheckpointCleanup[j_cleanup_mode.name()]
+    def set_force_unaligned_checkpoints(
+            self,
+            force_unaligned_checkpoints: bool = True) -> 'CheckpointConfig':
+        """
+        Checks whether unaligned checkpoints are forced, despite currently non-checkpointable
+        iteration feedback or custom partitioners.
 
-    def _to_j_externalized_checkpoint_cleanup(self):
-        gateway = get_gateway()
-        JExternalizedCheckpointCleanup = \
-            gateway.jvm.org.apache.flink.streaming.api.environment.CheckpointConfig \
-            .ExternalizedCheckpointCleanup
-        return getattr(JExternalizedCheckpointCleanup, self.name)
+        :param force_unaligned_checkpoints: The flag to force unaligned checkpoints.
+        """
+        self._j_checkpoint_config.setForceUnalignedCheckpoints(force_unaligned_checkpoints)
+        return self
+
+    def is_force_unaligned_checkpoints(self) -> 'bool':
+        """
+        Checks whether unaligned checkpoints are forced, despite iteration feedback or custom
+        partitioners.
+
+        :return: True, if unaligned checkpoints are forced, false otherwise.
+        """
+        return self._j_checkpoint_config.isForceUnalignedCheckpoints()

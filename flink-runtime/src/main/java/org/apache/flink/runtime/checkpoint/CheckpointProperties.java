@@ -18,8 +18,9 @@
 
 package org.apache.flink.runtime.checkpoint;
 
-import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.core.execution.RecoveryClaimMode;
+import org.apache.flink.core.execution.SavepointFormatType;
 
 import java.io.Serializable;
 
@@ -38,7 +39,7 @@ public class CheckpointProperties implements Serializable {
     private static final long serialVersionUID = 2L;
 
     /** Type - checkpoint / savepoint. */
-    private final CheckpointType checkpointType;
+    private final SnapshotType checkpointType;
 
     /**
      * This has a misleading name and actually means whether the snapshot must be triggered, or
@@ -53,15 +54,17 @@ public class CheckpointProperties implements Serializable {
     private final boolean discardFailed;
     private final boolean discardSuspended;
 
-    @VisibleForTesting
-    CheckpointProperties(
+    private final boolean unclaimed;
+
+    public CheckpointProperties(
             boolean forced,
-            CheckpointType checkpointType,
+            SnapshotType checkpointType,
             boolean discardSubsumed,
             boolean discardFinished,
             boolean discardCancelled,
             boolean discardFailed,
-            boolean discardSuspended) {
+            boolean discardSuspended,
+            boolean unclaimed) {
 
         this.forced = forced;
         this.checkpointType = checkNotNull(checkpointType);
@@ -70,6 +73,7 @@ public class CheckpointProperties implements Serializable {
         this.discardCancelled = discardCancelled;
         this.discardFailed = discardFailed;
         this.discardSuspended = discardSuspended;
+        this.unclaimed = unclaimed;
     }
 
     // ------------------------------------------------------------------------
@@ -87,6 +91,14 @@ public class CheckpointProperties implements Serializable {
      */
     boolean forceCheckpoint() {
         return forced;
+    }
+
+    /**
+     * Returns whether the checkpoint should be restored in a {@link RecoveryClaimMode#NO_CLAIM}
+     * mode.
+     */
+    public boolean isUnclaimed() {
+        return unclaimed;
     }
 
     // ------------------------------------------------------------------------
@@ -156,7 +168,7 @@ public class CheckpointProperties implements Serializable {
     }
 
     /** Gets the type of the checkpoint (checkpoint / savepoint). */
-    public CheckpointType getCheckpointType() {
+    public SnapshotType getCheckpointType() {
         return checkpointType;
     }
 
@@ -177,7 +189,7 @@ public class CheckpointProperties implements Serializable {
      *     </code> otherwise.
      */
     public boolean isSynchronous() {
-        return checkpointType.isSynchronous();
+        return isSavepoint() && ((SavepointType) checkpointType).isSynchronous();
     }
 
     // ------------------------------------------------------------------------
@@ -194,7 +206,7 @@ public class CheckpointProperties implements Serializable {
 
         CheckpointProperties that = (CheckpointProperties) o;
         return forced == that.forced
-                && checkpointType == that.checkpointType
+                && checkpointType.equals(that.checkpointType)
                 && discardSubsumed == that.discardSubsumed
                 && discardFinished == that.discardFinished
                 && discardCancelled == that.discardCancelled
@@ -238,22 +250,6 @@ public class CheckpointProperties implements Serializable {
     //  Factories and pre-configured properties
     // ------------------------------------------------------------------------
 
-    private static final CheckpointProperties SYNC_SAVEPOINT =
-            new CheckpointProperties(
-                    true, CheckpointType.SYNC_SAVEPOINT, false, false, false, false, false);
-
-    private static final CheckpointProperties SYNC_SAVEPOINT_NOT_FORCED =
-            new CheckpointProperties(
-                    false, CheckpointType.SYNC_SAVEPOINT, false, false, false, false, false);
-
-    private static final CheckpointProperties SAVEPOINT =
-            new CheckpointProperties(
-                    true, CheckpointType.SAVEPOINT, false, false, false, false, false);
-
-    private static final CheckpointProperties SAVEPOINT_NO_FORCE =
-            new CheckpointProperties(
-                    false, CheckpointType.SAVEPOINT, false, false, false, false, false);
-
     private static final CheckpointProperties CHECKPOINT_NEVER_RETAINED =
             new CheckpointProperties(
                     false,
@@ -262,7 +258,8 @@ public class CheckpointProperties implements Serializable {
                     true, // Delete on success
                     true, // Delete on cancellation
                     true, // Delete on failure
-                    true); // Delete on suspension
+                    true, // Delete on suspension
+                    false);
 
     private static final CheckpointProperties CHECKPOINT_RETAINED_ON_FAILURE =
             new CheckpointProperties(
@@ -272,7 +269,8 @@ public class CheckpointProperties implements Serializable {
                     true, // Delete on success
                     true, // Delete on cancellation
                     false, // Retain on failure
-                    true); // Delete on suspension
+                    true, // Delete on suspension
+                    false);
 
     private static final CheckpointProperties CHECKPOINT_RETAINED_ON_CANCELLATION =
             new CheckpointProperties(
@@ -282,7 +280,8 @@ public class CheckpointProperties implements Serializable {
                     true, // Delete on success
                     false, // Retain on cancellation
                     false, // Retain on failure
-                    false); // Retain on suspension
+                    false, // Retain on suspension
+                    false);
 
     /**
      * Creates the checkpoint properties for a (manually triggered) savepoint.
@@ -292,12 +291,53 @@ public class CheckpointProperties implements Serializable {
      *
      * @return Checkpoint properties for a (manually triggered) savepoint.
      */
-    public static CheckpointProperties forSavepoint(boolean forced) {
-        return forced ? SAVEPOINT : SAVEPOINT_NO_FORCE;
+    public static CheckpointProperties forSavepoint(
+            boolean forced, SavepointFormatType formatType) {
+        return new CheckpointProperties(
+                forced,
+                SavepointType.savepoint(formatType),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false);
     }
 
-    public static CheckpointProperties forSyncSavepoint(boolean forced) {
-        return forced ? SYNC_SAVEPOINT : SYNC_SAVEPOINT_NOT_FORCED;
+    /**
+     * Creates the checkpoint properties for a snapshot restored in {@link
+     * RecoveryClaimMode#NO_CLAIM}. Those properties should not be used when triggering a
+     * checkpoint/savepoint. They're useful when restoring a {@link CompletedCheckpointStore} after
+     * a JM failover.
+     *
+     * @return Checkpoint properties for a snapshot restored in {@link RecoveryClaimMode#NO_CLAIM}.
+     */
+    public static CheckpointProperties forUnclaimedSnapshot() {
+        return new CheckpointProperties(
+                false,
+                // unclaimed snapshot is similar to a savepoint
+                // we do not care about the format when restoring, the format is
+                // necessary when triggering a savepoint
+                SavepointType.savepoint(SavepointFormatType.CANONICAL),
+                false,
+                false,
+                false,
+                false,
+                false,
+                true);
+    }
+
+    public static CheckpointProperties forSyncSavepoint(
+            boolean forced, boolean terminate, SavepointFormatType formatType) {
+        return new CheckpointProperties(
+                forced,
+                terminate ? SavepointType.terminate(formatType) : SavepointType.suspend(formatType),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false);
     }
 
     /**

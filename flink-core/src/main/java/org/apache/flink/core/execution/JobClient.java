@@ -51,10 +51,13 @@ public interface JobClient {
      * @param advanceToEndOfEventTime flag indicating if the source should inject a {@code
      *     MAX_WATERMARK} in the pipeline
      * @param savepointDirectory directory the savepoint should be written to
+     * @param formatType binary format of the savepoint
      * @return a {@link CompletableFuture} containing the path where the savepoint is located
      */
     CompletableFuture<String> stopWithSavepoint(
-            boolean advanceToEndOfEventTime, @Nullable String savepointDirectory);
+            boolean advanceToEndOfEventTime,
+            @Nullable String savepointDirectory,
+            SavepointFormatType formatType);
 
     /**
      * Triggers a savepoint for the associated job. The savepoint will be written to the given
@@ -62,9 +65,11 @@ public interface JobClient {
      * org.apache.flink.configuration.CheckpointingOptions#SAVEPOINT_DIRECTORY} if it is null.
      *
      * @param savepointDirectory directory the savepoint should be written to
+     * @param formatType binary format of the savepoint
      * @return a {@link CompletableFuture} containing the path where the savepoint is located
      */
-    CompletableFuture<String> triggerSavepoint(@Nullable String savepointDirectory);
+    CompletableFuture<String> triggerSavepoint(
+            @Nullable String savepointDirectory, SavepointFormatType formatType);
 
     /**
      * Requests the accumulators of the associated job. Accumulators can be requested while it is
@@ -75,4 +80,7 @@ public interface JobClient {
 
     /** Returns the {@link JobExecutionResult result of the job execution} of the submitted job. */
     CompletableFuture<JobExecutionResult> getJobExecutionResult();
+
+    /** The client reports the heartbeat to the dispatcher for aliveness. */
+    default void reportHeartbeat(long expiredTimestamp) {}
 }

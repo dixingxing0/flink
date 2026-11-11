@@ -25,6 +25,7 @@ import org.apache.flink.configuration.IllegalConfigurationException;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.core.fs.Path;
 import org.apache.flink.runtime.state.AbstractStateBackend;
+import org.apache.flink.runtime.state.CheckpointStorage;
 import org.apache.flink.runtime.state.CompletedCheckpointStorageLocation;
 
 import javax.annotation.Nullable;
@@ -33,10 +34,7 @@ import java.io.IOException;
 import java.net.URI;
 
 /**
- * A base class for all state backends that store their metadata (and data) in files. Examples that
- * inherit from this are the {@link FsStateBackend}, the {@link
- * org.apache.flink.runtime.state.memory.MemoryStateBackend MemoryStateBackend}, or the {@code
- * RocksDBStateBackend}.
+ * A base class for all state backends that store their metadata (and data) in files.
  *
  * <p>This class takes the base checkpoint- and savepoint directory paths, but also accepts null for
  * both of then, in which case creating externalized checkpoint is not possible, and it is not
@@ -65,9 +63,15 @@ import java.net.URI;
  *
  * <p>A completed checkpoint writes its metadata into a file '{@value
  * AbstractFsCheckpointStorageAccess#METADATA_FILE_NAME}'.
+ *
+ * @deprecated State backends should no longer implement {@link CheckpointStorage} functionality.
+ *     Please inherit {@link AbstractStateBackend} instead. Custom checkpoint storage can be
+ *     additionally implemented as a separate class.
  */
+@Deprecated
 @PublicEvolving
-public abstract class AbstractFileStateBackend extends AbstractStateBackend {
+public abstract class AbstractFileStateBackend extends AbstractStateBackend
+        implements CheckpointStorage {
 
     private static final long serialVersionUID = 1L;
 

@@ -19,15 +19,17 @@
 package org.apache.flink.table.operations;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.expressions.Expression;
 import org.apache.flink.table.expressions.ResolvedExpression;
+import org.apache.flink.table.expressions.SqlFactory;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.stream.Collectors;
 
 /**
  * Table operation that computes new table using given {@link Expression}s from its input relational
@@ -36,12 +38,14 @@ import java.util.Objects;
 @Internal
 public class ValuesQueryOperation implements QueryOperation {
 
+    private static final String INPUT_ALIAS = "$$T_VAL";
     private final List<List<ResolvedExpression>> values;
-    private final TableSchema tableSchema;
+    private final ResolvedSchema resolvedSchema;
 
-    public ValuesQueryOperation(List<List<ResolvedExpression>> values, TableSchema tableSchema) {
+    public ValuesQueryOperation(
+            List<List<ResolvedExpression>> values, ResolvedSchema resolvedSchema) {
         this.values = values;
-        this.tableSchema = tableSchema;
+        this.resolvedSchema = resolvedSchema;
     }
 
     public List<List<ResolvedExpression>> getValues() {
@@ -49,8 +53,8 @@ public class ValuesQueryOperation implements QueryOperation {
     }
 
     @Override
-    public TableSchema getTableSchema() {
-        return tableSchema;
+    public ResolvedSchema getResolvedSchema() {
+        return resolvedSchema;
     }
 
     @Override
@@ -60,6 +64,28 @@ public class ValuesQueryOperation implements QueryOperation {
 
         return OperationUtils.formatWithChildren(
                 "Values", args, getChildren(), Operation::asSummaryString);
+    }
+
+    @Override
+    public String asSerializableString(SqlFactory sqlFactory) {
+        return String.format(
+                "SELECT %s FROM (VALUES %s\n) %s(%s)",
+                OperationUtils.formatSelectColumns(resolvedSchema, INPUT_ALIAS),
+                OperationUtils.indent(
+                        values.stream()
+                                .map(
+                                        row ->
+                                                row.stream()
+                                                        .map(
+                                                                resolvedExpression ->
+                                                                        resolvedExpression
+                                                                                .asSerializableString(
+                                                                                        sqlFactory))
+                                                        .collect(
+                                                                Collectors.joining(", ", "(", ")")))
+                                .collect(Collectors.joining(",\n"))),
+                INPUT_ALIAS,
+                OperationUtils.formatSelectColumns(resolvedSchema, null));
     }
 
     @Override
@@ -81,12 +107,13 @@ public class ValuesQueryOperation implements QueryOperation {
             return false;
         }
         ValuesQueryOperation that = (ValuesQueryOperation) o;
-        return Objects.equals(values, that.values) && Objects.equals(tableSchema, that.tableSchema);
+        return Objects.equals(values, that.values)
+                && Objects.equals(resolvedSchema, that.resolvedSchema);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(values, tableSchema);
+        return Objects.hash(values, resolvedSchema);
     }
 
     @Override

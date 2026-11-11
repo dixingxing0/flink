@@ -27,9 +27,7 @@ import org.apache.flink.api.connector.source.SplitEnumeratorContext;
 import org.apache.flink.api.connector.source.mocks.MockSourceSplit;
 import org.apache.flink.api.connector.source.mocks.MockSourceSplitSerializer;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.SourceReaderOptions;
-import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.util.InstantiationUtil;
 
@@ -66,14 +64,15 @@ public class MockBaseSource implements Source<Integer, MockSourceSplit, List<Moc
 
     @Override
     public SourceReader<Integer, MockSourceSplit> createReader(SourceReaderContext readerContext) {
-        FutureCompletingBlockingQueue<RecordsWithSplitIds<int[]>> elementsQueue =
-                new FutureCompletingBlockingQueue<>();
 
         Configuration config = new Configuration();
-        config.setInteger(SourceReaderOptions.ELEMENT_QUEUE_CAPACITY, 1);
-        config.setLong(SourceReaderOptions.SOURCE_READER_CLOSE_TIMEOUT, 30000L);
-        return new MockSourceReader(
-                elementsQueue, () -> new MockSplitReader(2, true), config, readerContext);
+        config.set(SourceReaderOptions.ELEMENT_QUEUE_CAPACITY, 1);
+        config.set(SourceReaderOptions.SOURCE_READER_CLOSE_TIMEOUT, 30000L);
+        MockSplitReader.Builder builder =
+                MockSplitReader.newBuilder()
+                        .setNumRecordsPerSplitPerFetch(2)
+                        .setBlockingFetch(true);
+        return new MockSourceReader(builder::build, config, readerContext);
     }
 
     @Override
@@ -114,7 +113,8 @@ public class MockBaseSource implements Source<Integer, MockSourceSplit, List<Moc
 
             @Override
             public byte[] serialize(List<MockSourceSplit> obj) throws IOException {
-                return InstantiationUtil.serializeObject(obj.toArray());
+                return InstantiationUtil.serializeObject(
+                        obj.toArray(new MockSourceSplit[obj.size()]));
             }
 
             @Override

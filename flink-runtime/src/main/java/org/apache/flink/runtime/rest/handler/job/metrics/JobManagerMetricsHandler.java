@@ -18,7 +18,6 @@
 
 package org.apache.flink.runtime.rest.handler.job.metrics;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.rest.handler.HandlerRequest;
 import org.apache.flink.runtime.rest.handler.legacy.metrics.MetricFetcher;
 import org.apache.flink.runtime.rest.handler.legacy.metrics.MetricStore;
@@ -30,6 +29,7 @@ import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.Map;
 
 /** Handler that returns JobManager metrics. */
@@ -38,7 +38,7 @@ public class JobManagerMetricsHandler
 
     public JobManagerMetricsHandler(
             final GatewayRetriever<? extends RestfulGateway> leaderRetriever,
-            final Time timeout,
+            final Duration timeout,
             final Map<String, String> headers,
             final MetricFetcher metricFetcher) {
         super(
@@ -52,8 +52,7 @@ public class JobManagerMetricsHandler
     @Nullable
     @Override
     protected MetricStore.ComponentMetricStore getComponentMetricStore(
-            final HandlerRequest<EmptyRequestBody, JobManagerMetricsMessageParameters> request,
-            final MetricStore metricStore) {
+            final HandlerRequest<EmptyRequestBody> request, final MetricStore metricStore) {
         return metricStore.getJobManagerMetricStore();
     }
 }

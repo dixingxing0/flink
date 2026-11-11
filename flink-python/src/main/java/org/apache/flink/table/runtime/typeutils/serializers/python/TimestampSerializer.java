@@ -33,9 +33,8 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 
 /**
- * Uses similar serialization/deserialization of SqlTimestampSerializer in blink to serialize
- * Timestamp. It not only deals with Daylight saving time problem and precision problem, but also
- * makes the serialized value consistent between the legacy planner and the blink planner.
+ * Uses similar serialization/deserialization of SqlTimestampSerializer to serialize Timestamp. It
+ * deals with Daylight saving time problem and precision problem.
  */
 @Internal
 public class TimestampSerializer extends TypeSerializerSingleton<Timestamp> {
@@ -154,14 +153,14 @@ public class TimestampSerializer extends TypeSerializerSingleton<Timestamp> {
 
         private static final int CURRENT_VERSION = 1;
 
-        private int previousPrecision;
+        private int precision;
 
         public TimestampSerializerSnapshot() {
             // this constructor is used when restoring from a checkpoint/savepoint.
         }
 
         TimestampSerializerSnapshot(int precision) {
-            this.previousPrecision = precision;
+            this.precision = precision;
         }
 
         @Override
@@ -171,29 +170,30 @@ public class TimestampSerializer extends TypeSerializerSingleton<Timestamp> {
 
         @Override
         public void writeSnapshot(DataOutputView out) throws IOException {
-            out.writeInt(previousPrecision);
+            out.writeInt(precision);
         }
 
         @Override
         public void readSnapshot(int readVersion, DataInputView in, ClassLoader userCodeClassLoader)
                 throws IOException {
-            this.previousPrecision = in.readInt();
+            this.precision = in.readInt();
         }
 
         @Override
         public TypeSerializer<Timestamp> restoreSerializer() {
-            return new TimestampSerializer(previousPrecision);
+            return new TimestampSerializer(precision);
         }
 
         @Override
         public TypeSerializerSchemaCompatibility<Timestamp> resolveSchemaCompatibility(
-                TypeSerializer<Timestamp> newSerializer) {
-            if (!(newSerializer instanceof TimestampSerializer)) {
+                TypeSerializerSnapshot<Timestamp> oldSerializerSnapshot) {
+            if (!(oldSerializerSnapshot instanceof TimestampSerializerSnapshot)) {
                 return TypeSerializerSchemaCompatibility.incompatible();
             }
 
-            TimestampSerializer timestampSerializer = (TimestampSerializer) newSerializer;
-            if (previousPrecision != timestampSerializer.precision) {
+            TimestampSerializerSnapshot timestampSerializerSnapshot =
+                    (TimestampSerializerSnapshot) oldSerializerSnapshot;
+            if (precision != timestampSerializerSnapshot.precision) {
                 return TypeSerializerSchemaCompatibility.incompatible();
             } else {
                 return TypeSerializerSchemaCompatibility.compatibleAsIs();

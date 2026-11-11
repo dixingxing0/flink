@@ -17,7 +17,7 @@
  */
 package org.apache.flink.api.java.typeutils.runtime;
 
-import org.apache.flink.api.common.ExecutionConfig;
+import org.apache.flink.api.common.serialization.SerializerConfigImpl;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
@@ -31,16 +31,16 @@ import org.apache.flink.types.Row;
 import org.apache.flink.types.RowKind;
 import org.apache.flink.types.RowUtils;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.io.Serializable;
 import java.util.LinkedHashMap;
 import java.util.Objects;
 
-public class RowSerializerTest {
+class RowSerializerTest {
 
     @Test
-    public void testRowSerializer() {
+    void testRowSerializer() {
         final TypeInformation<Row> rowTypeInfo =
                 Types.ROW_NAMED(
                         new String[] {"a", "b", "c", "d"},
@@ -80,7 +80,8 @@ public class RowSerializerTest {
         namedPositionedRow.setField(2, null);
         namedPositionedRow.setField("d", false);
 
-        final TypeSerializer<Row> serializer = rowTypeInfo.createSerializer(new ExecutionConfig());
+        final TypeSerializer<Row> serializer =
+                rowTypeInfo.createSerializer(new SerializerConfigImpl());
         final RowSerializerTestInstance instance =
                 new RowSerializerTestInstance(
                         serializer, positionedRow, namedRow, sparseNamedRow, namedPositionedRow);
@@ -88,7 +89,7 @@ public class RowSerializerTest {
     }
 
     @Test
-    public void testLargeRowSerializer() {
+    void testLargeRowSerializer() {
         TypeInformation<Row> typeInfo =
                 new RowTypeInfo(
                         BasicTypeInfo.INT_TYPE_INFO,
@@ -119,13 +120,13 @@ public class RowSerializerTest {
         row.setField(11, null);
         row.setField(12, "Test");
 
-        TypeSerializer<Row> serializer = typeInfo.createSerializer(new ExecutionConfig());
+        TypeSerializer<Row> serializer = typeInfo.createSerializer(new SerializerConfigImpl());
         RowSerializerTestInstance testInstance = new RowSerializerTestInstance(serializer, row);
         testInstance.testAll();
     }
 
     @Test
-    public void testRowSerializerWithComplexTypes() {
+    void testRowSerializerWithComplexTypes() {
         TypeInformation<Row> typeInfo =
                 new RowTypeInfo(
                         BasicTypeInfo.INT_TYPE_INFO,
@@ -204,7 +205,7 @@ public class RowSerializerTest {
                             testPojo3)
                 };
 
-        TypeSerializer<Row> serializer = typeInfo.createSerializer(new ExecutionConfig());
+        TypeSerializer<Row> serializer = typeInfo.createSerializer(new SerializerConfigImpl());
         RowSerializerTestInstance testInstance = new RowSerializerTestInstance(serializer, data);
         testInstance.testAll();
     }

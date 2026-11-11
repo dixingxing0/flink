@@ -19,6 +19,7 @@
 package org.apache.flink.runtime.metrics.scope;
 
 import org.apache.flink.metrics.CharacterFilter;
+import org.apache.flink.util.CollectionUtil;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -37,14 +38,6 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * across failure and recovery).
  */
 public abstract class ScopeFormat {
-
-    private static CharacterFilter defaultFilter =
-            new CharacterFilter() {
-                @Override
-                public String filterCharacters(String input) {
-                    return input;
-                }
-            };
 
     // ------------------------------------------------------------------------
     //  Scope Format Special Characters
@@ -208,18 +201,6 @@ public abstract class ScopeFormat {
         return SCOPE_VARIABLE_PREFIX + scope + SCOPE_VARIABLE_SUFFIX;
     }
 
-    public static String concat(String... components) {
-        return concat(defaultFilter, '.', components);
-    }
-
-    public static String concat(CharacterFilter filter, String... components) {
-        return concat(filter, '.', components);
-    }
-
-    public static String concat(Character delimiter, String... components) {
-        return concat(defaultFilter, delimiter, components);
-    }
-
     /**
      * Concatenates the given component names separated by the delimiter character. Additionally the
      * character filter is applied to all component names.
@@ -246,7 +227,7 @@ public abstract class ScopeFormat {
     }
 
     protected static HashMap<String, Integer> arrayToMap(String[] array) {
-        HashMap<String, Integer> map = new HashMap<>(array.length);
+        HashMap<String, Integer> map = CollectionUtil.newHashMapWithExpectedSize(array.length);
         for (int i = 0; i < array.length; i++) {
             map.put(array[i], i);
         }

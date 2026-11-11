@@ -20,7 +20,6 @@ package org.apache.flink.runtime.scheduler;
 
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
-import org.apache.flink.runtime.concurrent.FutureUtils;
 import org.apache.flink.runtime.executiongraph.utils.SimpleAckingTaskManagerGateway;
 import org.apache.flink.runtime.jobmanager.scheduler.NoResourceAvailableException;
 import org.apache.flink.runtime.jobmanager.slots.TaskManagerGateway;
@@ -28,6 +27,7 @@ import org.apache.flink.runtime.jobmaster.SlotRequestId;
 import org.apache.flink.runtime.jobmaster.slotpool.PhysicalSlotProvider;
 import org.apache.flink.runtime.jobmaster.slotpool.PhysicalSlotRequest;
 import org.apache.flink.util.Preconditions;
+import org.apache.flink.util.concurrent.FutureUtils;
 
 import java.util.Collection;
 import java.util.Collections;
@@ -47,6 +47,8 @@ public class TestingPhysicalSlotProvider implements PhysicalSlotProvider {
 
     private final Function<ResourceProfile, CompletableFuture<TestingPhysicalSlot>>
             physicalSlotCreator;
+
+    private boolean batchSlotRequestTimeoutCheckEnabled = true;
 
     public static TestingPhysicalSlotProvider create(
             Function<ResourceProfile, CompletableFuture<TestingPhysicalSlot>> physicalSlotCreator) {
@@ -106,24 +108,37 @@ public class TestingPhysicalSlotProvider implements PhysicalSlotProvider {
     }
 
     @Override
-    public CompletableFuture<PhysicalSlotRequest.Result> allocatePhysicalSlot(
-            PhysicalSlotRequest physicalSlotRequest) {
-        SlotRequestId slotRequestId = physicalSlotRequest.getSlotRequestId();
-        requests.put(slotRequestId, physicalSlotRequest);
+    public Map<SlotRequestId, CompletableFuture<PhysicalSlotRequest.Result>> allocatePhysicalSlots(
+            Collection<PhysicalSlotRequest> physicalSlotRequests) {
+        Map<SlotRequestId, CompletableFuture<PhysicalSlotRequest.Result>> result =
+                new HashMap<>(physicalSlotRequests.size());
+        for (PhysicalSlotRequest physicalSlotRequest : physicalSlotRequests) {
+            SlotRequestId slotRequestId = physicalSlotRequest.getSlotRequestId();
+            requests.put(slotRequestId, physicalSlotRequest);
 
-        final CompletableFuture<TestingPhysicalSlot> resultFuture =
-                physicalSlotCreator.apply(
-                        physicalSlotRequest.getSlotProfile().getPhysicalSlotResourceProfile());
+            final CompletableFuture<TestingPhysicalSlot> resultFuture =
+                    physicalSlotCreator.apply(
+                            physicalSlotRequest.getSlotProfile().getPhysicalSlotResourceProfile());
 
-        responses.put(slotRequestId, resultFuture);
+            responses.put(slotRequestId, resultFuture);
 
-        return resultFuture.thenApply(
-                physicalSlot -> new PhysicalSlotRequest.Result(slotRequestId, physicalSlot));
+            CompletableFuture<PhysicalSlotRequest.Result> physicalSlotFuture =
+                    resultFuture.thenApply(
+                            physicalSlot ->
+                                    new PhysicalSlotRequest.Result(slotRequestId, physicalSlot));
+            result.put(slotRequestId, physicalSlotFuture);
+        }
+        return result;
     }
 
     @Override
     public void cancelSlotRequest(SlotRequestId slotRequestId, Throwable cause) {
         cancellations.put(slotRequestId, cause);
+    }
+
+    @Override
+    public void disableBatchSlotRequestTimeoutCheck() {
+        batchSlotRequestTimeoutCheckEnabled = false;
     }
 
     public CompletableFuture<TestingPhysicalSlot> getResultForRequestId(
@@ -159,5 +174,9 @@ public class TestingPhysicalSlotProvider implements PhysicalSlotProvider {
         Optional<T> element = collection.stream().findFirst();
         Preconditions.checkState(element.isPresent());
         return element.get();
+    }
+
+    boolean isBatchSlotRequestTimeoutCheckEnabled() {
+        return batchSlotRequestTimeoutCheckEnabled;
     }
 }

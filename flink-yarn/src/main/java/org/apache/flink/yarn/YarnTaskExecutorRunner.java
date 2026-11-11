@@ -19,17 +19,18 @@
 package org.apache.flink.yarn;
 
 import org.apache.flink.annotation.VisibleForTesting;
-import org.apache.flink.configuration.AkkaOptions;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.RpcOptions;
 import org.apache.flink.configuration.SecurityOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
+import org.apache.flink.configuration.TaskManagerOptionsInternal;
 import org.apache.flink.core.plugin.PluginManager;
 import org.apache.flink.runtime.clusterframework.BootstrapTools;
 import org.apache.flink.runtime.taskexecutor.TaskManagerRunner;
 import org.apache.flink.runtime.util.EnvironmentInformation;
 import org.apache.flink.runtime.util.JvmShutdownSafeguard;
 import org.apache.flink.runtime.util.SignalHandler;
-import org.apache.flink.util.ExceptionUtils;
+import org.apache.flink.util.Preconditions;
 
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
@@ -37,7 +38,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.lang.reflect.UndeclaredThrowableException;
 import java.util.Map;
 
 /** This class is the executable entry point for running a TaskExecutor in a YARN container. */
@@ -76,23 +76,22 @@ public class YarnTaskExecutorRunner {
      * @param args The command line arguments.
      */
     private static void runTaskManagerSecurely(String[] args) {
+        Configuration configuration = null;
+
         try {
             LOG.debug("All environment variables: {}", ENV);
 
             final String currDir = ENV.get(Environment.PWD.key());
             LOG.info("Current working Directory: {}", currDir);
 
-            final Configuration configuration = TaskManagerRunner.loadConfiguration(args);
+            configuration = TaskManagerRunner.loadConfiguration(args);
             setupAndModifyConfiguration(configuration, currDir, ENV);
-
-            TaskManagerRunner.runTaskManagerSecurely(configuration);
         } catch (Throwable t) {
-            final Throwable strippedThrowable =
-                    ExceptionUtils.stripException(t, UndeclaredThrowableException.class);
-            // make sure that everything whatever ends up in the log
-            LOG.error("YARN TaskManager initialization failed.", strippedThrowable);
+            LOG.error("YARN TaskManager initialization failed.", t);
             System.exit(INIT_ERROR_EXIT_CODE);
         }
+
+        TaskManagerRunner.runTaskManagerProcessSecurely(Preconditions.checkNotNull(configuration));
     }
 
     @VisibleForTesting
@@ -118,8 +117,8 @@ public class YarnTaskExecutorRunner {
         final String keytabPrincipal = variables.get(YarnConfigKeys.KEYTAB_PRINCIPAL);
         LOG.info("TM: keytab principal obtained {}", keytabPrincipal);
 
-        // tell akka to die in case of an error
-        configuration.setBoolean(AkkaOptions.JVM_EXIT_ON_FATAL_ERROR, true);
+        // tell pekko to die in case of an error
+        configuration.set(RpcOptions.JVM_EXIT_ON_FATAL_ERROR, true);
 
         String keytabPath = Utils.resolveKeytabPath(currDir, localKeytabPath);
 
@@ -131,15 +130,17 @@ public class YarnTaskExecutorRunner {
                 yarnClientUsername);
 
         if (keytabPath != null && keytabPrincipal != null) {
-            configuration.setString(SecurityOptions.KERBEROS_LOGIN_KEYTAB, keytabPath);
-            configuration.setString(SecurityOptions.KERBEROS_LOGIN_PRINCIPAL, keytabPrincipal);
+            configuration.set(SecurityOptions.KERBEROS_LOGIN_KEYTAB, keytabPath);
+            configuration.set(SecurityOptions.KERBEROS_LOGIN_PRINCIPAL, keytabPrincipal);
         }
 
         // use the hostname passed by job manager
         final String taskExecutorHostname =
                 variables.get(YarnResourceManagerDriver.ENV_FLINK_NODE_ID);
         if (taskExecutorHostname != null) {
-            configuration.setString(TaskManagerOptions.HOST, taskExecutorHostname);
+            configuration.set(TaskManagerOptions.HOST, taskExecutorHostname);
+            configuration.set(
+                    TaskManagerOptionsInternal.TASK_MANAGER_NODE_ID, taskExecutorHostname);
         }
     }
 }

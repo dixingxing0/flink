@@ -18,22 +18,30 @@
 
 package org.apache.flink.table.types.inference.strategies;
 
+import org.apache.flink.api.common.typeinfo.BasicArrayTypeInfo;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.inference.CallContext;
 import org.apache.flink.table.types.logical.BinaryType;
 import org.apache.flink.table.types.logical.CharType;
 import org.apache.flink.table.types.logical.DecimalType;
+import org.apache.flink.table.types.logical.LegacyTypeInformationType;
 import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.LogicalTypeFamily;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.VarBinaryType;
 import org.apache.flink.table.types.logical.VarCharType;
 import org.apache.flink.table.types.logical.utils.LogicalTypeCasts;
+import org.apache.flink.table.types.utils.TypeConversions;
 
 import javax.annotation.Nullable;
 
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 import static org.apache.flink.table.types.logical.LogicalTypeFamily.APPROXIMATE_NUMERIC;
 import static org.apache.flink.table.types.logical.LogicalTypeFamily.EXACT_NUMERIC;
@@ -44,8 +52,6 @@ import static org.apache.flink.table.types.logical.utils.LogicalTypeCasts.suppor
 import static org.apache.flink.table.types.logical.utils.LogicalTypeChecks.getLength;
 import static org.apache.flink.table.types.logical.utils.LogicalTypeChecks.getPrecision;
 import static org.apache.flink.table.types.logical.utils.LogicalTypeChecks.getScale;
-import static org.apache.flink.table.types.logical.utils.LogicalTypeChecks.hasFamily;
-import static org.apache.flink.table.types.logical.utils.LogicalTypeChecks.hasRoot;
 
 /** Utilities for shared logic in classes of this package. */
 final class StrategyUtils {
@@ -99,6 +105,17 @@ final class StrategyUtils {
                         });
     }
 
+    static boolean isDecimalComputation(LogicalType type1, LogicalType type2) {
+        // both must be exact numeric
+        if (!type1.is(LogicalTypeFamily.EXACT_NUMERIC)
+                || !type2.is(LogicalTypeFamily.EXACT_NUMERIC)) {
+            return false;
+        }
+
+        // one decimal must be present
+        return type1.is(LogicalTypeRoot.DECIMAL) || type2.is(LogicalTypeRoot.DECIMAL);
+    }
+
     /**
      * Returns a data type for the given data type and expected root.
      *
@@ -113,14 +130,14 @@ final class StrategyUtils {
     private static @Nullable DataType findDataTypeOfRoot(
             DataType actualDataType, LogicalTypeRoot expectedRoot) {
         final LogicalType actualType = actualDataType.getLogicalType();
-        if (hasRoot(actualType, expectedRoot)) {
+        if (actualType.is(expectedRoot)) {
             return actualDataType;
         }
         switch (expectedRoot) {
             case CHAR:
                 return DataTypes.CHAR(CharType.DEFAULT_LENGTH);
             case VARCHAR:
-                if (hasRoot(actualType, CHAR)) {
+                if (actualType.is(CHAR)) {
                     return DataTypes.VARCHAR(getLength(actualType));
                 }
                 return DataTypes.VARCHAR(VarCharType.DEFAULT_LENGTH);
@@ -129,14 +146,14 @@ final class StrategyUtils {
             case BINARY:
                 return DataTypes.BINARY(BinaryType.DEFAULT_LENGTH);
             case VARBINARY:
-                if (hasRoot(actualType, BINARY)) {
+                if (actualType.is(BINARY)) {
                     return DataTypes.VARBINARY(getLength(actualType));
                 }
                 return DataTypes.VARBINARY(VarBinaryType.DEFAULT_LENGTH);
             case DECIMAL:
-                if (hasFamily(actualType, EXACT_NUMERIC)) {
+                if (actualType.is(EXACT_NUMERIC)) {
                     return DataTypes.DECIMAL(getPrecision(actualType), getScale(actualType));
-                } else if (hasFamily(actualType, APPROXIMATE_NUMERIC)) {
+                } else if (actualType.is(APPROXIMATE_NUMERIC)) {
                     final int precision = getPrecision(actualType);
                     // we don't know where the precision occurs (before or after the dot)
                     return DataTypes.DECIMAL(precision * 2, precision);
@@ -157,7 +174,7 @@ final class StrategyUtils {
             case DATE:
                 return DataTypes.DATE();
             case TIME_WITHOUT_TIME_ZONE:
-                if (hasRoot(actualType, TIMESTAMP_WITHOUT_TIME_ZONE)) {
+                if (actualType.is(TIMESTAMP_WITHOUT_TIME_ZONE)) {
                     return DataTypes.TIME(getPrecision(actualType));
                 }
                 return DataTypes.TIME();
@@ -173,6 +190,8 @@ final class StrategyUtils {
                 return DataTypes.INTERVAL(DataTypes.SECOND());
             case NULL:
                 return DataTypes.NULL();
+            case DESCRIPTOR:
+                return DataTypes.DESCRIPTOR();
             case ARRAY:
             case MULTISET:
             case MAP:
@@ -184,6 +203,51 @@ final class StrategyUtils {
             case UNRESOLVED:
             default:
                 return null;
+        }
+    }
+
+    static Optional<DataType> extractLegacyArrayElement(DataType arrayType) {
+        final LogicalType logicalType = arrayType.getLogicalType();
+        if (logicalType instanceof LegacyTypeInformationType) {
+            final TypeInformation<?> typeInformation =
+                    ((LegacyTypeInformationType<?>) logicalType).getTypeInformation();
+            if (typeInformation instanceof BasicArrayTypeInfo) {
+                return Optional.of(
+                        TypeConversions.fromLegacyInfoToDataType(
+                                        ((BasicArrayTypeInfo<?, ?>) typeInformation)
+                                                .getComponentInfo())
+                                .nullable());
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Validates that the argument at {@code regexArgPos} is a literal that compiles as a Java
+     * regex. Non-literal or null-literal regex arguments are deferred to runtime.
+     *
+     * @return {@link Optional#empty()} when the argument is not a literal, is a {@code NULL}
+     *     literal, or compiles cleanly; the result of {@link CallContext#fail} otherwise.
+     */
+    static Optional<List<DataType>> validateLiteralPattern(
+            final CallContext callContext, final int regexArgPos, final boolean throwOnFailure) {
+        if (!callContext.isArgumentLiteral(regexArgPos)
+                || callContext.isArgumentNull(regexArgPos)) {
+            return Optional.empty();
+        }
+        final Optional<String> pattern = callContext.getArgumentValue(regexArgPos, String.class);
+        if (pattern.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            Pattern.compile(pattern.get());
+            return Optional.empty();
+        } catch (PatternSyntaxException e) {
+            return callContext.fail(
+                    throwOnFailure,
+                    "Invalid regular expression for %s: %s",
+                    callContext.getName(),
+                    e.getMessage());
         }
     }
 

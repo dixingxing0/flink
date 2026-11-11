@@ -43,17 +43,33 @@ public class NoOpResultSubpartitionView implements ResultSubpartitionView {
     public void resumeConsumption() {}
 
     @Override
+    public void acknowledgeAllDataProcessed() {}
+
+    @Override
     public Throwable getFailureCause() {
         return null;
     }
 
     @Override
-    public boolean isAvailable(int numCreditsAvailable) {
-        return false;
+    public AvailabilityWithBacklog getAvailabilityAndBacklog(boolean isCreditAvailable) {
+        return new AvailabilityWithBacklog(false, 0);
     }
 
     @Override
     public int unsynchronizedGetNumberOfQueuedBuffers() {
         return 0;
+    }
+
+    @Override
+    public int getNumberOfQueuedBuffers() {
+        return 0;
+    }
+
+    @Override
+    public void notifyNewBufferSize(int newBufferSize) {}
+
+    @Override
+    public int peekNextBufferSubpartitionId() {
+        throw new UnsupportedOperationException();
     }
 }

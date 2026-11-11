@@ -18,43 +18,88 @@
 
 package org.apache.flink.table.client.gateway;
 
-import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.api.common.RuntimeExecutionMode;
+import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.table.api.config.TableConfigOptions;
+import org.apache.flink.table.catalog.ResolvedSchema;
+import org.apache.flink.table.client.config.ResultMode;
+import org.apache.flink.table.client.gateway.result.ChangelogCollectResult;
+import org.apache.flink.table.client.gateway.result.DynamicResult;
+import org.apache.flink.table.client.gateway.result.MaterializedCollectBatchResult;
+import org.apache.flink.table.client.gateway.result.MaterializedCollectStreamResult;
+import org.apache.flink.table.utils.print.RowDataToStringConverter;
+
+import static org.apache.flink.configuration.ExecutionOptions.RUNTIME_MODE;
+import static org.apache.flink.table.client.config.ResultMode.CHANGELOG;
+import static org.apache.flink.table.client.config.ResultMode.TABLE;
+import static org.apache.flink.table.client.config.SqlClientOptions.DISPLAY_QUERY_TIME_COST;
+import static org.apache.flink.table.client.config.SqlClientOptions.EXECUTION_MAX_TABLE_RESULT_ROWS;
+import static org.apache.flink.table.client.config.SqlClientOptions.EXECUTION_RESULT_MODE;
 
 /** Describes a result to be expected from a table program. */
 public class ResultDescriptor {
 
-    private final String resultId;
+    private final StatementResult tableResult;
+    private final ReadableConfig config;
 
-    private final TableSchema resultSchema;
-
-    private final boolean isMaterialized;
-
-    private final boolean isTableauMode;
-
-    public ResultDescriptor(
-            String resultId,
-            TableSchema resultSchema,
-            boolean isMaterialized,
-            boolean isTableauMode) {
-        this.resultId = resultId;
-        this.resultSchema = resultSchema;
-        this.isMaterialized = isMaterialized;
-        this.isTableauMode = isTableauMode;
+    public ResultDescriptor(StatementResult tableResult, ReadableConfig config) {
+        this.tableResult = tableResult;
+        this.config = config;
     }
 
-    public String getResultId() {
-        return resultId;
+    @SuppressWarnings("unchecked")
+    public <T extends DynamicResult> T createResult() {
+        ResultMode resultMode = config.get(EXECUTION_RESULT_MODE);
+        boolean isStreaming = config.get(RUNTIME_MODE).equals(RuntimeExecutionMode.STREAMING);
+        if (resultMode.equals(CHANGELOG) && !isStreaming) {
+            throw new SqlExecutionException(
+                    "Results of batch queries can only be served in table or tableau mode.");
+        }
+
+        switch (resultMode) {
+            case CHANGELOG:
+            case TABLEAU:
+                return (T) new ChangelogCollectResult(tableResult);
+            case TABLE:
+                Integer maxRows = config.get(EXECUTION_MAX_TABLE_RESULT_ROWS);
+                if (isStreaming) {
+                    return (T) new MaterializedCollectStreamResult(tableResult, maxRows);
+                } else {
+                    return (T) new MaterializedCollectBatchResult(tableResult, maxRows);
+                }
+            default:
+                throw new SqlExecutionException(
+                        String.format(
+                                "Unknown value '%s' for option '%s'.",
+                                resultMode, EXECUTION_RESULT_MODE.key()));
+        }
     }
 
-    public TableSchema getResultSchema() {
-        return resultSchema;
+    public ResolvedSchema getResultSchema() {
+        return tableResult.getResultSchema();
     }
 
     public boolean isMaterialized() {
-        return isMaterialized;
+        return config.get(EXECUTION_RESULT_MODE).equals(TABLE);
     }
 
     public boolean isTableauMode() {
-        return isTableauMode;
+        return config.get(EXECUTION_RESULT_MODE).equals(ResultMode.TABLEAU);
+    }
+
+    public boolean isStreamingMode() {
+        return config.get(RUNTIME_MODE).equals(RuntimeExecutionMode.STREAMING);
+    }
+
+    public int maxColumnWidth() {
+        return config.get(TableConfigOptions.DISPLAY_MAX_COLUMN_WIDTH);
+    }
+
+    public boolean isPrintQueryTimeCost() {
+        return config.get(DISPLAY_QUERY_TIME_COST);
+    }
+
+    public RowDataToStringConverter getRowDataStringConverter() {
+        return tableResult.getRowDataToStringConverter();
     }
 }

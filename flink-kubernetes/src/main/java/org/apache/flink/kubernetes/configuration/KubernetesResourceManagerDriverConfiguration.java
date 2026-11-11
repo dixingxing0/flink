@@ -18,26 +18,29 @@
 
 package org.apache.flink.kubernetes.configuration;
 
-import org.apache.flink.api.common.time.Time;
+import javax.annotation.Nullable;
 
 /**
  * Configuration specific to {@link org.apache.flink.kubernetes.KubernetesResourceManagerDriver}.
  */
 public class KubernetesResourceManagerDriverConfiguration {
+
     private final String clusterId;
-    private final Time podCreationRetryInterval;
+
+    @Nullable private final String webInterfaceUrl;
 
     public KubernetesResourceManagerDriverConfiguration(
-            String clusterId, Time podCreationRetryInterval) {
+            String clusterId, @Nullable String webInterfaceUrl) {
         this.clusterId = clusterId;
-        this.podCreationRetryInterval = podCreationRetryInterval;
+        this.webInterfaceUrl = webInterfaceUrl;
     }
 
     public String getClusterId() {
         return clusterId;
     }
 
-    public Time getPodCreationRetryInterval() {
-        return podCreationRetryInterval;
+    @Nullable
+    public String getWebInterfaceUrl() {
+        return webInterfaceUrl;
     }
 }

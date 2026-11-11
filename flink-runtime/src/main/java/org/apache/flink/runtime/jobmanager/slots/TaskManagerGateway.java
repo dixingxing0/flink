@@ -19,7 +19,6 @@
 package org.apache.flink.runtime.jobmanager.slots;
 
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
@@ -28,12 +27,12 @@ import org.apache.flink.runtime.executiongraph.PartitionInfo;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.messages.Acknowledge;
-import org.apache.flink.runtime.messages.TaskBackPressureResponse;
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
 import org.apache.flink.runtime.rpc.RpcTimeout;
 import org.apache.flink.runtime.taskexecutor.TaskExecutorOperatorEventGateway;
 import org.apache.flink.util.SerializedValue;
 
+import java.time.Duration;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
@@ -48,24 +47,13 @@ public interface TaskManagerGateway extends TaskExecutorOperatorEventGateway {
     String getAddress();
 
     /**
-     * Request the back pressure ratio for the given task.
-     *
-     * @param executionAttemptID identifying the task to request.
-     * @param requestId id of the request.
-     * @param timeout rpc request timeout.
-     * @return A future of the task back pressure result.
-     */
-    CompletableFuture<TaskBackPressureResponse> requestTaskBackPressure(
-            ExecutionAttemptID executionAttemptID, int requestId, Time timeout);
-
-    /**
      * Submit a task to the task manager.
      *
      * @param tdd describing the task to submit
      * @param timeout of the submit operation
      * @return Future acknowledge of the successful operation
      */
-    CompletableFuture<Acknowledge> submitTask(TaskDeploymentDescriptor tdd, Time timeout);
+    CompletableFuture<Acknowledge> submitTask(TaskDeploymentDescriptor tdd, Duration timeout);
 
     /**
      * Cancel the given task.
@@ -74,7 +62,8 @@ public interface TaskManagerGateway extends TaskExecutorOperatorEventGateway {
      * @param timeout of the submit operation
      * @return Future acknowledge if the task is successfully canceled
      */
-    CompletableFuture<Acknowledge> cancelTask(ExecutionAttemptID executionAttemptID, Time timeout);
+    CompletableFuture<Acknowledge> cancelTask(
+            ExecutionAttemptID executionAttemptID, Duration timeout);
 
     /**
      * Update the task where the given partitions can be found.
@@ -87,7 +76,7 @@ public interface TaskManagerGateway extends TaskExecutorOperatorEventGateway {
     CompletableFuture<Acknowledge> updatePartitions(
             ExecutionAttemptID executionAttemptID,
             Iterable<PartitionInfo> partitionInfos,
-            Time timeout);
+            Duration timeout);
 
     /**
      * Batch release intermediate result partitions.
@@ -98,15 +87,21 @@ public interface TaskManagerGateway extends TaskExecutorOperatorEventGateway {
     void releasePartitions(JobID jobId, Set<ResultPartitionID> partitionIds);
 
     /**
-     * Notify the given task about a completed checkpoint.
+     * Notify the given task about a completed checkpoint and the last subsumed checkpoint id if
+     * possible.
      *
      * @param executionAttemptID identifying the task
      * @param jobId identifying the job to which the task belongs
-     * @param checkpointId of the completed checkpoint
-     * @param timestamp of the completed checkpoint
+     * @param completedCheckpointId of the completed checkpoint
+     * @param completedTimestamp of the completed checkpoint
+     * @param lastSubsumedCheckpointId of the last subsumed checkpoint id,
      */
-    void notifyCheckpointComplete(
-            ExecutionAttemptID executionAttemptID, JobID jobId, long checkpointId, long timestamp);
+    void notifyCheckpointOnComplete(
+            ExecutionAttemptID executionAttemptID,
+            JobID jobId,
+            long completedCheckpointId,
+            long completedTimestamp,
+            long lastSubsumedCheckpointId);
 
     /**
      * Notify the given task about a aborted checkpoint.
@@ -114,10 +109,15 @@ public interface TaskManagerGateway extends TaskExecutorOperatorEventGateway {
      * @param executionAttemptID identifying the task
      * @param jobId identifying the job to which the task belongs
      * @param checkpointId of the subsumed checkpoint
+     * @param latestCompletedCheckpointId of the latest completed checkpoint
      * @param timestamp of the subsumed checkpoint
      */
     void notifyCheckpointAborted(
-            ExecutionAttemptID executionAttemptID, JobID jobId, long checkpointId, long timestamp);
+            ExecutionAttemptID executionAttemptID,
+            JobID jobId,
+            long checkpointId,
+            long latestCompletedCheckpointId,
+            long timestamp);
 
     /**
      * Trigger for the given task a checkpoint.
@@ -127,16 +127,14 @@ public interface TaskManagerGateway extends TaskExecutorOperatorEventGateway {
      * @param checkpointId of the checkpoint to trigger
      * @param timestamp of the checkpoint to trigger
      * @param checkpointOptions of the checkpoint to trigger
-     * @param advanceToEndOfEventTime Flag indicating if the source should inject a {@code
-     *     MAX_WATERMARK} in the pipeline to fire any registered event-time timers
+     * @return Future acknowledge which is returned once the checkpoint has been triggered
      */
-    void triggerCheckpoint(
+    CompletableFuture<Acknowledge> triggerCheckpoint(
             ExecutionAttemptID executionAttemptID,
             JobID jobId,
             long checkpointId,
             long timestamp,
-            CheckpointOptions checkpointOptions,
-            boolean advanceToEndOfEventTime);
+            CheckpointOptions checkpointOptions);
 
     /**
      * Frees the slot with the given allocation ID.
@@ -147,7 +145,9 @@ public interface TaskManagerGateway extends TaskExecutorOperatorEventGateway {
      * @return Future acknowledge which is returned once the slot has been freed
      */
     CompletableFuture<Acknowledge> freeSlot(
-            final AllocationID allocationId, final Throwable cause, @RpcTimeout final Time timeout);
+            final AllocationID allocationId,
+            final Throwable cause,
+            @RpcTimeout final Duration timeout);
 
     @Override
     CompletableFuture<Acknowledge> sendOperatorEventToTask(

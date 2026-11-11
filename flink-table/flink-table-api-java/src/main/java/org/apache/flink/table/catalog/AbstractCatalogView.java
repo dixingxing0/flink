@@ -18,7 +18,8 @@
 
 package org.apache.flink.table.catalog;
 
-import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.annotation.Internal;
+import org.apache.flink.table.legacy.api.TableSchema;
 import org.apache.flink.util.StringUtils;
 
 import java.util.Map;
@@ -27,6 +28,7 @@ import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /** An abstract catalog view. */
+@Internal
 public abstract class AbstractCatalogView implements CatalogView {
     // Original text of the view definition.
     private final String originalQuery;
@@ -38,14 +40,14 @@ public abstract class AbstractCatalogView implements CatalogView {
     private final String expandedQuery;
 
     private final TableSchema schema;
-    private final Map<String, String> properties;
+    private final Map<String, String> options;
     private final String comment;
 
     public AbstractCatalogView(
             String originalQuery,
             String expandedQuery,
             TableSchema schema,
-            Map<String, String> properties,
+            Map<String, String> options,
             String comment) {
         checkArgument(
                 !StringUtils.isNullOrWhitespaceOnly(originalQuery),
@@ -57,7 +59,7 @@ public abstract class AbstractCatalogView implements CatalogView {
         this.originalQuery = originalQuery;
         this.expandedQuery = expandedQuery;
         this.schema = checkNotNull(schema, "schema cannot be null");
-        this.properties = checkNotNull(properties, "properties cannot be null");
+        this.options = checkNotNull(options, "options cannot be null");
         this.comment = comment;
     }
 
@@ -72,8 +74,8 @@ public abstract class AbstractCatalogView implements CatalogView {
     }
 
     @Override
-    public Map<String, String> getProperties() {
-        return this.properties;
+    public Map<String, String> getOptions() {
+        return this.options;
     }
 
     @Override
@@ -81,7 +83,8 @@ public abstract class AbstractCatalogView implements CatalogView {
         return this.schema;
     }
 
+    @Override
     public String getComment() {
-        return this.comment;
+        return comment != null ? comment : "";
     }
 }

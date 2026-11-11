@@ -17,18 +17,20 @@
 
 package org.apache.flink.runtime.io.network.partition;
 
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.runtime.io.network.buffer.UnpooledBufferPool;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for the {@link PipelinedResultPartitionReleaseOnConsumptionTest}. */
-public class PipelinedResultPartitionReleaseOnConsumptionTest extends TestLogger {
+class PipelinedResultPartitionReleaseOnConsumptionTest {
 
     @Test
-    public void testConsumptionBasedPartitionRelease() {
+    void testConsumptionBasedPartitionRelease() throws IOException {
         final ResultPartitionManager manager = new ResultPartitionManager();
         final ResultPartition partition =
                 new ResultPartitionBuilder()
@@ -40,14 +42,33 @@ public class PipelinedResultPartitionReleaseOnConsumptionTest extends TestLogger
         manager.registerResultPartition(partition);
 
         partition.onConsumedSubpartition(0);
-        assertFalse(partition.isReleased());
+        assertThat(partition.isReleased()).isFalse();
 
         partition.onConsumedSubpartition(1);
-        assertTrue(partition.isReleased());
+        partition.close();
+        assertThat(partition.isReleased()).isTrue();
     }
 
     @Test
-    public void testMultipleReleaseCallsAreIdempotent() {
+    void testConsumptionBeforePartitionClose() throws IOException {
+        final ResultPartition partition =
+                new ResultPartitionBuilder()
+                        .setResultPartitionType(ResultPartitionType.PIPELINED)
+                        .setNumberOfSubpartitions(1)
+                        .setBufferPoolFactory(UnpooledBufferPool::new)
+                        .build();
+
+        partition.setup();
+        partition.emitRecord(ByteBuffer.allocate(16), 0);
+        partition.onConsumedSubpartition(0);
+        assertThat(partition.isReleased()).isFalse();
+        partition.emitRecord(ByteBuffer.allocate(16), 0);
+        partition.close();
+        assertThat(partition.isReleased()).isTrue();
+    }
+
+    @Test
+    void testMultipleReleaseCallsAreIdempotent() throws IOException {
         final ResultPartitionManager manager = new ResultPartitionManager();
         final ResultPartition partition =
                 new ResultPartitionBuilder()
@@ -60,11 +81,11 @@ public class PipelinedResultPartitionReleaseOnConsumptionTest extends TestLogger
         partition.onConsumedSubpartition(0);
         partition.onConsumedSubpartition(0);
 
-        assertFalse(partition.isReleased());
+        assertThat(partition.isReleased()).isFalse();
     }
 
     @Test
-    public void testReleaseAfterIdempotentCalls() {
+    void testReleaseAfterIdempotentCalls() throws IOException {
         final ResultPartitionManager manager = new ResultPartitionManager();
         final ResultPartition partition =
                 new ResultPartitionBuilder()
@@ -77,7 +98,8 @@ public class PipelinedResultPartitionReleaseOnConsumptionTest extends TestLogger
         partition.onConsumedSubpartition(0);
         partition.onConsumedSubpartition(0);
         partition.onConsumedSubpartition(1);
+        partition.close();
 
-        assertTrue(partition.isReleased());
+        assertThat(partition.isReleased()).isTrue();
     }
 }

@@ -20,6 +20,7 @@ package org.apache.flink.runtime.rest;
 
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.RestOptions;
+import org.apache.flink.configuration.SecurityOptions;
 import org.apache.flink.runtime.io.network.netty.SSLHandlerFactory;
 import org.apache.flink.runtime.net.SSLUtils;
 import org.apache.flink.util.ConfigurationException;
@@ -99,7 +100,7 @@ public final class RestClientConfiguration {
         Preconditions.checkNotNull(config);
 
         final SSLHandlerFactory sslHandlerFactory;
-        if (SSLUtils.isRestSSLEnabled(config)) {
+        if (SecurityOptions.isRestSSLEnabled(config)) {
             try {
                 sslHandlerFactory = SSLUtils.createRestClientSSLEngineFactory(config);
             } catch (Exception e) {
@@ -110,11 +111,11 @@ public final class RestClientConfiguration {
             sslHandlerFactory = null;
         }
 
-        final long connectionTimeout = config.getLong(RestOptions.CONNECTION_TIMEOUT);
+        final long connectionTimeout = config.get(RestOptions.CONNECTION_TIMEOUT).toMillis();
 
-        final long idlenessTimeout = config.getLong(RestOptions.IDLENESS_TIMEOUT);
+        final long idlenessTimeout = config.get(RestOptions.IDLENESS_TIMEOUT).toMillis();
 
-        int maxContentLength = config.getInteger(RestOptions.CLIENT_MAX_CONTENT_LENGTH);
+        int maxContentLength = config.get(RestOptions.CLIENT_MAX_CONTENT_LENGTH);
 
         return new RestClientConfiguration(
                 sslHandlerFactory, connectionTimeout, idlenessTimeout, maxContentLength);

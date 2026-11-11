@@ -22,6 +22,8 @@ import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.runtime.taskexecutor.TaskExecutor;
 
+import java.io.File;
+
 /** Interface to access {@link TaskExecutor} information. */
 public interface TaskManagerRuntimeInfo {
 
@@ -60,6 +62,13 @@ public interface TaskManagerRuntimeInfo {
      * @return The bind address of the TaskManager.
      */
     default String getTaskManagerBindAddress() {
-        return getConfiguration().getString(TaskManagerOptions.BIND_HOST);
+        return getConfiguration().get(TaskManagerOptions.BIND_HOST);
     }
+
+    /**
+     * Gets the temporary working directory of the TaskManager instance.
+     *
+     * @return The temporary working directory of the TaskManager.
+     */
+    File getTmpWorkingDirectory();
 }

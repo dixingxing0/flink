@@ -22,9 +22,9 @@ import io.fabric8.kubernetes.client.server.mock.KubernetesCrudDispatcher;
 import io.fabric8.mockwebserver.ServerRequest;
 import io.fabric8.mockwebserver.ServerResponse;
 import io.fabric8.mockwebserver.dsl.HttpMethod;
+import io.fabric8.mockwebserver.http.MockResponse;
+import io.fabric8.mockwebserver.http.RecordedRequest;
 import io.fabric8.mockwebserver.internal.SimpleRequest;
-import okhttp3.mockwebserver.MockResponse;
-import okhttp3.mockwebserver.RecordedRequest;
 
 import java.util.Map;
 import java.util.Queue;
@@ -38,7 +38,7 @@ public class MixedDispatcher extends KubernetesCrudDispatcher {
     }
 
     @Override
-    public MockResponse dispatch(RecordedRequest request) throws InterruptedException {
+    public MockResponse dispatch(RecordedRequest request) {
         HttpMethod method = HttpMethod.valueOf(request.getMethod());
         String path = request.getPath();
         SimpleRequest key = new SimpleRequest(method, path);

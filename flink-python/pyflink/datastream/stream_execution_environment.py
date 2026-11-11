@@ -18,28 +18,35 @@
 import os
 import tempfile
 
-from typing import List, Any
+from typing import List, Any, Optional, cast
 
 from py4j.java_gateway import JavaObject
 
+from pyflink.common import Configuration, WatermarkStrategy
 from pyflink.common.execution_config import ExecutionConfig
+from pyflink.common.io import InputFormat
 from pyflink.common.job_client import JobClient
 from pyflink.common.job_execution_result import JobExecutionResult
-from pyflink.common.restart_strategy import RestartStrategies, RestartStrategyConfiguration
 from pyflink.common.typeinfo import TypeInformation, Types
+from pyflink.datastream import SlotSharingGroup
 from pyflink.datastream.checkpoint_config import CheckpointConfig
 from pyflink.datastream.checkpointing_mode import CheckpointingMode
+from pyflink.datastream.connectors import Source
 from pyflink.datastream.data_stream import DataStream
+from pyflink.datastream.execution_mode import RuntimeExecutionMode
 from pyflink.datastream.functions import SourceFunction
-from pyflink.datastream.state_backend import _from_j_state_backend, StateBackend
-from pyflink.datastream.time_characteristic import TimeCharacteristic
+from pyflink.datastream.utils import ResultTypeQueryable
 from pyflink.java_gateway import get_gateway
 from pyflink.serializers import PickleSerializer
-from pyflink.util.utils import load_java_class, add_jars_to_context_class_loader
+from pyflink.util.api_stability_decorators import Public
+from pyflink.util.java_utils import add_jars_to_context_class_loader, \
+    invoke_method, get_field_value, is_local_deployment, get_j_env_configuration
+
 
 __all__ = ['StreamExecutionEnvironment']
 
 
+@Public()
 class StreamExecutionEnvironment(object):
     """
     The StreamExecutionEnvironment is the context in which a streaming program is executed. A
@@ -54,6 +61,7 @@ class StreamExecutionEnvironment(object):
     def __init__(self, j_stream_execution_environment, serializer=PickleSerializer()):
         self._j_stream_execution_environment = j_stream_execution_environment
         self.serializer = serializer
+        self._open()
 
     def get_config(self) -> ExecutionConfig:
         """
@@ -84,17 +92,35 @@ class StreamExecutionEnvironment(object):
     def set_max_parallelism(self, max_parallelism: int) -> 'StreamExecutionEnvironment':
         """
         Sets the maximum degree of parallelism defined for the program. The upper limit (inclusive)
-        is 32767.
+        is 32768.
 
         The maximum degree of parallelism specifies the upper limit for dynamic scaling. It also
         defines the number of key groups used for partitioned state.
 
         :param max_parallelism: Maximum degree of parallelism to be used for the program,
-                                with 0 < maxParallelism <= 2^15 - 1.
+                                with 0 < maxParallelism <= 2^15.
         :return: This object.
         """
         self._j_stream_execution_environment = \
             self._j_stream_execution_environment.setMaxParallelism(max_parallelism)
+        return self
+
+    def register_slot_sharing_group(self, slot_sharing_group: SlotSharingGroup) \
+            -> 'StreamExecutionEnvironment':
+        """
+        Register a slot sharing group with its resource spec.
+
+        Note that a slot sharing group hints the scheduler that the grouped operators CAN be
+        deployed into a shared slot. There's no guarantee that the scheduler always deploy the
+        grouped operators together. In cases grouped operators are deployed into separate slots, the
+        slot resources will be derived from the specified group requirements.
+
+        :param slot_sharing_group: Which contains name and its resource spec.
+        :return: This object.
+        """
+        self._j_stream_execution_environment = \
+            self._j_stream_execution_environment.registerSlotSharingGroup(
+                slot_sharing_group.get_java_slot_sharing_group())
         return self
 
     def get_parallelism(self) -> int:
@@ -117,6 +143,26 @@ class StreamExecutionEnvironment(object):
         :return: Maximum degree of parallelism.
         """
         return self._j_stream_execution_environment.getMaxParallelism()
+
+    def set_runtime_mode(self, execution_mode: RuntimeExecutionMode):
+        """
+        Sets the runtime execution mode for the application
+        :class:`~pyflink.datastream.execution_mode.RuntimeExecutionMode`. This
+        is equivalent to setting the `execution.runtime-mode` in your application's
+        configuration file.
+
+        We recommend users to NOT use this method but set the `execution.runtime-mode` using
+        the command-line when submitting the application. Keeping the application code
+        configuration-free allows for more flexibility as the same application will be able to be
+        executed in any execution mode.
+
+        :param execution_mode: The desired execution mode.
+        :return: The execution environment of your application.
+
+        .. versionadded:: 1.13.0
+        """
+        return self._j_stream_execution_environment.setRuntimeMode(
+            execution_mode._to_j_execution_mode())
 
     def set_buffer_timeout(self, timeout_millis: int) -> 'StreamExecutionEnvironment':
         """
@@ -165,6 +211,15 @@ class StreamExecutionEnvironment(object):
         :return: True if chaining is enabled, false otherwise.
         """
         return self._j_stream_execution_environment.isChainingEnabled()
+
+    def is_chaining_of_operators_with_different_max_parallelism_enabled(self) -> bool:
+        """
+        Returns whether operators that have a different max parallelism can be chained.
+
+        :return: True if chaining is enabled, false otherwise
+        """
+        return self._j_stream_execution_environment\
+            .isChainingOfOperatorsWithDifferentMaxParallelismEnabled()
 
     def get_checkpoint_config(self) -> CheckpointConfig:
         """
@@ -230,167 +285,115 @@ class StreamExecutionEnvironment(object):
 
         :return: The :class:`~pyflink.datastream.CheckpointingMode`.
         """
-        j_checkpointing_mode = self._j_stream_execution_environment.getCheckpointingMode()
+        return self.get_checkpointing_consistency_mode()
+
+    def get_checkpointing_consistency_mode(self) -> CheckpointingMode:
+        """
+        Returns the checkpointing mode (exactly-once vs. at-least-once).
+
+        Shorthand for get_checkpoint_config().get_checkpointing_mode().
+
+        :return: The :class:`~pyflink.datastream.CheckpointingMode`.
+        """
+        j_checkpointing_mode = \
+            self._j_stream_execution_environment.getCheckpointingConsistencyMode()
         return CheckpointingMode._from_j_checkpointing_mode(j_checkpointing_mode)
 
-    def get_state_backend(self) -> StateBackend:
+    def enable_changelog_state_backend(self, enabled: bool) -> 'StreamExecutionEnvironment':
         """
-        Gets the state backend that defines how to store and checkpoint state.
+        Enable the change log for current state backend. This change log allows operators to persist
+        state changes in a very fine-grained manner. Currently, the change log only applies to keyed
+        state, so non-keyed operator state and channel state are persisted as usual. The 'state'
+        here refers to 'keyed state'. Details are as follows:
 
-        .. seealso:: :func:`set_state_backend`
+        * Stateful operators write the state changes to that log (logging the state), in addition \
+        to applying them to the state tables in RocksDB or the in-mem Hashtable.
+        * An operator can acknowledge a checkpoint as soon as the changes in the log have reached \
+        the durable checkpoint storage.
+        * The state tables are persisted periodically, independent of the checkpoints. We call \
+        this the materialization of the state on the checkpoint storage.
+        * Once the state is materialized on checkpoint storage, the state changelog can be \
+        truncated to the corresponding point.
 
-        :return: The :class:`StateBackend`.
-        """
-        j_state_backend = self._j_stream_execution_environment.getStateBackend()
-        return _from_j_state_backend(j_state_backend)
+        It establish a way to drastically reduce the checkpoint interval for streaming
+        applications across state backends. For more details please check the FLIP-158.
 
-    def set_state_backend(self, state_backend: StateBackend) -> 'StreamExecutionEnvironment':
-        """
-        Sets the state backend that describes how to store and checkpoint operator state. It
-        defines both which data structures hold state during execution (for example hash tables,
-        RockDB, or other data stores) as well as where checkpointed data will be persisted.
+        If this method is not called explicitly, it means no preference for enabling the change
+        log. Configs for change log enabling will override in different config levels
+        (job/local/cluster).
 
-        The :class:`~pyflink.datastream.MemoryStateBackend` for example maintains the state in heap
-        memory, as objects. It is lightweight without extra dependencies, but can checkpoint only
-        small states(some counters).
+        .. seealso:: :func:`is_changelog_state_backend_enabled`
 
-        In contrast, the :class:`~pyflink.datastream.FsStateBackend` stores checkpoints of the state
-        (also maintained as heap objects) in files. When using a replicated file system (like HDFS,
-        S3, MapR FS, Alluxio, etc) this will guarantee that state is not lost upon failures of
-        individual nodes and that streaming program can be executed highly available and strongly
-        consistent(assuming that Flink is run in high-availability mode).
 
-        The build-in state backend includes:
-            :class:`~pyflink.datastream.MemoryStateBackend`,
-            :class:`~pyflink.datastream.FsStateBackend`
-            and :class:`~pyflink.datastream.RocksDBStateBackend`.
-
-        .. seealso:: :func:`get_state_backend`
-
-        Example:
-        ::
-
-            >>> env.set_state_backend(RocksDBStateBackend("file://var/checkpoints/"))
-
-        :param state_backend: The :class:`StateBackend`.
+        :param enabled: True if enable the change log for state backend explicitly, otherwise
+                        disable the change log.
         :return: This object.
+
+        .. versionadded:: 1.14.0
         """
         self._j_stream_execution_environment = \
-            self._j_stream_execution_environment.setStateBackend(state_backend._j_state_backend)
+            self._j_stream_execution_environment.enableChangelogStateBackend(enabled)
         return self
 
-    def set_restart_strategy(self, restart_strategy_configuration: RestartStrategyConfiguration):
+    def is_changelog_state_backend_enabled(self) -> Optional[bool]:
         """
-        Sets the restart strategy configuration. The configuration specifies which restart strategy
-        will be used for the execution graph in case of a restart.
+        Gets the enable status of change log for state backend.
+
+        .. seealso:: :func:`enable_changelog_state_backend`
+
+        :return: An :class:`Optional[bool]` for the enable status of change log for state backend.
+                 Could be None if user never specify this by calling
+                 :func:`enable_changelog_state_backend`.
+
+        .. versionadded:: 1.14.0
+        """
+        j_ternary_boolean = self._j_stream_execution_environment.isChangelogStateBackendEnabled()
+        return j_ternary_boolean.getAsBoolean()
+
+    def set_default_savepoint_directory(self, directory: str) -> 'StreamExecutionEnvironment':
+        """
+        Sets the default savepoint directory, where savepoints will be written to if none
+        is explicitly provided when triggered.
 
         Example:
         ::
 
-            >>> env.set_restart_strategy(RestartStrategies.no_restart())
+            >>> env.set_default_savepoint_directory("hdfs://savepoints")
 
-        :param restart_strategy_configuration: Restart strategy configuration to be set.
-        :return:
+        :param directory The savepoint directory
+        :return: This object.
         """
-        self._j_stream_execution_environment.setRestartStrategy(
-            restart_strategy_configuration._j_restart_strategy_configuration)
+        self._j_stream_execution_environment.setDefaultSavepointDirectory(directory)
+        return self
 
-    def get_restart_strategy(self) -> RestartStrategyConfiguration:
+    def get_default_savepoint_directory(self) -> Optional[str]:
         """
-        Returns the specified restart strategy configuration.
-
-        :return: The restart strategy configuration to be used.
+        Gets the default savepoint directory for this Job.
         """
-        return RestartStrategies._from_j_restart_strategy(
-            self._j_stream_execution_environment.getRestartStrategy())
+        j_path = self._j_stream_execution_environment.getDefaultSavepointDirectory()
+        if j_path is None:
+            return None
+        else:
+            return j_path.toString()
 
-    def add_default_kryo_serializer(self, type_class_name: str, serializer_class_name: str):
+    def configure(self, configuration: Configuration):
         """
-        Adds a new Kryo default serializer to the Runtime.
+        Sets all relevant options contained in the :class:`~pyflink.common.Configuration`. such as
+        e.g. `pipeline.time-characteristic`. It will reconfigure
+        :class:`~pyflink.datastream.StreamExecutionEnvironment`,
+        :class:`~pyflink.common.ExecutionConfig` and :class:`~pyflink.datastream.CheckpointConfig`.
 
-        Example:
-        ::
+        It will change the value of a setting only if a corresponding option was set in the
+        `configuration`. If a key is not present, the current value of a field will remain
+        untouched.
 
-            >>> env.add_default_kryo_serializer("com.aaa.bbb.TypeClass", "com.aaa.bbb.Serializer")
+        :param configuration: a configuration to read the values from.
 
-        :param type_class_name: The full-qualified java class name of the types serialized with the
-                                given serializer.
-        :param serializer_class_name: The full-qualified java class name of the serializer to use.
+        .. versionadded:: 1.15.0
         """
-        type_clz = load_java_class(type_class_name)
-        j_serializer_clz = load_java_class(serializer_class_name)
-        self._j_stream_execution_environment.addDefaultKryoSerializer(type_clz, j_serializer_clz)
-
-    def register_type_with_kryo_serializer(self, type_class_name: str, serializer_class_name: str):
-        """
-        Registers the given Serializer via its class as a serializer for the given type at the
-        KryoSerializer.
-
-        Example:
-        ::
-
-            >>> env.register_type_with_kryo_serializer("com.aaa.bbb.TypeClass",
-            ...                                        "com.aaa.bbb.Serializer")
-
-        :param type_class_name: The full-qualified java class name of the types serialized with
-                                the given serializer.
-        :param serializer_class_name: The full-qualified java class name of the serializer to use.
-        """
-        type_clz = load_java_class(type_class_name)
-        j_serializer_clz = load_java_class(serializer_class_name)
-        self._j_stream_execution_environment.registerTypeWithKryoSerializer(
-            type_clz, j_serializer_clz)
-
-    def register_type(self, type_class_name: str):
-        """
-        Registers the given type with the serialization stack. If the type is eventually
-        serialized as a POJO, then the type is registered with the POJO serializer. If the
-        type ends up being serialized with Kryo, then it will be registered at Kryo to make
-        sure that only tags are written.
-
-        Example:
-        ::
-
-            >>> env.register_type("com.aaa.bbb.TypeClass")
-
-        :param type_class_name: The full-qualified java class name of the type to register.
-        """
-        type_clz = load_java_class(type_class_name)
-        self._j_stream_execution_environment.registerType(type_clz)
-
-    def set_stream_time_characteristic(self, characteristic: TimeCharacteristic):
-        """
-        Sets the time characteristic for all streams create from this environment, e.g., processing
-        time, event time, or ingestion time.
-
-        If you set the characteristic to IngestionTime of EventTime this will set a default
-        watermark update interval of 200 ms. If this is not applicable for your application
-        you should change it using
-        :func:`pyflink.common.ExecutionConfig.set_auto_watermark_interval`.
-
-        Example:
-        ::
-
-            >>> env.set_stream_time_characteristic(TimeCharacteristic.EventTime)
-
-        :param characteristic: The time characteristic, which could be
-                               :data:`TimeCharacteristic.ProcessingTime`,
-                               :data:`TimeCharacteristic.IngestionTime`,
-                               :data:`TimeCharacteristic.EventTime`.
-        """
-        j_characteristic = TimeCharacteristic._to_j_time_characteristic(characteristic)
-        self._j_stream_execution_environment.setStreamTimeCharacteristic(j_characteristic)
-
-    def get_stream_time_characteristic(self) -> 'TimeCharacteristic':
-        """
-        Gets the time characteristic.
-
-        .. seealso:: :func:`set_stream_time_characteristic`
-
-        :return: The :class:`TimeCharacteristic`.
-        """
-        j_characteristic = self._j_stream_execution_environment.getStreamTimeCharacteristic()
-        return TimeCharacteristic._from_j_time_characteristic(j_characteristic)
+        self._j_stream_execution_environment.configure(configuration._j_configuration,
+                                                       get_gateway().jvm.Thread.currentThread()
+                                                       .getContextClassLoader())
 
     def add_python_file(self, file_path: str):
         """
@@ -405,7 +408,7 @@ class StreamExecutionEnvironment(object):
             .getEnvironmentConfig(self._j_stream_execution_environment)
         python_files = env_config.getString(jvm.PythonOptions.PYTHON_FILES.key(), None)
         if python_files is not None:
-            python_files = jvm.PythonDependencyUtils.FILE_DELIMITER.join([python_files, file_path])
+            python_files = jvm.PythonDependencyUtils.FILE_DELIMITER.join([file_path, python_files])
         else:
             python_files = file_path
         env_config.setString(jvm.PythonOptions.PYTHON_FILES.key(), python_files)
@@ -436,7 +439,7 @@ class StreamExecutionEnvironment(object):
 
             Please make sure the installation packages matches the platform of the cluster
             and the python version used. These packages will be installed using pip,
-            so also make sure the version of Pip (version >= 7.1.0) and the version of
+            so also make sure the version of Pip (version >= 20.3) and the version of
             SetupTools (version >= 37.0.0).
 
         :param requirements_file_path: The path of "requirements.txt" file.
@@ -491,7 +494,7 @@ class StreamExecutionEnvironment(object):
         .. note::
 
             Please make sure the uploaded python environment matches the platform that the cluster
-            is running on and that the python version must be 3.5 or higher.
+            is running on and that the python version must be 3.6 or higher.
 
         .. note::
 
@@ -540,11 +543,11 @@ class StreamExecutionEnvironment(object):
         .. note::
 
             Please make sure the uploaded python environment matches the platform that the cluster
-            is running on and that the python version must be 3.5 or higher.
+            is running on and that the python version must be 3.7 or higher.
 
         .. note::
 
-            The python udf worker depends on Apache Beam (version == 2.23.0).
+            The python udf worker depends on Apache Beam (version >= 2.69.0, <= 2.75.0).
             Please ensure that the specified environment meets the above requirements.
 
         :param python_exec: The path of python interpreter.
@@ -565,11 +568,10 @@ class StreamExecutionEnvironment(object):
         jars_key = jvm.org.apache.flink.configuration.PipelineOptions.JARS.key()
         env_config = jvm.org.apache.flink.python.util.PythonConfigUtil \
             .getEnvironmentConfig(self._j_stream_execution_environment)
-        old_jar_paths = env_config.getString(jars_key, None)
-        joined_jars_path = ';'.join(jars_path)
-        if old_jar_paths and old_jar_paths.strip():
-            joined_jars_path = ';'.join([old_jar_paths, joined_jars_path])
-        env_config.setString(jars_key, joined_jars_path)
+        old_jars_path = env_config.getString(jars_key, None)
+        old_jars_list = Configuration.parse_list_value(old_jars_path)
+        joined_jars_list = [*old_jars_list, *jars_path]
+        env_config.setString(jars_key, str(joined_jars_list))
 
     def add_classpaths(self, *classpaths: str):
         """
@@ -584,10 +586,9 @@ class StreamExecutionEnvironment(object):
         env_config = jvm.org.apache.flink.python.util.PythonConfigUtil \
             .getEnvironmentConfig(self._j_stream_execution_environment)
         old_classpaths = env_config.getString(classpaths_key, None)
-        joined_classpaths = ';'.join(list(classpaths))
-        if old_classpaths and old_classpaths.strip():
-            joined_classpaths = ';'.join([old_classpaths, joined_classpaths])
-        env_config.setString(classpaths_key, joined_classpaths)
+        old_classpaths_list = Configuration.parse_list_value(old_classpaths)
+        joined_classpaths_list = [*old_classpaths_list, *classpaths]
+        env_config.setString(classpaths_key, str(joined_classpaths_list))
 
     def get_default_local_parallelism(self) -> int:
         """
@@ -618,7 +619,6 @@ class StreamExecutionEnvironment(object):
         """
 
         j_stream_graph = self._generate_stream_graph(clear_transformations=True, job_name=job_name)
-
         return JobExecutionResult(self._j_stream_execution_environment.execute(j_stream_graph))
 
     def execute_async(self, job_name: str = 'Flink Streaming Job') -> JobClient:
@@ -633,7 +633,6 @@ class StreamExecutionEnvironment(object):
                  submission succeeded.
         """
         j_stream_graph = self._generate_stream_graph(clear_transformations=True, job_name=job_name)
-
         j_job_client = self._j_stream_execution_environment.executeAsync(j_stream_graph)
         return JobClient(j_job_client=j_job_client)
 
@@ -650,22 +649,79 @@ class StreamExecutionEnvironment(object):
         :return: The execution plan of the program, as a JSON String.
         """
         j_stream_graph = self._generate_stream_graph(False)
-
         return j_stream_graph.getStreamingPlanAsJSON()
 
+    def register_cached_file(self, file_path: str, name: str, executable: bool = False):
+        """
+        Registers a file at the distributed cache under the given name. The file will be accessible
+        from any user-defined function in the (distributed) runtime under a local path. Files may be
+        local files (which will be distributed via BlobServer), or files in a distributed file
+        system. The runtime will copy the files temporarily to a local cache, if needed.
+
+        :param file_path: The path of the file, as a URI (e.g. "file:///some/path" or
+                         hdfs://host:port/and/path").
+        :param name: The name under which the file is registered.
+        :param executable: Flag indicating whether the file should be executable.
+
+        .. versionadded:: 1.16.0
+        """
+        self._j_stream_execution_environment.registerCachedFile(file_path, name, executable)
+
     @staticmethod
-    def get_execution_environment() -> 'StreamExecutionEnvironment':
+    def get_execution_environment(configuration: Configuration = None) \
+            -> 'StreamExecutionEnvironment':
         """
         Creates an execution environment that represents the context in which the
         program is currently executed. If the program is invoked standalone, this
         method returns a local execution environment.
 
+        When executed from the command line the given configuration is stacked on top of the
+        global configuration which comes from the config.yaml, potentially overriding
+        duplicated options.
+
+        :param configuration: The configuration to instantiate the environment with.
         :return: The execution environment of the context in which the program is executed.
         """
         gateway = get_gateway()
-        j_stream_exection_environment = gateway.jvm.org.apache.flink.streaming.api.environment\
-            .StreamExecutionEnvironment.getExecutionEnvironment()
+        JStreamExecutionEnvironment = gateway.jvm.org.apache.flink.streaming.api.environment \
+            .StreamExecutionEnvironment
+
+        if configuration:
+            j_stream_exection_environment = JStreamExecutionEnvironment.getExecutionEnvironment(
+                configuration._j_configuration)
+        else:
+            j_stream_exection_environment = JStreamExecutionEnvironment.getExecutionEnvironment()
+
         return StreamExecutionEnvironment(j_stream_exection_environment)
+
+    def create_input(self, input_format: InputFormat,
+                     type_info: Optional[TypeInformation] = None):
+        """
+        Create an input data stream with InputFormat.
+
+        If the input_format needs a well-defined type information (e.g. Avro's generic record), you
+        can either explicitly use type_info argument or use InputFormats implementing
+        ResultTypeQueryable.
+
+        :param input_format: The input format to read from.
+        :param type_info: Optional type information to explicitly declare output type.
+
+        .. versionadded:: 1.16.0
+        """
+        input_type_info = type_info
+
+        if input_type_info is None and isinstance(input_format, ResultTypeQueryable):
+            input_type_info = cast(ResultTypeQueryable, input_format).get_produced_type()
+
+        if input_type_info is None:
+            j_data_stream = self._j_stream_execution_environment.createInput(
+                input_format.get_java_object()
+            )
+        else:
+            j_data_stream = self._j_stream_execution_environment.createInput(
+                input_format.get_java_object(), input_type_info.get_java_type_info()
+            )
+        return DataStream(j_data_stream=j_data_stream)
 
     def add_source(self, source_func: SourceFunction, source_name: str = 'Custom Source',
                    type_info: TypeInformation = None) -> 'DataStream':
@@ -687,20 +743,36 @@ class StreamExecutionEnvironment(object):
                                                                        j_type_info)
         return DataStream(j_data_stream=j_data_stream)
 
-    def read_text_file(self, file_path: str, charset_name: str = "UTF-8") -> DataStream:
+    def from_source(self,
+                    source: Source,
+                    watermark_strategy: WatermarkStrategy,
+                    source_name: str,
+                    type_info: TypeInformation = None) -> 'DataStream':
         """
-        Reads the given file line-by-line and creates a DataStream that contains a string with the
-        contents of each such line. The charset with the given name will be used to read the files.
+        Adds a data :class:`~pyflink.datastream.connectors.Source` to the environment to get a
+        :class:`~pyflink.datastream.DataStream`.
 
-        Note that this interface is not fault tolerant that is supposed to be used for test purpose.
+        The result will be either a bounded data stream (that can be processed in a batch way) or
+        an unbounded data stream (that must be processed in a streaming way), based on the
+        boundedness property of the source.
 
-        :param file_path: The path of the file, as a URI (e.g., "file:///some/local/file" or
-                          "hdfs://host:port/file/path")
-        :param charset_name: The name of the character set used to read the file.
-        :return: The DataStream that represents the data read from the given file as text lines.
+        This method takes an explicit type information for the produced data stream, so that
+        callers can define directly what type/serializer will be used for the produced stream. For
+        sources that describe their produced type, the parameter type_info should not be specified
+        to avoid specifying the produced type redundantly.
+
+        .. versionadded:: 1.13.0
         """
-        return DataStream(self._j_stream_execution_environment
-                          .readTextFile(file_path, charset_name))
+        if type_info:
+            j_type_info = type_info.get_java_type_info()
+        else:
+            j_type_info = None
+        j_data_stream = self._j_stream_execution_environment.fromSource(
+            source.get_java_function(),
+            watermark_strategy._j_watermark_strategy,
+            source_name,
+            j_type_info)
+        return DataStream(j_data_stream=j_data_stream)
 
     def from_collection(self, collection: List[Any],
                         type_info: TypeInformation = None) -> DataStream:
@@ -726,31 +798,42 @@ class StreamExecutionEnvironment(object):
         try:
             with temp_file:
                 # dumps elements to a temporary file by pickle serializer.
-                serializer.dump_to_stream(elements, temp_file)
+                serializer.serialize(elements, temp_file)
             gateway = get_gateway()
             # if user does not defined the element data types, read the pickled data as a byte array
             # list.
             if type_info is None:
                 j_objs = gateway.jvm.PythonBridgeUtils.readPickledBytes(temp_file.name)
-                out_put_type_info = Types.PICKLED_BYTE_ARRAY()  # type: TypeInformation
+                out_put_type_info: TypeInformation = Types.PICKLED_BYTE_ARRAY()
             else:
                 j_objs = gateway.jvm.PythonBridgeUtils.readPythonObjects(temp_file.name)
                 out_put_type_info = type_info
-            # Since flink python module depends on table module, we can make use of utils of it when
-            # implementing python DataStream API.
-            PythonTableUtils = gateway.jvm\
-                .org.apache.flink.table.planner.utils.python.PythonTableUtils
+
+            PythonTypeUtils = gateway.jvm\
+                .org.apache.flink.streaming.api.utils.PythonTypeUtils
             execution_config = self._j_stream_execution_environment.getConfig()
-            j_input_format = PythonTableUtils.getCollectionInputFormat(
+            j_input_format = PythonTypeUtils.getCollectionInputFormat(
                 j_objs,
                 out_put_type_info.get_java_type_info(),
                 execution_config
             )
 
-            j_data_stream_source = self._j_stream_execution_environment.createInput(
-                j_input_format,
-                out_put_type_info.get_java_type_info()
-            )
+            JInputFormatSourceFunction = gateway.jvm.org.apache.flink.streaming.api.functions.\
+                source.legacy.InputFormatSourceFunction
+            JBoundedness = gateway.jvm.org.apache.flink.api.connector.source.Boundedness
+
+            j_data_stream_source = invoke_method(
+                self._j_stream_execution_environment,
+                "org.apache.flink.streaming.api.environment.StreamExecutionEnvironment",
+                "addSource",
+                [JInputFormatSourceFunction(j_input_format, out_put_type_info.get_java_type_info()),
+                 "Collection Source",
+                 out_put_type_info.get_java_type_info(),
+                 JBoundedness.BOUNDED],
+                ["org.apache.flink.streaming.api.functions.source.legacy.SourceFunction",
+                 "java.lang.String",
+                 "org.apache.flink.api.common.typeinfo.TypeInformation",
+                 "org.apache.flink.api.connector.source.Boundedness"])
             j_data_stream_source.forceNonParallel()
             return DataStream(j_data_stream=j_data_stream_source)
         finally:
@@ -758,14 +841,50 @@ class StreamExecutionEnvironment(object):
 
     def _generate_stream_graph(self, clear_transformations: bool = False, job_name: str = None) \
             -> JavaObject:
-        j_stream_graph = get_gateway().jvm \
-            .org.apache.flink.python.util.PythonConfigUtil.generateStreamGraphWithDependencies(
-            self._j_stream_execution_environment, clear_transformations)
+        gateway = get_gateway()
+        JPythonConfigUtil = gateway.jvm.org.apache.flink.python.util.PythonConfigUtil
 
+        JPythonConfigUtil.configPythonOperator(self._j_stream_execution_environment)
+
+        gateway.jvm.org.apache.flink.python.chain.PythonOperatorChainingOptimizer.apply(
+            self._j_stream_execution_environment)
+
+        JPythonConfigUtil.setPartitionCustomOperatorNumPartitions(
+            get_field_value(self._j_stream_execution_environment, "transformations"))
+
+        j_stream_graph = self._j_stream_execution_environment.getStreamGraph(clear_transformations)
         if job_name is not None:
             j_stream_graph.setJobName(job_name)
-
         return j_stream_graph
+
+    def _open(self):
+        # start BeamFnLoopbackWorkerPoolServicer when executed in MiniCluster
+        j_configuration = get_j_env_configuration(self._j_stream_execution_environment)
+
+        def startup_loopback_server():
+            from pyflink.common import Configuration
+            from pyflink.fn_execution.beam.beam_worker_pool_service import \
+                BeamFnLoopbackWorkerPoolServicer
+            config = Configuration(j_configuration=j_configuration)
+            config.set_string(
+                "python.loopback-server.address",
+                BeamFnLoopbackWorkerPoolServicer().configure(config).start())
+
+        python_worker_execution_mode = os.environ.get('_python_worker_execution_mode')
+
+        if python_worker_execution_mode is None:
+            if is_local_deployment(j_configuration):
+                startup_loopback_server()
+        elif python_worker_execution_mode == 'loopback':
+            if is_local_deployment(j_configuration):
+                startup_loopback_server()
+            else:
+                raise ValueError("Loopback mode is enabled, however the job wasn't configured to "
+                                 "run in local deployment mode")
+        elif python_worker_execution_mode != 'process':
+            raise ValueError(
+                "It only supports to execute the Python worker in 'loopback' mode and 'process' "
+                "mode, unknown mode '%s' is configured" % python_worker_execution_mode)
 
     def is_unaligned_checkpoints_enabled(self):
         """
@@ -778,3 +897,12 @@ class StreamExecutionEnvironment(object):
         Returns whether Unaligned Checkpoints are force-enabled.
         """
         return self._j_stream_execution_environment.isForceUnalignedCheckpoints()
+
+    def close(self):
+        """
+        Close and clean up the execution environment. All the cached intermediate results will be
+        released physically.
+
+        .. versionadded:: 1.16.0
+        """
+        self._j_stream_execution_environment.close()

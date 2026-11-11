@@ -28,6 +28,8 @@ import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.TypeSerializerSchemaCompatibility;
 import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.runtime.state.v2.StateDescriptorUtils;
+import org.apache.flink.runtime.state.v2.adaptor.OperatorListStateAdaptor;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.StateMigrationException;
 
@@ -83,7 +85,7 @@ public class DefaultOperatorStateBackend implements OperatorStateBackend {
 
     private final Map<String, BackendWritableBroadcastState<?, ?>> accessedBroadcastStatesByName;
 
-    private final AbstractSnapshotStrategy<OperatorStateHandle> snapshotStrategy;
+    private final SnapshotStrategyRunner<OperatorStateHandle, ?> snapshotStrategyRunner;
 
     public DefaultOperatorStateBackend(
             ExecutionConfig executionConfig,
@@ -92,14 +94,14 @@ public class DefaultOperatorStateBackend implements OperatorStateBackend {
             Map<String, BackendWritableBroadcastState<?, ?>> registeredBroadcastStates,
             Map<String, PartitionableListState<?>> accessedStatesByName,
             Map<String, BackendWritableBroadcastState<?, ?>> accessedBroadcastStatesByName,
-            AbstractSnapshotStrategy<OperatorStateHandle> snapshotStrategy) {
+            SnapshotStrategyRunner<OperatorStateHandle, ?> snapshotStrategyRunner) {
         this.closeStreamOnCancelRegistry = closeStreamOnCancelRegistry;
         this.executionConfig = executionConfig;
         this.registeredOperatorStates = registeredOperatorStates;
         this.registeredBroadcastStates = registeredBroadcastStates;
         this.accessedStatesByName = accessedStatesByName;
         this.accessedBroadcastStatesByName = accessedBroadcastStatesByName;
-        this.snapshotStrategy = snapshotStrategy;
+        this.snapshotStrategyRunner = snapshotStrategyRunner;
     }
 
     public ExecutionConfig getExecutionConfig() {
@@ -217,6 +219,33 @@ public class DefaultOperatorStateBackend implements OperatorStateBackend {
     }
 
     // -------------------------------------------------------------------------------------------
+    //  State creating methods for state v2
+    // -------------------------------------------------------------------------------------------
+
+    @Override
+    public <K, V> BroadcastState<K, V> getBroadcastState(
+            org.apache.flink.api.common.state.v2.MapStateDescriptor<K, V> stateDescriptor)
+            throws Exception {
+        return getBroadcastState(StateDescriptorUtils.transformFromV2ToV1(stateDescriptor));
+    }
+
+    @Override
+    public <S> org.apache.flink.api.common.state.v2.ListState<S> getListState(
+            org.apache.flink.api.common.state.v2.ListStateDescriptor<S> stateDescriptor)
+            throws Exception {
+        return new OperatorListStateAdaptor<>(
+                getListState(StateDescriptorUtils.transformFromV2ToV1(stateDescriptor)));
+    }
+
+    @Override
+    public <S> org.apache.flink.api.common.state.v2.ListState<S> getUnionListState(
+            org.apache.flink.api.common.state.v2.ListStateDescriptor<S> stateDescriptor)
+            throws Exception {
+        return new OperatorListStateAdaptor<>(
+                getListState(StateDescriptorUtils.transformFromV2ToV1(stateDescriptor)));
+    }
+
+    // -------------------------------------------------------------------------------------------
     //  Snapshot
     // -------------------------------------------------------------------------------------------
     @Nonnull
@@ -227,15 +256,8 @@ public class DefaultOperatorStateBackend implements OperatorStateBackend {
             @Nonnull CheckpointStreamFactory streamFactory,
             @Nonnull CheckpointOptions checkpointOptions)
             throws Exception {
-
-        long syncStartTime = System.currentTimeMillis();
-
-        RunnableFuture<SnapshotResult<OperatorStateHandle>> snapshotRunner =
-                snapshotStrategy.snapshot(
-                        checkpointId, timestamp, streamFactory, checkpointOptions);
-
-        snapshotStrategy.logSyncCompleted(streamFactory, syncStartTime);
-        return snapshotRunner;
+        return snapshotStrategyRunner.snapshot(
+                checkpointId, timestamp, streamFactory, checkpointOptions);
     }
 
     private <S> ListState<S> getListState(

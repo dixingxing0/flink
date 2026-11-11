@@ -18,20 +18,17 @@
 package org.apache.flink.runtime.resourcemanager.slotmanager;
 
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.runtime.util.ResourceCounter;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
-import static org.hamcrest.Matchers.contains;
-import static org.hamcrest.Matchers.empty;
-import static org.hamcrest.core.Is.is;
-import static org.junit.Assert.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for the {@link BiDirectionalResourceToRequirementMapping}. */
-public class BiDirectionalResourceToRequirementMappingTest extends TestLogger {
+class BiDirectionalResourceToRequirementMappingTest {
 
     @Test
-    public void testIncrement() {
+    void testIncrement() {
         BiDirectionalResourceToRequirementMapping mapping =
                 new BiDirectionalResourceToRequirementMapping();
 
@@ -40,15 +37,17 @@ public class BiDirectionalResourceToRequirementMappingTest extends TestLogger {
 
         mapping.incrementCount(requirement, resource, 1);
 
-        assertThat(mapping.getRequirementsFulfilledBy(resource).get(requirement), is(1));
-        assertThat(mapping.getResourcesFulfilling(requirement).get(resource), is(1));
+        assertThat(mapping.getRequirementsFulfilledBy(resource))
+                .isEqualTo(ResourceCounter.withResource(requirement, 1));
+        assertThat(mapping.getResourcesFulfilling(requirement))
+                .isEqualTo(ResourceCounter.withResource(resource, 1));
 
-        assertThat(mapping.getAllRequirementProfiles(), contains(requirement));
-        assertThat(mapping.getAllResourceProfiles(), contains(resource));
+        assertThat(mapping.getAllRequirementProfiles()).contains(requirement);
+        assertThat(mapping.getAllResourceProfiles()).contains(resource);
     }
 
     @Test
-    public void testDecrement() {
+    void testDecrement() {
         BiDirectionalResourceToRequirementMapping mapping =
                 new BiDirectionalResourceToRequirementMapping();
 
@@ -58,13 +57,12 @@ public class BiDirectionalResourceToRequirementMappingTest extends TestLogger {
         mapping.incrementCount(requirement, resource, 1);
         mapping.decrementCount(requirement, resource, 1);
 
-        assertThat(
-                mapping.getRequirementsFulfilledBy(resource).getOrDefault(requirement, 0), is(0));
-        assertThat(mapping.getResourcesFulfilling(requirement).getOrDefault(resource, 0), is(0));
+        assertThat(mapping.getRequirementsFulfilledBy(resource).isEmpty()).isTrue();
+        assertThat(mapping.getResourcesFulfilling(requirement).isEmpty()).isTrue();
 
-        assertThat(mapping.getAllRequirementProfiles(), empty());
-        assertThat(mapping.getAllResourceProfiles(), empty());
+        assertThat(mapping.getAllRequirementProfiles()).isEmpty();
+        assertThat(mapping.getAllResourceProfiles()).isEmpty();
 
-        assertThat(mapping.isEmpty(), is(true));
+        assertThat(mapping.isEmpty()).isTrue();
     }
 }

@@ -18,38 +18,41 @@
 
 package org.apache.flink.streaming.tests;
 
-import org.apache.flink.api.common.time.Time;
-import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigOptions;
+import org.apache.flink.util.ParameterTool;
+
+import java.time.Duration;
 
 class TtlTestConfig {
     private static final ConfigOption<Integer> UPDATE_GENERATOR_SRC_KEYSPACE =
-            ConfigOptions.key("update_generator_source.keyspace").defaultValue(100);
+            ConfigOptions.key("update_generator_source.keyspace").intType().defaultValue(100);
 
     private static final ConfigOption<Long> UPDATE_GENERATOR_SRC_SLEEP_TIME =
-            ConfigOptions.key("update_generator_source.sleep_time").defaultValue(0L);
+            ConfigOptions.key("update_generator_source.sleep_time").longType().defaultValue(0L);
 
     private static final ConfigOption<Long> UPDATE_GENERATOR_SRC_SLEEP_AFTER_ELEMENTS =
-            ConfigOptions.key("update_generator_source.sleep_after_elements").defaultValue(0L);
+            ConfigOptions.key("update_generator_source.sleep_after_elements")
+                    .longType()
+                    .defaultValue(0L);
 
     private static final ConfigOption<Long> STATE_TTL_VERIFIER_TTL_MILLI =
-            ConfigOptions.key("state_ttl_verifier.ttl_milli").defaultValue(1000L);
+            ConfigOptions.key("state_ttl_verifier.ttl_milli").longType().defaultValue(1000L);
 
     private static final ConfigOption<Long> REPORT_STAT_AFTER_UPDATES_NUM =
-            ConfigOptions.key("report_stat.after_updates_num").defaultValue(200L);
+            ConfigOptions.key("report_stat.after_updates_num").longType().defaultValue(200L);
 
     final int keySpace;
     final long sleepAfterElements;
     final long sleepTime;
-    final Time ttl;
+    final Duration ttl;
     final long reportStatAfterUpdatesNum;
 
     private TtlTestConfig(
             int keySpace,
             long sleepAfterElements,
             long sleepTime,
-            Time ttl,
+            Duration ttl,
             long reportStatAfterUpdatesNum) {
         this.keySpace = keySpace;
         this.sleepAfterElements = sleepAfterElements;
@@ -71,8 +74,8 @@ class TtlTestConfig {
                 pt.getLong(
                         UPDATE_GENERATOR_SRC_SLEEP_TIME.key(),
                         UPDATE_GENERATOR_SRC_SLEEP_TIME.defaultValue());
-        Time ttl =
-                Time.milliseconds(
+        Duration ttl =
+                Duration.ofMillis(
                         pt.getLong(
                                 STATE_TTL_VERIFIER_TTL_MILLI.key(),
                                 STATE_TTL_VERIFIER_TTL_MILLI.defaultValue()));

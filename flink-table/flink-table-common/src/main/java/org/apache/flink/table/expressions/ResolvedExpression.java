@@ -19,6 +19,7 @@
 package org.apache.flink.table.expressions;
 
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.types.DataType;
 
 import java.util.List;
@@ -46,7 +47,22 @@ public interface ResolvedExpression extends Expression {
      * @return detailed string for persisting in a catalog
      */
     default String asSerializableString() {
-        throw new UnsupportedOperationException("Expressions are not string serializable for now.");
+        return asSerializableString(DefaultSqlFactory.INSTANCE);
+    }
+
+    /**
+     * Returns a string that fully serializes this instance. The serialized string can be used for
+     * storing the query in, for example, a {@link org.apache.flink.table.catalog.Catalog} as a
+     * view.
+     *
+     * @return detailed string for persisting in a catalog
+     */
+    default String asSerializableString(SqlFactory sqlFactory) {
+        throw new TableException(
+                String.format(
+                        "Expression '%s' is not string serializable. Currently, only expressions that "
+                                + "originated from a SQL expression have a well-defined string representation.",
+                        asSummaryString()));
     }
 
     /** Returns the data type of the computation result. */

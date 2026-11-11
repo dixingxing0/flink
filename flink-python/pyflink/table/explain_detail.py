@@ -18,7 +18,10 @@
 
 __all__ = ['ExplainDetail']
 
+from pyflink.util.api_stability_decorators import PublicEvolving
 
+
+@PublicEvolving()
 class ExplainDetail(object):
     """
     ExplainDetail defines the types of details for explain result.
@@ -34,3 +37,9 @@ class ExplainDetail(object):
     # The changelog mode produced by a physical rel node.
     # e.g. GroupAggregate(..., changelogMode=[I,UA,D])
     CHANGELOG_MODE = 1
+
+    # The execution plan in json format of the program.
+    JSON_EXECUTION_PLAN = 2
+
+    # The potential risk warnings and SQL optimizer tuning advice analyzed from the physical plan.
+    PLAN_ADVICE = 3

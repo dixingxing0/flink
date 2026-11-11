@@ -18,7 +18,6 @@
 
 package org.apache.flink.runtime.rest.handler.job;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.executiongraph.AccessExecutionJobVertex;
 import org.apache.flink.runtime.executiongraph.AccessExecutionVertex;
 import org.apache.flink.runtime.rest.handler.HandlerRequest;
@@ -36,6 +35,7 @@ import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 
 import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.HttpResponseStatus;
 
+import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.Executor;
 
@@ -64,7 +64,7 @@ public abstract class AbstractSubtaskHandler<
      */
     protected AbstractSubtaskHandler(
             GatewayRetriever<? extends RestfulGateway> leaderRetriever,
-            Time timeout,
+            Duration timeout,
             Map<String, String> responseHeaders,
             MessageHeaders<EmptyRequestBody, R, M> messageHeaders,
             ExecutionGraphCache executionGraphCache,
@@ -81,7 +81,7 @@ public abstract class AbstractSubtaskHandler<
 
     @Override
     protected R handleRequest(
-            HandlerRequest<EmptyRequestBody, M> request, AccessExecutionJobVertex jobVertex)
+            HandlerRequest<EmptyRequestBody> request, AccessExecutionJobVertex jobVertex)
             throws RestHandlerException {
 
         final Integer subtaskIndex = request.getPathParameter(SubtaskIndexPathParameter.class);
@@ -106,6 +106,6 @@ public abstract class AbstractSubtaskHandler<
      * @throws RestHandlerException the rest handler exception
      */
     protected abstract R handleRequest(
-            HandlerRequest<EmptyRequestBody, M> request, AccessExecutionVertex executionVertex)
+            HandlerRequest<EmptyRequestBody> request, AccessExecutionVertex executionVertex)
             throws RestHandlerException;
 }

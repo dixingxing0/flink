@@ -18,18 +18,12 @@
 
 package org.apache.flink.runtime.webmonitor;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.WebOptions;
-import org.apache.flink.core.fs.Path;
 import org.apache.flink.runtime.dispatcher.DispatcherGateway;
 import org.apache.flink.runtime.rest.handler.legacy.files.StaticFileServerHandler;
 import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 import org.apache.flink.util.FlinkException;
-
-import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
-import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.node.ArrayNode;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,9 +34,7 @@ import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
-import java.net.URI;
-import java.util.HashMap;
-import java.util.Iterator;
+import java.time.Duration;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -82,7 +74,7 @@ public final class WebMonitorUtils {
 
             if (logFilePath == null) {
                 LOG.warn("Log file environment variable '{}' is not set.", logEnv);
-                logFilePath = config.getString(WebOptions.LOG_PATH);
+                logFilePath = config.get(WebOptions.LOG_PATH);
             }
 
             // not configured, cannot serve log files
@@ -133,7 +125,7 @@ public final class WebMonitorUtils {
      * @throws IOException if we cannot create the StaticFileServerHandler
      */
     public static <T extends RestfulGateway> Optional<StaticFileServerHandler<T>> tryLoadWebContent(
-            GatewayRetriever<? extends T> leaderRetriever, Time timeout, File tmpDir)
+            GatewayRetriever<? extends T> leaderRetriever, Duration timeout, File tmpDir)
             throws IOException {
 
         if (isFlinkRuntimeWebInClassPath()) {
@@ -158,7 +150,7 @@ public final class WebMonitorUtils {
      */
     public static WebMonitorExtension loadWebSubmissionExtension(
             GatewayRetriever<? extends DispatcherGateway> leaderRetriever,
-            Time timeout,
+            Duration timeout,
             Map<String, String> responseHeaders,
             CompletableFuture<String> localAddressFuture,
             java.nio.file.Path uploadDir,
@@ -177,7 +169,7 @@ public final class WebMonitorUtils {
                                         CompletableFuture.class,
                                         java.nio.file.Path.class,
                                         Executor.class,
-                                        Time.class);
+                                        Duration.class);
 
                 return (WebMonitorExtension)
                         webSubmissionExtensionConstructor.newInstance(
@@ -200,53 +192,6 @@ public final class WebMonitorUtils {
                     "The module flink-runtime-web could not be found in the class path. Please add "
                             + "this jar in order to enable web based job submission.");
         }
-    }
-
-    public static Map<String, String> fromKeyValueJsonArray(String jsonString) {
-        try {
-            Map<String, String> map = new HashMap<>();
-            ObjectMapper m = new ObjectMapper();
-            ArrayNode array = (ArrayNode) m.readTree(jsonString);
-
-            Iterator<JsonNode> elements = array.elements();
-            while (elements.hasNext()) {
-                JsonNode node = elements.next();
-                String key = node.get("key").asText();
-                String value = node.get("value").asText();
-                map.put(key, value);
-            }
-
-            return map;
-        } catch (Exception e) {
-            throw new RuntimeException(e.getMessage(), e);
-        }
-    }
-
-    /**
-     * Checks and normalizes the given URI. This method first checks the validity of the URI (scheme
-     * and path are not null) and then normalizes the URI to a path.
-     *
-     * @param archiveDirUri The URI to check and normalize.
-     * @return A normalized URI as a Path.
-     * @throws IllegalArgumentException Thrown, if the URI misses scheme or path.
-     */
-    public static Path validateAndNormalizeUri(URI archiveDirUri) {
-        final String scheme = archiveDirUri.getScheme();
-        final String path = archiveDirUri.getPath();
-
-        // some validity checks
-        if (scheme == null) {
-            throw new IllegalArgumentException(
-                    "The scheme (hdfs://, file://, etc) is null. "
-                            + "Please specify the file system scheme explicitly in the URI.");
-        }
-        if (path == null) {
-            throw new IllegalArgumentException(
-                    "The path to store the job archive data in is null. "
-                            + "Please specify a directory path for the archiving the job data.");
-        }
-
-        return new Path(archiveDirUri);
     }
 
     /** Private constructor to prevent instantiation. */

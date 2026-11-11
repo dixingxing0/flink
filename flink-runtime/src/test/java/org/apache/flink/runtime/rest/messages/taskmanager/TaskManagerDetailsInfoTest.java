@@ -18,16 +18,23 @@
 
 package org.apache.flink.runtime.rest.messages.taskmanager;
 
+import org.apache.flink.api.common.JobID;
+import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
+import org.apache.flink.runtime.resourcemanager.TaskManagerInfoWithSlots;
 import org.apache.flink.runtime.rest.messages.RestResponseMarshallingTestBase;
+import org.apache.flink.testutils.junit.extensions.parameterized.NoOpTestExtension;
+
+import org.junit.jupiter.api.extension.ExtendWith;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Random;
 import java.util.UUID;
 
 /** Tests (un)marshalling of {@link TaskManagerDetailsInfo}. */
-public class TaskManagerDetailsInfoTest
-        extends RestResponseMarshallingTestBase<TaskManagerDetailsInfo> {
+@ExtendWith(NoOpTestExtension.class)
+class TaskManagerDetailsInfoTest extends RestResponseMarshallingTestBase<TaskManagerDetailsInfo> {
 
     private static final Random random = new Random();
 
@@ -38,10 +45,14 @@ public class TaskManagerDetailsInfoTest
 
     @Override
     protected TaskManagerDetailsInfo getTestResponseInstance() throws Exception {
-        final TaskManagerInfo taskManagerInfo = TaskManagerInfoTest.createRandomTaskManagerInfo();
+        final TaskManagerInfoWithSlots taskManagerInfoWithSlots =
+                new TaskManagerInfoWithSlots(
+                        TaskManagerInfoTest.createRandomTaskManagerInfo(),
+                        Collections.singletonList(
+                                new SlotInfo(new JobID(), ResourceProfile.ANY, 0)));
         final TaskManagerMetricsInfo taskManagerMetricsInfo = createRandomTaskManagerMetricsInfo();
 
-        return new TaskManagerDetailsInfo(taskManagerInfo, taskManagerMetricsInfo);
+        return new TaskManagerDetailsInfo(taskManagerInfoWithSlots, taskManagerMetricsInfo);
     }
 
     static TaskManagerMetricsInfo createRandomTaskManagerMetricsInfo() {

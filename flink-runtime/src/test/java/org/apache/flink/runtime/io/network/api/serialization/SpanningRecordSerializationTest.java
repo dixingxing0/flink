@@ -33,14 +33,12 @@ import org.apache.flink.testutils.serialization.types.SerializationTestType;
 import org.apache.flink.testutils.serialization.types.SerializationTestTypeFactory;
 import org.apache.flink.testutils.serialization.types.Util;
 import org.apache.flink.util.CloseableIterator;
-import org.apache.flink.util.TestLogger;
 
-import org.junit.Assert;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
@@ -53,15 +51,16 @@ import java.util.Random;
 
 import static org.apache.flink.runtime.io.network.buffer.BufferBuilderTestUtils.buildSingleBuffer;
 import static org.apache.flink.runtime.io.network.buffer.BufferBuilderTestUtils.createFilledBufferBuilder;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for the {@link SpillingAdaptiveSpanningRecordDeserializer}. */
-public class SpanningRecordSerializationTest extends TestLogger {
+class SpanningRecordSerializationTest {
     private static final Random RANDOM = new Random(42);
 
-    @Rule public TemporaryFolder tempFolder = new TemporaryFolder();
+    @TempDir private File tempFolder;
 
     @Test
-    public void testIntRecordsSpanningMultipleSegments() throws Exception {
+    void testIntRecordsSpanningMultipleSegments() throws Exception {
         final int segmentSize = 1;
         final int numValues = 10;
 
@@ -70,7 +69,7 @@ public class SpanningRecordSerializationTest extends TestLogger {
     }
 
     @Test
-    public void testIntRecordsWithAlignedBuffers() throws Exception {
+    void testIntRecordsWithAlignedBuffers() throws Exception {
         final int segmentSize = 64;
         final int numValues = 64;
 
@@ -79,7 +78,7 @@ public class SpanningRecordSerializationTest extends TestLogger {
     }
 
     @Test
-    public void testIntRecordsWithUnalignedBuffers() throws Exception {
+    void testIntRecordsWithUnalignedBuffers() throws Exception {
         final int segmentSize = 31;
         final int numValues = 248;
 
@@ -88,7 +87,7 @@ public class SpanningRecordSerializationTest extends TestLogger {
     }
 
     @Test
-    public void testRandomRecords() throws Exception {
+    void testRandomRecords() throws Exception {
         final int segmentSize = 127;
         final int numValues = 10000;
 
@@ -96,7 +95,7 @@ public class SpanningRecordSerializationTest extends TestLogger {
     }
 
     @Test
-    public void testHandleMixedLargeRecords() throws Exception {
+    void testHandleMixedLargeRecords() throws Exception {
         final int numValues = 99;
         final int segmentSize = 32 * 1024;
 
@@ -121,7 +120,7 @@ public class SpanningRecordSerializationTest extends TestLogger {
             Iterable<SerializationTestType> records, int segmentSize) throws Exception {
         RecordDeserializer<SerializationTestType> deserializer =
                 new SpillingAdaptiveSpanningRecordDeserializer<>(
-                        new String[] {tempFolder.getRoot().getAbsolutePath()});
+                        new String[] {tempFolder.getAbsolutePath()});
 
         testSerializationRoundTrip(records, segmentSize, deserializer);
     }
@@ -173,7 +172,7 @@ public class SpanningRecordSerializationTest extends TestLogger {
                     deserializer.setNextBuffer(serializationResult.buildBuffer());
                 }
             }
-            Assert.assertFalse(serializedRecord.hasRemaining());
+            assertThat(serializedRecord.hasRemaining()).isFalse();
         }
 
         // deserialize left over records
@@ -185,21 +184,20 @@ public class SpanningRecordSerializationTest extends TestLogger {
             SerializationTestType actual = expected.getClass().newInstance();
             RecordDeserializer.DeserializationResult result = deserializer.getNextRecord(actual);
 
-            Assert.assertTrue(result.isFullRecord());
-            Assert.assertEquals(expected, actual);
+            assertThat(result.isFullRecord()).isTrue();
+            assertThat(actual).isEqualTo(expected);
             numRecords--;
         }
 
         // assert that all records have been serialized and deserialized
-        Assert.assertEquals(0, numRecords);
-        Assert.assertFalse(deserializer.hasUnfinishedData());
+        assertThat(numRecords).isZero();
     }
 
     @Test
-    public void testSmallRecordUnconsumedBuffer() throws Exception {
+    void testSmallRecordUnconsumedBuffer() throws Exception {
         RecordDeserializer<SerializationTestType> deserializer =
                 new SpillingAdaptiveSpanningRecordDeserializer<>(
-                        new String[] {tempFolder.getRoot().getAbsolutePath()});
+                        new String[] {tempFolder.getAbsolutePath()});
 
         testUnconsumedBuffer(
                 deserializer, Util.randomRecord(SerializationTestTypeFactory.INT), 1024);
@@ -210,29 +208,29 @@ public class SpanningRecordSerializationTest extends TestLogger {
      * by byte.
      */
     @Test
-    public void testSpanningRecordUnconsumedBuffer() throws Exception {
+    void testSpanningRecordUnconsumedBuffer() throws Exception {
         RecordDeserializer<SerializationTestType> deserializer =
                 new SpillingAdaptiveSpanningRecordDeserializer<>(
-                        new String[] {tempFolder.getRoot().getAbsolutePath()});
+                        new String[] {tempFolder.getAbsolutePath()});
 
         testUnconsumedBuffer(deserializer, Util.randomRecord(SerializationTestTypeFactory.INT), 1);
     }
 
     @Test
-    public void testLargeSpanningRecordUnconsumedBuffer() throws Exception {
+    void testLargeSpanningRecordUnconsumedBuffer() throws Exception {
         RecordDeserializer<SerializationTestType> deserializer =
                 new SpillingAdaptiveSpanningRecordDeserializer<>(
-                        new String[] {tempFolder.getRoot().getAbsolutePath()});
+                        new String[] {tempFolder.getAbsolutePath()});
 
         testUnconsumedBuffer(
                 deserializer, Util.randomRecord(SerializationTestTypeFactory.BYTE_ARRAY), 1);
     }
 
     @Test
-    public void testLargeSpanningRecordUnconsumedBufferWithLeftOverBytes() throws Exception {
+    void testLargeSpanningRecordUnconsumedBufferWithLeftOverBytes() throws Exception {
         RecordDeserializer<SerializationTestType> deserializer =
                 new SpillingAdaptiveSpanningRecordDeserializer<>(
-                        new String[] {tempFolder.getRoot().getAbsolutePath()});
+                        new String[] {tempFolder.getAbsolutePath()});
 
         testUnconsumedBuffer(
                 deserializer,
@@ -249,7 +247,7 @@ public class SpanningRecordSerializationTest extends TestLogger {
                 new byte[] {42, 43, 44});
     }
 
-    public void testUnconsumedBuffer(
+    private static void testUnconsumedBuffer(
             RecordDeserializer<SerializationTestType> deserializer,
             SerializationTestType record,
             int segmentSize,
@@ -293,27 +291,28 @@ public class SpanningRecordSerializationTest extends TestLogger {
     }
 
     private static Buffer appendLeftOverBytes(Buffer buffer, byte[] leftOverBytes) {
-        BufferBuilder bufferBuilder =
+        try (BufferBuilder bufferBuilder =
                 new BufferBuilder(
                         MemorySegmentFactory.allocateUnpooledSegment(
                                 buffer.readableBytes() + leftOverBytes.length),
-                        FreeingBufferRecycler.INSTANCE);
-        try (BufferConsumer bufferConsumer = bufferBuilder.createBufferConsumer()) {
-            bufferBuilder.append(buffer.getNioBufferReadable());
-            bufferBuilder.appendAndCommit(ByteBuffer.wrap(leftOverBytes));
-            return bufferConsumer.build();
+                        FreeingBufferRecycler.INSTANCE)) {
+            try (BufferConsumer bufferConsumer = bufferBuilder.createBufferConsumer()) {
+                bufferBuilder.append(buffer.getNioBufferReadable());
+                bufferBuilder.appendAndCommit(ByteBuffer.wrap(leftOverBytes));
+                return bufferConsumer.build();
+            }
         }
     }
 
     private static void assertUnconsumedBuffer(
             ByteArrayOutputStream expected, CloseableIterator<Buffer> actual) throws Exception {
         if (!actual.hasNext()) {
-            Assert.assertEquals(expected.size(), 0);
+            assertThat(expected.size()).isZero();
         }
 
         ByteBuffer expectedByteBuffer = ByteBuffer.wrap(expected.toByteArray());
         ByteBuffer actualByteBuffer = actual.next().getNioBufferReadable();
-        Assert.assertEquals(expectedByteBuffer, actualByteBuffer);
+        assertThat(actualByteBuffer).isEqualTo(expectedByteBuffer);
         actual.close();
     }
 
@@ -332,6 +331,10 @@ public class SpanningRecordSerializationTest extends TestLogger {
                 createFilledBufferBuilder(segmentSize + startingOffset, startingOffset);
         BufferConsumer bufferConsumer = bufferBuilder.createBufferConsumer();
         bufferConsumer.build().recycleBuffer();
+
+        // Closing the BufferBuilder here just allow to be sure that Buffer will be recovered when
+        // BufferConsumer will be closed.
+        bufferBuilder.close();
 
         bufferBuilder.appendAndCommit(serializedRecord);
         return new BufferAndSerializerResult(

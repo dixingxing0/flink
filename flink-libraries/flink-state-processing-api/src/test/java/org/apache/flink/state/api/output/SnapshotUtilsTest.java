@@ -18,51 +18,79 @@
 
 package org.apache.flink.state.api.output;
 
-import org.apache.flink.api.common.JobID;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.core.execution.CheckpointingMode;
+import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.core.fs.Path;
-import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.groups.OperatorMetricGroup;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.runtime.checkpoint.SavepointType;
+import org.apache.flink.runtime.checkpoint.SnapshotType;
 import org.apache.flink.runtime.jobgraph.OperatorID;
-import org.apache.flink.runtime.state.CheckpointStorageWorkerView;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
-import org.apache.flink.runtime.state.ttl.mock.MockStateBackend;
 import org.apache.flink.streaming.api.operators.OperatorSnapshotFutures;
 import org.apache.flink.streaming.api.operators.StreamOperator;
 import org.apache.flink.streaming.api.operators.StreamTaskStateInitializer;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 
-import org.junit.Assert;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
+import static org.assertj.core.api.Assertions.assertThat;
+
 /** Tests that snapshot utils can properly snapshot an operator. */
-public class SnapshotUtilsTest {
+class SnapshotUtilsTest {
 
     private static final List<String> EXPECTED_CALL_OPERATOR_SNAPSHOT =
             Arrays.asList("prepareSnapshotPreBarrier", "snapshotState", "notifyCheckpointComplete");
 
-    @Rule public TemporaryFolder folder = new TemporaryFolder();
+    @TempDir private File folder;
 
     private static final List<String> ACTUAL_ORDER_TRACKING =
             Collections.synchronizedList(new ArrayList<>(EXPECTED_CALL_OPERATOR_SNAPSHOT.size()));
 
+    private static SnapshotType actualSnapshotType;
+
     @Test
-    public void testSnapshotUtilsLifecycle() throws Exception {
+    void testSnapshotUtilsLifecycleWithDefaultSavepointFormatType() throws Exception {
+        testSnapshotUtilsLifecycleWithSavepointFormatType(SavepointFormatType.DEFAULT);
+    }
+
+    @Test
+    void testSnapshotUtilsLifecycleWithCanonicalSavepointFormatType() throws Exception {
+        testSnapshotUtilsLifecycleWithSavepointFormatType(SavepointFormatType.CANONICAL);
+    }
+
+    @Test
+    void testSnapshotUtilsLifecycleWithNativeSavepointFormatType() throws Exception {
+        testSnapshotUtilsLifecycleWithSavepointFormatType(SavepointFormatType.NATIVE);
+    }
+
+    private void testSnapshotUtilsLifecycleWithSavepointFormatType(
+            SavepointFormatType savepointFormatType) throws Exception {
+        ACTUAL_ORDER_TRACKING.clear();
         StreamOperator<Void> operator = new LifecycleOperator();
-        CheckpointStorageWorkerView storage =
-                new MockStateBackend().createCheckpointStorage(new JobID());
+        Path path = new Path(folder.getAbsolutePath());
 
-        Path path = new Path(folder.newFolder().getAbsolutePath());
+        SnapshotUtils.snapshot(
+                0L,
+                operator,
+                0,
+                0L,
+                CheckpointingMode.EXACTLY_ONCE,
+                false,
+                new Configuration(),
+                path,
+                savepointFormatType);
 
-        SnapshotUtils.snapshot(operator, 0, 0L, true, false, storage, path);
-
-        Assert.assertEquals(EXPECTED_CALL_OPERATOR_SNAPSHOT, ACTUAL_ORDER_TRACKING);
+        assertThat(actualSnapshotType).isEqualTo(SavepointType.savepoint(savepointFormatType));
+        assertThat(ACTUAL_ORDER_TRACKING).isEqualTo(EXPECTED_CALL_OPERATOR_SNAPSHOT);
     }
 
     private static class LifecycleOperator implements StreamOperator<Void> {
@@ -74,13 +102,13 @@ public class SnapshotUtilsTest {
         }
 
         @Override
-        public void close() throws Exception {
-            ACTUAL_ORDER_TRACKING.add("close");
+        public void finish() throws Exception {
+            ACTUAL_ORDER_TRACKING.add("finish");
         }
 
         @Override
-        public void dispose() throws Exception {
-            ACTUAL_ORDER_TRACKING.add("dispose");
+        public void close() throws Exception {
+            ACTUAL_ORDER_TRACKING.add("close");
         }
 
         @Override
@@ -96,6 +124,7 @@ public class SnapshotUtilsTest {
                 CheckpointStreamFactory storageLocation)
                 throws Exception {
             ACTUAL_ORDER_TRACKING.add("snapshotState");
+            actualSnapshotType = checkpointOptions.getCheckpointType();
             return new OperatorSnapshotFutures();
         }
 
@@ -116,7 +145,7 @@ public class SnapshotUtilsTest {
         }
 
         @Override
-        public MetricGroup getMetricGroup() {
+        public OperatorMetricGroup getMetricGroup() {
             ACTUAL_ORDER_TRACKING.add("getMetricGroup");
             return null;
         }

@@ -20,6 +20,7 @@ package org.apache.flink.table.api;
 
 import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
 
@@ -68,62 +69,8 @@ public interface TableResult {
     void await(long timeout, TimeUnit unit)
             throws InterruptedException, ExecutionException, TimeoutException;
 
-    /**
-     * Get the schema of result.
-     *
-     * <p>The schema of DDL, USE, EXPLAIN:
-     *
-     * <pre>
-     * +-------------+-------------+----------+
-     * | column name | column type | comments |
-     * +-------------+-------------+----------+
-     * | result      | STRING      |          |
-     * +-------------+-------------+----------+
-     * </pre>
-     *
-     * <p>The schema of SHOW:
-     *
-     * <pre>
-     * +---------------+-------------+----------+
-     * |  column name  | column type | comments |
-     * +---------------+-------------+----------+
-     * | &lt;object name&gt; | STRING      |          |
-     * +---------------+-------------+----------+
-     * The column name of `SHOW CATALOGS` is "catalog name",
-     * the column name of `SHOW DATABASES` is "database name",
-     * the column name of `SHOW TABLES` is "table name",
-     * the column name of `SHOW VIEWS` is "view name",
-     * the column name of `SHOW FUNCTIONS` is "function name".
-     * </pre>
-     *
-     * <p>The schema of DESCRIBE:
-     *
-     * <pre>
-     * +------------------+-------------+-----------------------------------------------------------------------------+
-     * | column name      | column type |                              comments                                       |
-     * +------------------+-------------+-----------------------------------------------------------------------------+
-     * | name             | STRING      | field name                                                                  |
-     * | type             | STRING      | field type expressed as a String                                            |
-     * | null             | BOOLEAN     | field nullability: true if a field is nullable, else false                  |
-     * | key              | BOOLEAN     | key constraint: 'PRI' for primary keys, 'UNQ' for unique keys, else null    |
-     * | computed column  | STRING      | computed column: string expression if a field is computed column, else null |
-     * | watermark        | STRING      | watermark: string expression if a field is watermark, else null             |
-     * +------------------+-------------+-----------------------------------------------------------------------------+
-     * </pre>
-     *
-     * <p>The schema of INSERT: (one column per one sink)
-     *
-     * <pre>
-     * +----------------------------+-------------+-----------------------+
-     * | column name                | column type | comments              |
-     * +----------------------------+-------------+-----------------------+
-     * | (name of the insert table) | BIGINT      | the insert table name |
-     * +----------------------------+-------------+-----------------------+
-     * </pre>
-     *
-     * <p>The schema of SELECT is the selected field names and types.
-     */
-    TableSchema getTableSchema();
+    /** Returns the schema of the result. */
+    ResolvedSchema getResolvedSchema();
 
     /**
      * Return the {@link ResultKind} which represents the result type.
@@ -163,7 +110,7 @@ public interface TableResult {
      *
      * <p>This method has slightly different behaviors under different checkpointing settings (to
      * enable checkpointing for a streaming job, set checkpointing properties through {@link
-     * TableConfig#getConfiguration()}).
+     * TableConfig}).
      *
      * <ul>
      *   <li>For batch jobs or streaming jobs without checkpointing, this method has neither
@@ -190,7 +137,7 @@ public interface TableResult {
      *
      * <p>This method has slightly different behaviors under different checkpointing settings (to
      * enable checkpointing for a streaming job, set checkpointing properties through {@link
-     * TableConfig#getConfiguration()}).
+     * TableConfig}).
      *
      * <ul>
      *   <li>For batch jobs or streaming jobs without checkpointing, this method has neither

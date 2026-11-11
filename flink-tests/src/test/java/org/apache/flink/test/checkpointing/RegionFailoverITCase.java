@@ -19,6 +19,7 @@
 package org.apache.flink.test.checkpointing;
 
 import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.functions.RichMapFunction;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
@@ -29,40 +30,38 @@ import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.client.program.ClusterClient;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.ExternalizedCheckpointRetention;
 import org.apache.flink.configuration.HighAvailabilityOptions;
 import org.apache.flink.configuration.JobManagerOptions;
+import org.apache.flink.core.execution.CheckpointingMode;
 import org.apache.flink.runtime.checkpoint.CheckpointRecoveryFactory;
 import org.apache.flink.runtime.checkpoint.CheckpointsCleaner;
 import org.apache.flink.runtime.checkpoint.CompletedCheckpoint;
 import org.apache.flink.runtime.checkpoint.PerJobCheckpointRecoveryFactory;
-import org.apache.flink.runtime.checkpoint.StandaloneCheckpointIDCounter;
 import org.apache.flink.runtime.checkpoint.StandaloneCompletedCheckpointStore;
 import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
 import org.apache.flink.runtime.highavailability.HighAvailabilityServicesFactory;
-import org.apache.flink.runtime.highavailability.nonha.embedded.EmbeddedHaServices;
+import org.apache.flink.runtime.highavailability.nonha.embedded.EmbeddedHaServicesWithLeadershipControl;
 import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
-import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.checkpoint.ListCheckpointed;
 import org.apache.flink.streaming.api.datastream.DataStreamUtils;
-import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
-import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
-import org.apache.flink.test.util.MiniClusterWithClientResource;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.streaming.api.functions.sink.legacy.RichSinkFunction;
+import org.apache.flink.streaming.api.functions.source.legacy.RichParallelSourceFunction;
+import org.apache.flink.test.junit5.InjectClusterClient;
+import org.apache.flink.test.junit5.MiniClusterExtension;
+import org.apache.flink.util.TestLoggerExtension;
 
-import org.apache.commons.collections.CollectionUtils;
-import org.junit.AfterClass;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.ClassRule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.io.IOException;
 import java.util.Collections;
@@ -71,6 +70,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
@@ -78,10 +78,11 @@ import java.util.stream.IntStream;
 import java.util.stream.StreamSupport;
 
 import static org.apache.flink.test.util.TestUtils.submitJobAndWaitForResult;
-import static org.junit.Assert.assertEquals;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for region failover with multi regions. */
-public class RegionFailoverITCase extends TestLogger {
+@ExtendWith(TestLoggerExtension.class)
+class RegionFailoverITCase {
 
     private static final int FAIL_BASE = 1000;
     private static final int NUM_OF_REGIONS = 3;
@@ -101,36 +102,28 @@ public class RegionFailoverITCase extends TestLogger {
 
     private static Map<Long, Integer> snapshotIndicesOfSubTask = new HashMap<>();
 
-    private static MiniClusterWithClientResource cluster;
+    @RegisterExtension
+    private static final MiniClusterExtension MINI_CLUSTER_EXTENSION =
+            new MiniClusterExtension(
+                    new MiniClusterResourceConfiguration.Builder()
+                            .setConfiguration(
+                                    new Configuration()
+                                            .set(
+                                                    JobManagerOptions.EXECUTION_FAILOVER_STRATEGY,
+                                                    "region")
+                                            .set(
+                                                    HighAvailabilityOptions.HA_MODE,
+                                                    TestingHAFactory.class.getName()))
+                            .setNumberTaskManagers(2)
+                            .setNumberSlotsPerTaskManager(2)
+                            .build());
 
     private static boolean restoredState = false;
 
-    @ClassRule public static final TemporaryFolder TEMPORARY_FOLDER = new TemporaryFolder();
-
-    @Before
-    public void setup() throws Exception {
-        Configuration configuration = new Configuration();
-        configuration.setString(JobManagerOptions.EXECUTION_FAILOVER_STRATEGY, "region");
-        configuration.setString(HighAvailabilityOptions.HA_MODE, TestingHAFactory.class.getName());
-
-        cluster =
-                new MiniClusterWithClientResource(
-                        new MiniClusterResourceConfiguration.Builder()
-                                .setConfiguration(configuration)
-                                .setNumberTaskManagers(2)
-                                .setNumberSlotsPerTaskManager(2)
-                                .build());
-        cluster.before();
+    @BeforeEach
+    void setup() throws Exception {
         jobFailedCnt.set(0);
         numCompletedCheckpoints.set(0);
-    }
-
-    @AfterClass
-    public static void shutDownExistingCluster() {
-        if (cluster != null) {
-            cluster.after();
-            cluster = null;
-        }
     }
 
     /**
@@ -140,31 +133,27 @@ public class RegionFailoverITCase extends TestLogger {
      * NUM_OF_RESTARTS} times, and it will verify whether the restored state is identical to last
      * completed checkpoint's.
      */
-    @Test(timeout = 60000)
-    public void testMultiRegionFailover() {
-        try {
-            JobGraph jobGraph = createJobGraph();
-            ClusterClient<?> client = cluster.getClusterClient();
-            submitJobAndWaitForResult(client, jobGraph, getClass().getClassLoader());
-            verifyAfterJobExecuted();
-        } catch (Exception e) {
-            e.printStackTrace();
-            Assert.fail(e.getMessage());
-        }
+    @Test
+    @Timeout(value = 1, unit = TimeUnit.MINUTES)
+    void testMultiRegionFailover(@InjectClusterClient ClusterClient<?> client) throws Exception {
+        JobGraph jobGraph = createJobGraph();
+        submitJobAndWaitForResult(client, jobGraph, getClass().getClassLoader());
+        verifyAfterJobExecuted();
     }
 
     private void verifyAfterJobExecuted() {
-        Assert.assertTrue(
-                "The test multi-region job has never ever restored state.", restoredState);
+        assertThat(restoredState)
+                .as("The test multi-region job has never ever restored state.")
+                .isTrue();
 
         int keyCount = 0;
         for (Map<Integer, Integer> map : ValidatingSink.maps) {
             for (Map.Entry<Integer, Integer> entry : map.entrySet()) {
-                assertEquals(4 * entry.getKey() + 1, (int) entry.getValue());
+                assertThat(entry.getValue()).isEqualTo(4 * entry.getKey() + 1);
                 keyCount += 1;
             }
         }
-        assertEquals(NUM_ELEMENTS / 2, keyCount);
+        assertThat(keyCount).isEqualTo(NUM_ELEMENTS / 2);
     }
 
     private JobGraph createJobGraph() {
@@ -174,8 +163,8 @@ public class RegionFailoverITCase extends TestLogger {
         env.setMaxParallelism(MAX_PARALLELISM);
         env.enableCheckpointing(200, CheckpointingMode.EXACTLY_ONCE);
         env.getCheckpointConfig()
-                .enableExternalizedCheckpoints(
-                        CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
+                .setExternalizedCheckpointRetention(
+                        ExternalizedCheckpointRetention.RETAIN_ON_CANCELLATION);
         env.disableOperatorChaining();
 
         // Use DataStreamUtils#reinterpretAsKeyed to avoid merge regions and this stream graph would
@@ -242,7 +231,7 @@ public class RegionFailoverITCase extends TestLogger {
                 index = 0;
             }
 
-            int subTaskIndex = getRuntimeContext().getIndexOfThisSubtask();
+            int subTaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
             while (isRunning && index < numElements) {
 
                 synchronized (ctx.getCheckpointLock()) {
@@ -284,22 +273,20 @@ public class RegionFailoverITCase extends TestLogger {
 
         @Override
         public void snapshotState(FunctionSnapshotContext context) throws Exception {
-            int indexOfThisSubtask = getRuntimeContext().getIndexOfThisSubtask();
+            int indexOfThisSubtask = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
             if (indexOfThisSubtask != 0) {
-                listState.clear();
-                listState.add(index);
+                listState.update(Collections.singletonList(index));
                 if (indexOfThisSubtask == NUM_OF_REGIONS - 1) {
                     lastRegionIndex = index;
                     snapshotIndicesOfSubTask.put(context.getCheckpointId(), lastRegionIndex);
                 }
             }
-            unionListState.clear();
-            unionListState.add(indexOfThisSubtask);
+            unionListState.update(Collections.singletonList(indexOfThisSubtask));
         }
 
         @Override
         public void initializeState(FunctionInitializationContext context) throws Exception {
-            int indexOfThisSubtask = getRuntimeContext().getIndexOfThisSubtask();
+            int indexOfThisSubtask = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
             if (context.isRestored()) {
                 restoredState = true;
 
@@ -308,26 +295,27 @@ public class RegionFailoverITCase extends TestLogger {
                 Set<Integer> actualIndices =
                         StreamSupport.stream(unionListState.get().spliterator(), false)
                                 .collect(Collectors.toSet());
-                if (getRuntimeContext().getTaskName().contains(SINGLE_REGION_SOURCE_NAME)) {
-                    Assert.assertTrue(
-                            CollectionUtils.isEqualCollection(
-                                    EXPECTED_INDICES_SINGLE_REGION, actualIndices));
+                if (getRuntimeContext()
+                        .getTaskInfo()
+                        .getTaskName()
+                        .contains(SINGLE_REGION_SOURCE_NAME)) {
+                    assertThat(actualIndices)
+                            .containsExactlyElementsOf(EXPECTED_INDICES_SINGLE_REGION);
                 } else {
-                    Assert.assertTrue(
-                            CollectionUtils.isEqualCollection(
-                                    EXPECTED_INDICES_MULTI_REGION, actualIndices));
+                    assertThat(actualIndices)
+                            .containsExactlyElementsOf(EXPECTED_INDICES_MULTI_REGION);
                 }
 
                 if (indexOfThisSubtask == 0) {
                     listState = context.getOperatorStateStore().getListState(stateDescriptor);
-                    Assert.assertTrue(
-                            "list state should be empty for subtask-0",
-                            ((List<Integer>) listState.get()).isEmpty());
+                    assertThat(listState.get())
+                            .as("list state should be empty for subtask-0")
+                            .isEmpty();
                 } else {
                     listState = context.getOperatorStateStore().getListState(stateDescriptor);
-                    Assert.assertTrue(
-                            "list state should not be empty for subtask-" + indexOfThisSubtask,
-                            ((List<Integer>) listState.get()).size() > 0);
+                    assertThat(listState.get())
+                            .as("list state should not be empty for subtask-" + indexOfThisSubtask)
+                            .isNotEmpty();
 
                     if (indexOfThisSubtask == NUM_OF_REGIONS - 1) {
                         index = listState.get().iterator().next();
@@ -359,8 +347,8 @@ public class RegionFailoverITCase extends TestLogger {
         private ValueState<Integer> valueState;
 
         @Override
-        public void open(Configuration parameters) throws Exception {
-            super.open(parameters);
+        public void open(OpenContext openContext) throws Exception {
+            super.open(openContext);
             valueState =
                     getRuntimeContext()
                             .getState(new ValueStateDescriptor<>("value", Integer.class));
@@ -372,7 +360,7 @@ public class RegionFailoverITCase extends TestLogger {
 
         @Override
         public Tuple2<Integer, Integer> map(Tuple2<Integer, Integer> input) throws Exception {
-            int indexOfThisSubtask = getRuntimeContext().getIndexOfThisSubtask();
+            int indexOfThisSubtask = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
 
             if (input.f1 > FAIL_BASE * (jobFailedCnt.get() + 1)) {
 
@@ -417,7 +405,7 @@ public class RegionFailoverITCase extends TestLogger {
 
         @Override
         public void close() throws Exception {
-            maps[getRuntimeContext().getIndexOfThisSubtask()] = counts;
+            maps[getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()] = counts;
         }
 
         @Override
@@ -440,20 +428,6 @@ public class RegionFailoverITCase extends TestLogger {
         private static final long serialVersionUID = 1L;
     }
 
-    private static class TestingHaServices extends EmbeddedHaServices {
-        private final CheckpointRecoveryFactory checkpointRecoveryFactory;
-
-        TestingHaServices(CheckpointRecoveryFactory checkpointRecoveryFactory, Executor executor) {
-            super(executor);
-            this.checkpointRecoveryFactory = checkpointRecoveryFactory;
-        }
-
-        @Override
-        public CheckpointRecoveryFactory getCheckpointRecoveryFactory() {
-            return checkpointRecoveryFactory;
-        }
-    }
-
     /**
      * An extension of {@link StandaloneCompletedCheckpointStore} which would record information of
      * last completed checkpoint id and the number of completed checkpoints.
@@ -466,17 +440,20 @@ public class RegionFailoverITCase extends TestLogger {
         }
 
         @Override
-        public void addCheckpoint(
+        public CompletedCheckpoint addCheckpointAndSubsumeOldestOne(
                 CompletedCheckpoint checkpoint,
                 CheckpointsCleaner checkpointsCleaner,
                 Runnable postCleanup)
                 throws Exception {
-            super.addCheckpoint(checkpoint, checkpointsCleaner, postCleanup);
+            CompletedCheckpoint subsumedCheckpoint =
+                    super.addCheckpointAndSubsumeOldestOne(
+                            checkpoint, checkpointsCleaner, postCleanup);
             // we record the information when adding completed checkpoint instead of
             // 'notifyCheckpointComplete' invoked
             // on task side to avoid race condition. See FLINK-13601.
             lastCompletedCheckpointId.set(checkpoint.getCheckpointID());
             numCompletedCheckpoints.incrementAndGet();
+            return subsumedCheckpoint;
         }
     }
 
@@ -486,11 +463,10 @@ public class RegionFailoverITCase extends TestLogger {
         @Override
         public HighAvailabilityServices createHAServices(
                 Configuration configuration, Executor executor) {
-            return new TestingHaServices(
-                    PerJobCheckpointRecoveryFactory.useSameServicesForAllJobs(
-                            new TestingCompletedCheckpointStore(),
-                            new StandaloneCheckpointIDCounter()),
-                    executor);
+            final CheckpointRecoveryFactory checkpointRecoveryFactory =
+                    PerJobCheckpointRecoveryFactory.withoutCheckpointStoreRecovery(
+                            maxCheckpoints -> new TestingCompletedCheckpointStore());
+            return new EmbeddedHaServicesWithLeadershipControl(executor, checkpointRecoveryFactory);
         }
     }
 }

@@ -20,53 +20,62 @@ package org.apache.flink.test.checkpointing;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.functions.RichFlatMapFunction;
-import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.time.Deadline;
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
 import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.client.program.ClusterClient;
 import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.StateBackendOptions;
+import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.runtime.client.JobExecutionException;
 import org.apache.flink.runtime.client.JobStatusMessage;
-import org.apache.flink.runtime.concurrent.FutureUtils;
-import org.apache.flink.runtime.executiongraph.ExecutionJobVertex;
 import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobgraph.JobVertex;
 import org.apache.flink.runtime.jobgraph.SavepointRestoreSettings;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
-import org.apache.flink.runtime.testingUtils.TestingUtils;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.checkpoint.ListCheckpointed;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.sink.DiscardingSink;
-import org.apache.flink.streaming.api.functions.sink.SinkFunction;
-import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
-import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.streaming.api.functions.sink.legacy.SinkFunction;
+import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
+import org.apache.flink.streaming.api.functions.source.legacy.RichParallelSourceFunction;
+import org.apache.flink.streaming.api.functions.source.legacy.SourceFunction;
+import org.apache.flink.streaming.util.RestartStrategyUtils;
 import org.apache.flink.test.util.MiniClusterWithClientResource;
+import org.apache.flink.testutils.TestingUtils;
+import org.apache.flink.testutils.executor.TestExecutorExtension;
+import org.apache.flink.testutils.junit.extensions.parameterized.Parameter;
+import org.apache.flink.testutils.junit.extensions.parameterized.ParameterizedTestExtension;
+import org.apache.flink.testutils.junit.extensions.parameterized.Parameters;
+import org.apache.flink.testutils.junit.utils.TempDirUtils;
 import org.apache.flink.util.Collector;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.util.TestLoggerExtension;
+import org.apache.flink.util.concurrent.FixedRetryStrategy;
+import org.apache.flink.util.concurrent.FutureUtils;
+import org.apache.flink.util.concurrent.ScheduledExecutorServiceAdapter;
 
-import org.junit.AfterClass;
-import org.junit.Before;
-import org.junit.ClassRule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
@@ -75,29 +84,32 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import static org.apache.flink.runtime.testutils.CommonTestUtils.waitForAllTaskRunning;
 import static org.apache.flink.test.util.TestUtils.submitJobAndWaitForResult;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test savepoint rescaling. */
-@RunWith(Parameterized.class)
-public class RescalingITCase extends TestLogger {
+@ExtendWith({TestLoggerExtension.class, ParameterizedTestExtension.class})
+class RescalingITCase {
+
+    @RegisterExtension
+    private static final TestExecutorExtension<ScheduledExecutorService> EXECUTOR_RESOURCE =
+            TestingUtils.defaultExecutorExtension();
 
     private static final int numTaskManagers = 2;
     private static final int slotsPerTaskManager = 2;
     private static final int numSlots = numTaskManagers * slotsPerTaskManager;
 
-    @Parameterized.Parameters(name = "backend = {0}")
-    public static Object[] data() {
-        return new Object[] {"filesystem", "rocksdb"};
+    @Parameter private String backend;
+
+    @Parameters(name = "backend = {0}")
+    private static Collection<Object[]> data() {
+        return Arrays.asList(new Object[][] {{"hashmap"}, {"rocksdb"}});
     }
-
-    @Parameterized.Parameter public String backend;
-
-    private String currentBackend = null;
 
     enum OperatorCheckpointMethod {
         NON_PARTITIONED,
@@ -106,65 +118,56 @@ public class RescalingITCase extends TestLogger {
         LIST_CHECKPOINTED
     }
 
-    private static MiniClusterWithClientResource cluster;
+    private MiniClusterWithClientResource cluster;
 
-    @ClassRule public static TemporaryFolder temporaryFolder = new TemporaryFolder();
+    @TempDir private static Path temporaryFolder;
 
-    @Before
-    public void setup() throws Exception {
-        // detect parameter change
-        if (currentBackend != backend) {
-            shutDownExistingCluster();
+    @BeforeEach
+    void setup() throws Exception {
+        Configuration config = new Configuration();
 
-            currentBackend = backend;
+        final File checkpointDir = TempDirUtils.newFolder(temporaryFolder);
+        final File savepointDir = TempDirUtils.newFolder(temporaryFolder);
 
-            Configuration config = new Configuration();
+        config.set(StateBackendOptions.STATE_BACKEND, backend);
+        config.set(CheckpointingOptions.CHECKPOINTS_DIRECTORY, checkpointDir.toURI().toString());
+        config.set(CheckpointingOptions.SAVEPOINT_DIRECTORY, savepointDir.toURI().toString());
 
-            final File checkpointDir = temporaryFolder.newFolder();
-            final File savepointDir = temporaryFolder.newFolder();
-
-            config.setString(CheckpointingOptions.STATE_BACKEND, currentBackend);
-            config.setString(
-                    CheckpointingOptions.CHECKPOINTS_DIRECTORY, checkpointDir.toURI().toString());
-            config.setString(
-                    CheckpointingOptions.SAVEPOINT_DIRECTORY, savepointDir.toURI().toString());
-
-            cluster =
-                    new MiniClusterWithClientResource(
-                            new MiniClusterResourceConfiguration.Builder()
-                                    .setConfiguration(config)
-                                    .setNumberTaskManagers(numTaskManagers)
-                                    .setNumberSlotsPerTaskManager(numSlots)
-                                    .build());
-            cluster.before();
-        }
+        cluster =
+                new MiniClusterWithClientResource(
+                        new MiniClusterResourceConfiguration.Builder()
+                                .setConfiguration(config)
+                                .setNumberTaskManagers(numTaskManagers)
+                                .setNumberSlotsPerTaskManager(numSlots)
+                                .build());
+        cluster.before();
     }
 
-    @AfterClass
-    public static void shutDownExistingCluster() {
+    @AfterEach
+    void shutDownExistingCluster() {
         if (cluster != null) {
             cluster.after();
             cluster = null;
         }
     }
 
-    @Test
-    public void testSavepointRescalingInKeyedState() throws Exception {
+    @TestTemplate
+    void testSavepointRescalingInKeyedState() throws Exception {
         testSavepointRescalingKeyedState(false, false);
     }
 
-    @Test
-    public void testSavepointRescalingOutKeyedState() throws Exception {
+    @TestTemplate
+    void testSavepointRescalingOutKeyedState() throws Exception {
         testSavepointRescalingKeyedState(true, false);
     }
 
-    @Test
-    public void testSavepointRescalingInKeyedStateDerivedMaxParallelism() throws Exception {
+    @TestTemplate
+    void testSavepointRescalingInKeyedStateDerivedMaxParallelism() throws Exception {
         testSavepointRescalingKeyedState(false, true);
     }
 
-    @Test
-    public void testSavepointRescalingOutKeyedStateDerivedMaxParallelism() throws Exception {
+    @TestTemplate
+    void testSavepointRescalingOutKeyedStateDerivedMaxParallelism() throws Exception {
         testSavepointRescalingKeyedState(true, true);
     }
 
@@ -172,7 +175,7 @@ public class RescalingITCase extends TestLogger {
      * Tests that a job with purely keyed state can be restarted from a savepoint with a different
      * parallelism.
      */
-    public void testSavepointRescalingKeyedState(boolean scaleOut, boolean deriveMaxParallelism)
+    private void testSavepointRescalingKeyedState(boolean scaleOut, boolean deriveMaxParallelism)
             throws Exception {
         final int numberKeys = 42;
         final int numberElements = 1000;
@@ -197,9 +200,10 @@ public class RescalingITCase extends TestLogger {
 
             // wait til the sources have emitted numberElements for each key and completed a
             // checkpoint
-            assertTrue(
-                    SubtaskIndexFlatMapper.workCompletedLatch.await(
-                            deadline.timeLeft().toMillis(), TimeUnit.MILLISECONDS));
+            assertThat(
+                            SubtaskIndexFlatMapper.workCompletedLatch.await(
+                                    deadline.timeLeft().toMillis(), TimeUnit.MILLISECONDS))
+                    .isTrue();
 
             // verify the current state
 
@@ -217,12 +221,14 @@ public class RescalingITCase extends TestLogger {
                                 numberElements * key));
             }
 
-            assertEquals(expectedResult, actualResult);
+            assertThat(actualResult).isEqualTo(expectedResult);
 
             // clear the CollectionSink set for the restarted job
             CollectionSink.clearElementsSet();
 
-            CompletableFuture<String> savepointPathFuture = client.triggerSavepoint(jobID, null);
+            waitForAllTaskRunning(cluster.getMiniCluster(), jobGraph.getJobID(), false);
+            CompletableFuture<String> savepointPathFuture =
+                    client.triggerSavepoint(jobID, null, SavepointFormatType.CANONICAL);
 
             final String savepointPath =
                     savepointPathFuture.get(deadline.timeLeft().toMillis(), TimeUnit.MILLISECONDS);
@@ -234,7 +240,7 @@ public class RescalingITCase extends TestLogger {
             }
 
             int restoreMaxParallelism =
-                    deriveMaxParallelism ? ExecutionJobVertex.VALUE_NOT_SET : maxParallelism;
+                    deriveMaxParallelism ? JobVertex.MAX_PARALLELISM_DEFAULT : maxParallelism;
 
             JobGraph scaledJobGraph =
                     createJobGraphWithKeyedState(
@@ -263,7 +269,7 @@ public class RescalingITCase extends TestLogger {
                                 key * (numberElements + numberElements2)));
             }
 
-            assertEquals(expectedResult2, actualResult2);
+            assertThat(actualResult2).isEqualTo(expectedResult2);
 
         } finally {
             // clear the CollectionSink set for the restarted job
@@ -277,8 +283,8 @@ public class RescalingITCase extends TestLogger {
      *
      * @throws Exception
      */
-    @Test
-    public void testSavepointRescalingNonPartitionedStateCausesException() throws Exception {
+    @TestTemplate
+    void testSavepointRescalingNonPartitionedStateCausesException() throws Exception {
         final int parallelism = numSlots / 2;
         final int parallelism2 = numSlots;
         final int maxParallelism = 13;
@@ -292,21 +298,27 @@ public class RescalingITCase extends TestLogger {
             JobGraph jobGraph =
                     createJobGraphWithOperatorState(
                             parallelism, maxParallelism, OperatorCheckpointMethod.NON_PARTITIONED);
+            // make sure the job does not finish before we take the savepoint
+            StateSourceBase.canFinishLatch = new CountDownLatch(1);
 
             final JobID jobID = jobGraph.getJobID();
 
             client.submitJob(jobGraph).get();
 
             // wait until the operator is started
+            waitForAllTaskRunning(cluster.getMiniCluster(), jobGraph.getJobID(), false);
+            // wait until the operator handles some data
             StateSourceBase.workStartedLatch.await();
 
-            CompletableFuture<String> savepointPathFuture = client.triggerSavepoint(jobID, null);
+            CompletableFuture<String> savepointPathFuture =
+                    client.triggerSavepoint(jobID, null, SavepointFormatType.CANONICAL);
 
             final String savepointPath =
                     savepointPathFuture.get(deadline.timeLeft().toMillis(), TimeUnit.MILLISECONDS);
 
+            // we took a savepoint, the job can finish now
+            StateSourceBase.canFinishLatch.countDown();
             client.cancel(jobID).get();
-
             while (!getRunningJobs(client).isEmpty()) {
                 Thread.sleep(50);
             }
@@ -337,8 +349,8 @@ public class RescalingITCase extends TestLogger {
      *
      * @throws Exception
      */
-    @Test
-    public void testSavepointRescalingWithKeyedAndNonPartitionedState() throws Exception {
+    @TestTemplate
+    void testSavepointRescalingWithKeyedAndNonPartitionedState() throws Exception {
         int numberKeys = 42;
         int numberElements = 1000;
         int numberElements2 = 500;
@@ -365,13 +377,16 @@ public class RescalingITCase extends TestLogger {
 
             final JobID jobID = jobGraph.getJobID();
 
+            // make sure the job does not finish before we take the savepoint
+            StateSourceBase.canFinishLatch = new CountDownLatch(1);
             client.submitJob(jobGraph).get();
 
             // wait til the sources have emitted numberElements for each key and completed a
             // checkpoint
-            assertTrue(
-                    SubtaskIndexFlatMapper.workCompletedLatch.await(
-                            deadline.timeLeft().toMillis(), TimeUnit.MILLISECONDS));
+            assertThat(
+                            SubtaskIndexFlatMapper.workCompletedLatch.await(
+                                    deadline.timeLeft().toMillis(), TimeUnit.MILLISECONDS))
+                    .isTrue();
 
             // verify the current state
 
@@ -389,16 +404,20 @@ public class RescalingITCase extends TestLogger {
                                 numberElements * key));
             }
 
-            assertEquals(expectedResult, actualResult);
+            assertThat(actualResult).isEqualTo(expectedResult);
 
             // clear the CollectionSink set for the restarted job
             CollectionSink.clearElementsSet();
 
-            CompletableFuture<String> savepointPathFuture = client.triggerSavepoint(jobID, null);
+            waitForAllTaskRunning(cluster.getMiniCluster(), jobGraph.getJobID(), false);
+            CompletableFuture<String> savepointPathFuture =
+                    client.triggerSavepoint(jobID, null, SavepointFormatType.CANONICAL);
 
             final String savepointPath =
                     savepointPathFuture.get(deadline.timeLeft().toMillis(), TimeUnit.MILLISECONDS);
 
+            // we took a savepoint, the job can finish now
+            StateSourceBase.canFinishLatch.countDown();
             client.cancel(jobID).get();
 
             while (!getRunningJobs(client).isEmpty()) {
@@ -433,7 +452,7 @@ public class RescalingITCase extends TestLogger {
                                 key * (numberElements + numberElements2)));
             }
 
-            assertEquals(expectedResult2, actualResult2);
+            assertThat(actualResult2).isEqualTo(expectedResult2);
 
         } finally {
             // clear the CollectionSink set for the restarted job
@@ -441,38 +460,38 @@ public class RescalingITCase extends TestLogger {
         }
     }
 
-    @Test
-    public void testSavepointRescalingInPartitionedOperatorState() throws Exception {
+    @TestTemplate
+    void testSavepointRescalingInPartitionedOperatorState() throws Exception {
         testSavepointRescalingPartitionedOperatorState(
                 false, OperatorCheckpointMethod.CHECKPOINTED_FUNCTION);
     }
 
-    @Test
-    public void testSavepointRescalingOutPartitionedOperatorState() throws Exception {
+    @TestTemplate
+    void testSavepointRescalingOutPartitionedOperatorState() throws Exception {
         testSavepointRescalingPartitionedOperatorState(
                 true, OperatorCheckpointMethod.CHECKPOINTED_FUNCTION);
     }
 
-    @Test
-    public void testSavepointRescalingInBroadcastOperatorState() throws Exception {
+    @TestTemplate
+    void testSavepointRescalingInBroadcastOperatorState() throws Exception {
         testSavepointRescalingPartitionedOperatorState(
                 false, OperatorCheckpointMethod.CHECKPOINTED_FUNCTION_BROADCAST);
     }
 
-    @Test
-    public void testSavepointRescalingOutBroadcastOperatorState() throws Exception {
+    @TestTemplate
+    void testSavepointRescalingOutBroadcastOperatorState() throws Exception {
         testSavepointRescalingPartitionedOperatorState(
                 true, OperatorCheckpointMethod.CHECKPOINTED_FUNCTION_BROADCAST);
     }
 
-    @Test
-    public void testSavepointRescalingInPartitionedOperatorStateList() throws Exception {
+    @TestTemplate
+    void testSavepointRescalingInPartitionedOperatorStateList() throws Exception {
         testSavepointRescalingPartitionedOperatorState(
                 false, OperatorCheckpointMethod.LIST_CHECKPOINTED);
     }
 
-    @Test
-    public void testSavepointRescalingOutPartitionedOperatorStateList() throws Exception {
+    @TestTemplate
+    void testSavepointRescalingOutPartitionedOperatorStateList() throws Exception {
         testSavepointRescalingPartitionedOperatorState(
                 true, OperatorCheckpointMethod.LIST_CHECKPOINTED);
     }
@@ -482,7 +501,7 @@ public class RescalingITCase extends TestLogger {
      * {@link ListCheckpointed} as it subsumes {@link
      * org.apache.flink.streaming.api.checkpoint.CheckpointedFunction}.
      */
-    public void testSavepointRescalingPartitionedOperatorState(
+    private void testSavepointRescalingPartitionedOperatorState(
             boolean scaleOut, OperatorCheckpointMethod checkpointMethod) throws Exception {
         final int parallelism = scaleOut ? numSlots : numSlots / 2;
         final int parallelism2 = scaleOut ? numSlots / 2 : numSlots;
@@ -507,27 +526,35 @@ public class RescalingITCase extends TestLogger {
         try {
             JobGraph jobGraph =
                     createJobGraphWithOperatorState(parallelism, maxParallelism, checkpointMethod);
+            // make sure the job does not finish before we take the savepoint
+            StateSourceBase.canFinishLatch = new CountDownLatch(1);
 
             final JobID jobID = jobGraph.getJobID();
 
             client.submitJob(jobGraph).get();
 
             // wait until the operator is started
+            waitForAllTaskRunning(cluster.getMiniCluster(), jobGraph.getJobID(), false);
+            // wait until the operator handles some data
             StateSourceBase.workStartedLatch.await();
 
             CompletableFuture<String> savepointPathFuture =
                     FutureUtils.retryWithDelay(
-                            () -> client.triggerSavepoint(jobID, null),
-                            (int) deadline.timeLeft().getSeconds() / 10,
-                            Time.seconds(10),
+                            () ->
+                                    client.triggerSavepoint(
+                                            jobID, null, SavepointFormatType.CANONICAL),
+                            new FixedRetryStrategy(
+                                    (int) deadline.timeLeft().getSeconds() / 10,
+                                    Duration.ofSeconds(10)),
                             (throwable) -> true,
-                            TestingUtils.defaultScheduledExecutor());
+                            new ScheduledExecutorServiceAdapter(EXECUTOR_RESOURCE.getExecutor()));
 
             final String savepointPath =
                     savepointPathFuture.get(deadline.timeLeft().toMillis(), TimeUnit.MILLISECONDS);
 
+            // we took a savepoint, the job can finish now
+            StateSourceBase.canFinishLatch.countDown();
             client.cancel(jobID).get();
-
             while (!getRunningJobs(client).isEmpty()) {
                 Thread.sleep(50);
             }
@@ -572,7 +599,7 @@ public class RescalingITCase extends TestLogger {
                 }
             }
 
-            assertEquals(sumExp, sumAct);
+            assertThat(sumAct).isEqualTo(sumExp);
         } finally {
         }
     }
@@ -585,8 +612,7 @@ public class RescalingITCase extends TestLogger {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
         env.getConfig().setMaxParallelism(maxParallelism);
-        env.enableCheckpointing(Long.MAX_VALUE);
-        env.setRestartStrategy(RestartStrategies.noRestart());
+        RestartStrategyUtils.configureNoRestartStrategy(env);
 
         StateSourceBase.workStartedLatch = new CountDownLatch(parallelism);
 
@@ -611,7 +637,7 @@ public class RescalingITCase extends TestLogger {
 
         DataStream<Integer> input = env.addSource(src);
 
-        input.addSink(new DiscardingSink<Integer>());
+        input.sinkTo(new DiscardingSink<>());
 
         return env.getStreamGraph().getJobGraph();
     }
@@ -630,7 +656,7 @@ public class RescalingITCase extends TestLogger {
             env.getConfig().setMaxParallelism(maxParallelism);
         }
         env.enableCheckpointing(checkpointingInterval);
-        env.setRestartStrategy(RestartStrategies.noRestart());
+        RestartStrategyUtils.configureNoRestartStrategy(env);
         env.getConfig().setUseSnapshotCompression(true);
 
         DataStream<Integer> input =
@@ -671,7 +697,7 @@ public class RescalingITCase extends TestLogger {
         env.setParallelism(parallelism);
         env.getConfig().setMaxParallelism(maxParallelism);
         env.enableCheckpointing(checkpointingInterval);
-        env.setRestartStrategy(RestartStrategies.noRestart());
+        RestartStrategyUtils.configureNoRestartStrategy(env);
 
         DataStream<Integer> input =
                 env.addSource(
@@ -721,7 +747,7 @@ public class RescalingITCase extends TestLogger {
         @Override
         public void run(SourceContext<Integer> ctx) throws Exception {
             final Object lock = ctx.getCheckpointLock();
-            final int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
+            final int subtaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
 
             while (running) {
 
@@ -729,7 +755,10 @@ public class RescalingITCase extends TestLogger {
                     synchronized (lock) {
                         for (int value = subtaskIndex;
                                 value < numberKeys;
-                                value += getRuntimeContext().getNumberOfParallelSubtasks()) {
+                                value +=
+                                        getRuntimeContext()
+                                                .getTaskInfo()
+                                                .getNumberOfParallelSubtasks()) {
 
                             ctx.collect(value);
                         }
@@ -783,7 +812,7 @@ public class RescalingITCase extends TestLogger {
 
         private static final long serialVersionUID = 5273172591283191348L;
 
-        private static volatile CountDownLatch workCompletedLatch = new CountDownLatch(1);
+        private static CountDownLatch workCompletedLatch = new CountDownLatch(1);
 
         private transient ValueState<Integer> counter;
         private transient ValueState<Integer> sum;
@@ -805,7 +834,8 @@ public class RescalingITCase extends TestLogger {
             sum.update(s);
 
             if (count % numberElements == 0) {
-                out.collect(Tuple2.of(getRuntimeContext().getIndexOfThisSubtask(), s));
+                out.collect(
+                        Tuple2.of(getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), s));
                 workCompletedLatch.countDown();
             }
         }
@@ -850,7 +880,8 @@ public class RescalingITCase extends TestLogger {
     private static class StateSourceBase extends RichParallelSourceFunction<Integer> {
 
         private static final long serialVersionUID = 7512206069681177940L;
-        private static volatile CountDownLatch workStartedLatch = new CountDownLatch(1);
+        private static CountDownLatch workStartedLatch = new CountDownLatch(1);
+        private static CountDownLatch canFinishLatch = new CountDownLatch(0);
 
         protected volatile int counter = 0;
         protected volatile boolean running = true;
@@ -875,6 +906,8 @@ public class RescalingITCase extends TestLogger {
                     break;
                 }
             }
+
+            canFinishLatch.await();
         }
 
         @Override
@@ -913,7 +946,8 @@ public class RescalingITCase extends TestLogger {
         @Override
         public List<Integer> snapshotState(long checkpointId, long timestamp) throws Exception {
 
-            checkCorrectSnapshot[getRuntimeContext().getIndexOfThisSubtask()] = counter;
+            checkCorrectSnapshot[getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()] =
+                    counter;
 
             int div = counter / NUM_PARTITIONS;
             int mod = counter % NUM_PARTITIONS;
@@ -935,7 +969,8 @@ public class RescalingITCase extends TestLogger {
             for (Integer v : state) {
                 counter += v;
             }
-            checkCorrectRestore[getRuntimeContext().getIndexOfThisSubtask()] = counter;
+            checkCorrectRestore[getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()] =
+                    counter;
         }
     }
 
@@ -960,7 +995,8 @@ public class RescalingITCase extends TestLogger {
 
             counterPartitions.clear();
 
-            checkCorrectSnapshot[getRuntimeContext().getIndexOfThisSubtask()] = counter;
+            checkCorrectSnapshot[getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()] =
+                    counter;
 
             int div = counter / NUM_PARTITIONS;
             int mod = counter % NUM_PARTITIONS;
@@ -996,7 +1032,8 @@ public class RescalingITCase extends TestLogger {
                 for (int v : counterPartitions.get()) {
                     counter += v;
                 }
-                checkCorrectRestore[getRuntimeContext().getIndexOfThisSubtask()] = counter;
+                checkCorrectRestore[getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()] =
+                        counter;
             }
         }
     }

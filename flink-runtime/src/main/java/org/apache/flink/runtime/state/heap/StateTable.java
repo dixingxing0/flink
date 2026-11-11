@@ -21,7 +21,11 @@ package org.apache.flink.runtime.state.heap;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.runtime.state.InternalKeyContext;
+import org.apache.flink.runtime.state.IterableStateSnapshot;
+import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
+import org.apache.flink.runtime.state.KeyGroupRangeOffsets;
 import org.apache.flink.runtime.state.RegisteredKeyValueStateBackendMetaInfo;
 import org.apache.flink.runtime.state.StateEntry;
 import org.apache.flink.runtime.state.StateSnapshotKeyGroupReader;
@@ -35,8 +39,11 @@ import javax.annotation.Nonnull;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Objects;
 import java.util.Spliterators;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
@@ -63,8 +70,8 @@ public abstract class StateTable<K, N, S>
     /** The serializer of the key. */
     protected final TypeSerializer<K> keySerializer;
 
-    /** The offset to the contiguous key groups. */
-    protected final int keyGroupOffset;
+    /** The current key group range. */
+    protected final KeyGroupRange keyGroupRange;
 
     /**
      * Map for holding the actual state objects. The outer array represents the key-groups. All
@@ -85,7 +92,7 @@ public abstract class StateTable<K, N, S>
         this.metaInfo = Preconditions.checkNotNull(metaInfo);
         this.keySerializer = Preconditions.checkNotNull(keySerializer);
 
-        this.keyGroupOffset = keyContext.getKeyGroupRange().getStartKeyGroup();
+        this.keyGroupRange = keyContext.getKeyGroupRange();
 
         @SuppressWarnings("unchecked")
         StateMap<K, N, S>[] state =
@@ -98,6 +105,10 @@ public abstract class StateTable<K, N, S>
     }
 
     protected abstract StateMap<K, N, S> createStateMap();
+
+    @Override
+    @Nonnull
+    public abstract IterableStateSnapshot<K, N, S> stateSnapshot();
 
     // Main interface methods of StateTable -------------------------------------------------------
 
@@ -201,8 +212,30 @@ public abstract class StateTable<K, N, S>
         checkKeyNamespacePreconditions(key, namespace);
 
         int keyGroup = keyContext.getCurrentKeyGroupIndex();
-        StateMap<K, N, S> stateMap = getMapForKeyGroup(keyGroup);
-        stateMap.transform(key, namespace, value, transformation);
+        getMapForKeyGroup(keyGroup).transform(key, namespace, value, transformation);
+    }
+
+    /**
+     * Applies the given {@link StateTransformationFunction} to all state (1st input argument),
+     * using the given value as second input argument. The result of {@link
+     * StateTransformationFunction#apply(Object, Object)} is then stored as the new state. This
+     * function is basically an optimization for get-update-put pattern.
+     *
+     * @param value the value to use in transforming the state. Can be null.
+     * @throws Exception if some exception happens in the transformation function.
+     */
+    public <T> void transformAll(T value, StateTransformationFunction<S, T> transformation)
+            throws Exception {
+        for (StateMap<K, N, S> stateMap : keyGroupedStateMaps) {
+            List<StateEntry<K, N, S>> entries =
+                    StreamSupport.stream(
+                                    Spliterators.spliteratorUnknownSize(stateMap.iterator(), 0),
+                                    false)
+                            .collect(Collectors.toList());
+            for (StateEntry<K, N, S> entry : entries) {
+                stateMap.transform(entry.getKey(), entry.getNamespace(), value, transformation);
+            }
+        }
     }
 
     // For queryable state ------------------------------------------------------------------------
@@ -243,6 +276,24 @@ public abstract class StateTable<K, N, S>
                 .map(entry -> Tuple2.of(entry.getKey(), entry.getNamespace()));
     }
 
+    /**
+     * Returns all entries paired with the key-group they are physically stored under, i.e. the
+     * {@link #keyGroupedStateMaps} slot holding them, rather than a key-group recomputed from the
+     * key's {@code hashCode()}.
+     */
+    public Stream<Tuple2<StateEntry<K, N, S>, Integer>> getEntriesWithKeyGroup() {
+        final int offset = getKeyGroupOffset();
+        return IntStream.range(0, keyGroupedStateMaps.length)
+                .boxed()
+                .flatMap(
+                        i ->
+                                StreamSupport.stream(
+                                                Spliterators.spliteratorUnknownSize(
+                                                        keyGroupedStateMaps[i].iterator(), 0),
+                                                false)
+                                        .map(entry -> Tuple2.of(entry, i + offset)));
+    }
+
     public StateIncrementalVisitor<K, N, S> getStateIncrementalVisitor(
             int recommendedMaxNumberOfReturnedRecords) {
         return new StateEntryIterator(recommendedMaxNumberOfReturnedRecords);
@@ -252,22 +303,12 @@ public abstract class StateTable<K, N, S>
 
     private S get(K key, int keyGroupIndex, N namespace) {
         checkKeyNamespacePreconditions(key, namespace);
-
-        StateMap<K, N, S> stateMap = getMapForKeyGroup(keyGroupIndex);
-
-        if (stateMap == null) {
-            return null;
-        }
-
-        return stateMap.get(key, namespace);
+        return getMapForKeyGroup(keyGroupIndex).get(key, namespace);
     }
 
     private boolean containsKey(K key, int keyGroupIndex, N namespace) {
         checkKeyNamespacePreconditions(key, namespace);
-
-        StateMap<K, N, S> stateMap = getMapForKeyGroup(keyGroupIndex);
-
-        return stateMap != null && stateMap.containsKey(key, namespace);
+        return getMapForKeyGroup(keyGroupIndex).containsKey(key, namespace);
     }
 
     private void checkKeyNamespacePreconditions(K key, N namespace) {
@@ -278,17 +319,12 @@ public abstract class StateTable<K, N, S>
 
     private void remove(K key, int keyGroupIndex, N namespace) {
         checkKeyNamespacePreconditions(key, namespace);
-
-        StateMap<K, N, S> stateMap = getMapForKeyGroup(keyGroupIndex);
-        stateMap.remove(key, namespace);
+        getMapForKeyGroup(keyGroupIndex).remove(key, namespace);
     }
 
     private S removeAndGetOld(K key, int keyGroupIndex, N namespace) {
         checkKeyNamespacePreconditions(key, namespace);
-
-        StateMap<K, N, S> stateMap = getMapForKeyGroup(keyGroupIndex);
-
-        return stateMap.removeAndGetOld(key, namespace);
+        return getMapForKeyGroup(keyGroupIndex).removeAndGetOld(key, namespace);
     }
 
     // ------------------------------------------------------------------------
@@ -302,22 +338,21 @@ public abstract class StateTable<K, N, S>
     }
 
     public int getKeyGroupOffset() {
-        return keyGroupOffset;
+        return keyGroupRange.getStartKeyGroup();
     }
 
-    @VisibleForTesting
-    StateMap<K, N, S> getMapForKeyGroup(int keyGroupIndex) {
+    public StateMap<K, N, S> getMapForKeyGroup(int keyGroupIndex) {
         final int pos = indexToOffset(keyGroupIndex);
         if (pos >= 0 && pos < keyGroupedStateMaps.length) {
             return keyGroupedStateMaps[pos];
         } else {
-            return null;
+            throw KeyGroupRangeOffsets.newIllegalKeyGroupException(keyGroupIndex, keyGroupRange);
         }
     }
 
     /** Translates a key-group id to the internal array offset. */
     private int indexToOffset(int index) {
-        return index - keyGroupOffset;
+        return index - getKeyGroupOffset();
     }
 
     // Meta data setter / getter and toString -----------------------------------------------------
@@ -346,9 +381,7 @@ public abstract class StateTable<K, N, S>
 
     public void put(K key, int keyGroup, N namespace, S state) {
         checkKeyNamespacePreconditions(key, namespace);
-
-        StateMap<K, N, S> stateMap = getMapForKeyGroup(keyGroup);
-        stateMap.put(key, namespace, state);
+        getMapForKeyGroup(keyGroup).put(key, namespace, state);
     }
 
     @Override

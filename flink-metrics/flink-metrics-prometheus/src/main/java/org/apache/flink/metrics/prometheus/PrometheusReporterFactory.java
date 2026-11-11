@@ -17,18 +17,24 @@
 
 package org.apache.flink.metrics.prometheus;
 
-import org.apache.flink.metrics.reporter.InterceptInstantiationViaReflection;
+import org.apache.flink.metrics.MetricConfig;
 import org.apache.flink.metrics.reporter.MetricReporterFactory;
+import org.apache.flink.util.PortRange;
 
 import java.util.Properties;
 
 /** {@link MetricReporterFactory} for {@link PrometheusReporter}. */
-@InterceptInstantiationViaReflection(
-        reporterClassName = "org.apache.flink.metrics.prometheus.PrometheusReporter")
 public class PrometheusReporterFactory implements MetricReporterFactory {
+
+    static final String ARG_PORT = "port";
+    private static final String DEFAULT_PORT = "9249";
 
     @Override
     public PrometheusReporter createMetricReporter(Properties properties) {
-        return new PrometheusReporter();
+        MetricConfig metricConfig = (MetricConfig) properties;
+        String portsConfig = metricConfig.getString(ARG_PORT, DEFAULT_PORT);
+        PortRange portRange = new PortRange(portsConfig);
+
+        return new PrometheusReporter(portRange);
     }
 }

@@ -27,6 +27,8 @@ import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
+import org.apache.flink.runtime.externalresource.ExternalResourceUtils;
+import org.apache.flink.util.Preconditions;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,7 +49,8 @@ public class TaskExecutorResourceUtils {
                     TaskManagerOptions.NETWORK_MEMORY_MAX,
                     TaskManagerOptions.MANAGED_MEMORY_SIZE);
 
-    private static final List<ConfigOption<?>> UNUSED_CONFIG_OPTIONS =
+    @VisibleForTesting
+    static final List<ConfigOption<?>> UNUSED_CONFIG_OPTIONS =
             Arrays.asList(
                     TaskManagerOptions.TOTAL_PROCESS_MEMORY,
                     TaskManagerOptions.TOTAL_FLINK_MEMORY,
@@ -57,6 +60,10 @@ public class TaskExecutorResourceUtils {
                     TaskManagerOptions.JVM_OVERHEAD_MIN,
                     TaskManagerOptions.JVM_OVERHEAD_MAX,
                     TaskManagerOptions.JVM_OVERHEAD_FRACTION);
+
+    private static final MemorySize LOCAL_EXECUTION_TASK_MEMORY =
+            MemorySize.ofMebiBytes(1024 * 1024);
+    private static final double LOCAL_EXECUTION_CPU_CORES = 1000000.0;
 
     static final MemorySize DEFAULT_SHUFFLE_MEMORY_SIZE = MemorySize.parse("64m");
     static final MemorySize DEFAULT_MANAGED_MEMORY_SIZE = MemorySize.parse("128m");
@@ -70,11 +77,12 @@ public class TaskExecutorResourceUtils {
             throw new IllegalConfigurationException("Failed to create TaskExecutorResourceSpec", e);
         }
         return new TaskExecutorResourceSpec(
-                new CPUResource(config.getDouble(TaskManagerOptions.CPU_CORES)),
+                new CPUResource(config.get(TaskManagerOptions.CPU_CORES)),
                 config.get(TaskManagerOptions.TASK_HEAP_MEMORY),
                 config.get(TaskManagerOptions.TASK_OFF_HEAP_MEMORY),
                 config.get(TaskManagerOptions.NETWORK_MEMORY_MIN),
-                config.get(TaskManagerOptions.MANAGED_MEMORY_SIZE));
+                config.get(TaskManagerOptions.MANAGED_MEMORY_SIZE),
+                ExternalResourceUtils.getExternalResourcesCollection(config));
     }
 
     private static void checkTaskExecutorResourceConfigSet(Configuration config) {
@@ -100,21 +108,37 @@ public class TaskExecutorResourceUtils {
         }
     }
 
-    static ResourceProfile generateDefaultSlotResourceProfile(
+    /**
+     * This must be consist with {@link
+     * org.apache.flink.runtime.resourcemanager.slotmanager.SlotManagerUtils#generateDefaultSlotResourceProfile}.
+     */
+    @VisibleForTesting
+    public static ResourceProfile generateDefaultSlotResourceProfile(
             TaskExecutorResourceSpec taskExecutorResourceSpec, int numberOfSlots) {
-        return ResourceProfile.newBuilder()
-                .setCpuCores(taskExecutorResourceSpec.getCpuCores().divide(numberOfSlots))
-                .setTaskHeapMemory(taskExecutorResourceSpec.getTaskHeapSize().divide(numberOfSlots))
-                .setTaskOffHeapMemory(
-                        taskExecutorResourceSpec.getTaskOffHeapSize().divide(numberOfSlots))
-                .setManagedMemory(
-                        taskExecutorResourceSpec.getManagedMemorySize().divide(numberOfSlots))
-                .setNetworkMemory(
-                        taskExecutorResourceSpec.getNetworkMemSize().divide(numberOfSlots))
-                .build();
+        final ResourceProfile.Builder resourceProfileBuilder =
+                ResourceProfile.newBuilder()
+                        .setCpuCores(taskExecutorResourceSpec.getCpuCores().divide(numberOfSlots))
+                        .setTaskHeapMemory(
+                                taskExecutorResourceSpec.getTaskHeapSize().divide(numberOfSlots))
+                        .setTaskOffHeapMemory(
+                                taskExecutorResourceSpec.getTaskOffHeapSize().divide(numberOfSlots))
+                        .setManagedMemory(
+                                taskExecutorResourceSpec
+                                        .getManagedMemorySize()
+                                        .divide(numberOfSlots))
+                        .setNetworkMemory(
+                                taskExecutorResourceSpec.getNetworkMemSize().divide(numberOfSlots));
+        taskExecutorResourceSpec
+                .getExtendedResources()
+                .forEach(
+                        (name, resource) ->
+                                resourceProfileBuilder.setExtendedResource(
+                                        resource.divide(numberOfSlots)));
+        return resourceProfileBuilder.build();
     }
 
-    static ResourceProfile generateTotalAvailableResourceProfile(
+    @VisibleForTesting
+    public static ResourceProfile generateTotalAvailableResourceProfile(
             TaskExecutorResourceSpec taskExecutorResourceSpec) {
         return ResourceProfile.newBuilder()
                 .setCpuCores(taskExecutorResourceSpec.getCpuCores())
@@ -122,6 +146,7 @@ public class TaskExecutorResourceUtils {
                 .setTaskOffHeapMemory(taskExecutorResourceSpec.getTaskOffHeapSize())
                 .setManagedMemory(taskExecutorResourceSpec.getManagedMemorySize())
                 .setNetworkMemory(taskExecutorResourceSpec.getNetworkMemSize())
+                .setExtendedResources(taskExecutorResourceSpec.getExtendedResources().values())
                 .build();
     }
 
@@ -131,18 +156,69 @@ public class TaskExecutorResourceUtils {
         return resourceSpecFromConfig(adjustForLocalExecution(config));
     }
 
-    public static Configuration adjustForLocalExecution(Configuration config) {
-        UNUSED_CONFIG_OPTIONS.forEach(option -> warnOptionHasNoEffectIfSet(config, option));
+    public static long calculateTotalFlinkMemoryFromComponents(Configuration config) {
+        Preconditions.checkArgument(config.contains(TaskManagerOptions.TASK_HEAP_MEMORY));
+        Preconditions.checkArgument(config.contains(TaskManagerOptions.TASK_OFF_HEAP_MEMORY));
+        Preconditions.checkArgument(config.contains(TaskManagerOptions.NETWORK_MEMORY_MAX));
+        Preconditions.checkArgument(config.contains(TaskManagerOptions.NETWORK_MEMORY_MIN));
+        Preconditions.checkArgument(config.contains(TaskManagerOptions.MANAGED_MEMORY_SIZE));
+        Preconditions.checkArgument(config.contains(TaskManagerOptions.FRAMEWORK_HEAP_MEMORY));
+        Preconditions.checkArgument(config.contains(TaskManagerOptions.FRAMEWORK_OFF_HEAP_MEMORY));
+        Preconditions.checkArgument(
+                config.get(TaskManagerOptions.NETWORK_MEMORY_MAX)
+                        .equals(config.get(TaskManagerOptions.NETWORK_MEMORY_MIN)));
+        return config.get(TaskManagerOptions.TASK_HEAP_MEMORY)
+                .add(config.get(TaskManagerOptions.TASK_OFF_HEAP_MEMORY))
+                .add(config.get(TaskManagerOptions.NETWORK_MEMORY_MAX))
+                .add(config.get(TaskManagerOptions.MANAGED_MEMORY_SIZE))
+                .add(config.get(TaskManagerOptions.FRAMEWORK_HEAP_MEMORY))
+                .add(config.get(TaskManagerOptions.FRAMEWORK_OFF_HEAP_MEMORY))
+                .getBytes();
+    }
 
-        setConfigOptionToPassedMaxIfNotSet(config, TaskManagerOptions.CPU_CORES, Double.MAX_VALUE);
+    public static long calculateTotalProcessMemoryFromComponents(Configuration config) {
+        Preconditions.checkArgument(config.contains(TaskManagerOptions.JVM_METASPACE));
+        Preconditions.checkArgument(config.contains(TaskManagerOptions.JVM_OVERHEAD_MAX));
+        Preconditions.checkArgument(config.contains(TaskManagerOptions.JVM_OVERHEAD_MIN));
+        Preconditions.checkArgument(
+                config.get(TaskManagerOptions.JVM_OVERHEAD_MAX)
+                        .equals(config.get(TaskManagerOptions.JVM_OVERHEAD_MIN)));
+        return calculateTotalFlinkMemoryFromComponents(config)
+                + config.get(TaskManagerOptions.JVM_METASPACE)
+                        .add(config.get(TaskManagerOptions.JVM_OVERHEAD_MAX))
+                        .getBytes();
+    }
+
+    public static Configuration adjustForLocalExecution(Configuration config) {
+        UNUSED_CONFIG_OPTIONS.forEach(
+                option -> warnAndRemoveOptionHasNoEffectIfSet(config, option));
+
         setConfigOptionToPassedMaxIfNotSet(
-                config, TaskManagerOptions.TASK_HEAP_MEMORY, MemorySize.MAX_VALUE);
+                config, TaskManagerOptions.CPU_CORES, LOCAL_EXECUTION_CPU_CORES);
         setConfigOptionToPassedMaxIfNotSet(
-                config, TaskManagerOptions.TASK_OFF_HEAP_MEMORY, MemorySize.MAX_VALUE);
+                config, TaskManagerOptions.TASK_HEAP_MEMORY, LOCAL_EXECUTION_TASK_MEMORY);
+        setConfigOptionToPassedMaxIfNotSet(
+                config, TaskManagerOptions.TASK_OFF_HEAP_MEMORY, LOCAL_EXECUTION_TASK_MEMORY);
 
         adjustNetworkMemoryForLocalExecution(config);
         setConfigOptionToDefaultIfNotSet(
                 config, TaskManagerOptions.MANAGED_MEMORY_SIZE, DEFAULT_MANAGED_MEMORY_SIZE);
+
+        // Set valid default values for unused config options which should have been removed.
+        config.set(
+                TaskManagerOptions.FRAMEWORK_HEAP_MEMORY,
+                TaskManagerOptions.FRAMEWORK_HEAP_MEMORY.defaultValue());
+        config.set(
+                TaskManagerOptions.FRAMEWORK_OFF_HEAP_MEMORY,
+                TaskManagerOptions.FRAMEWORK_OFF_HEAP_MEMORY.defaultValue());
+        config.set(
+                TaskManagerOptions.JVM_METASPACE, TaskManagerOptions.JVM_METASPACE.defaultValue());
+        config.set(
+                TaskManagerOptions.JVM_OVERHEAD_MAX,
+                TaskManagerOptions.JVM_OVERHEAD_MAX.defaultValue());
+        config.set(
+                TaskManagerOptions.JVM_OVERHEAD_MIN,
+                TaskManagerOptions.JVM_OVERHEAD_MAX.defaultValue());
 
         return config;
     }
@@ -166,13 +242,15 @@ public class TaskExecutorResourceUtils {
                 config, TaskManagerOptions.NETWORK_MEMORY_MAX, DEFAULT_SHUFFLE_MEMORY_SIZE);
     }
 
-    private static void warnOptionHasNoEffectIfSet(Configuration config, ConfigOption<?> option) {
+    private static void warnAndRemoveOptionHasNoEffectIfSet(
+            Configuration config, ConfigOption<?> option) {
         if (config.contains(option)) {
             LOG.warn(
                     "The resource configuration option {} is set but it will have no effect for local execution, "
                             + "only the following options matter for the resource configuration: {}",
                     option,
-                    UNUSED_CONFIG_OPTIONS);
+                    CONFIG_OPTIONS);
+            config.removeConfig(option);
         }
     }
 

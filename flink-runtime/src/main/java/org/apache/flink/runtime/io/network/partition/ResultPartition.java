@@ -22,10 +22,13 @@ import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.SimpleCounter;
 import org.apache.flink.runtime.executiongraph.IntermediateResultPartition;
+import org.apache.flink.runtime.io.network.api.EndOfData;
+import org.apache.flink.runtime.io.network.api.StopMode;
 import org.apache.flink.runtime.io.network.api.writer.ResultPartitionWriter;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.BufferCompressor;
 import org.apache.flink.runtime.io.network.buffer.BufferPool;
+import org.apache.flink.runtime.io.network.metrics.ResultPartitionBytesCounter;
 import org.apache.flink.runtime.io.network.partition.consumer.LocalInputChannel;
 import org.apache.flink.runtime.io.network.partition.consumer.RemoteInputChannel;
 import org.apache.flink.runtime.jobgraph.DistributionPattern;
@@ -110,6 +113,10 @@ public abstract class ResultPartition implements ResultPartitionWriter {
 
     protected Counter numBuffersOut = new SimpleCounter();
 
+    protected ResultPartitionBytesCounter resultPartitionBytes;
+
+    private boolean isNumberOfPartitionConsumerUndefined = false;
+
     public ResultPartition(
             String owningTaskName,
             int partitionIndex,
@@ -131,6 +138,7 @@ public abstract class ResultPartition implements ResultPartitionWriter {
         this.partitionManager = checkNotNull(partitionManager);
         this.bufferCompressor = bufferCompressor;
         this.bufferPoolFactory = bufferPoolFactory;
+        this.resultPartitionBytes = new ResultPartitionBytesCounter(numSubpartitions);
     }
 
     /**
@@ -148,8 +156,12 @@ public abstract class ResultPartition implements ResultPartitionWriter {
                 "Bug in result partition setup logic: Already registered buffer pool.");
 
         this.bufferPool = checkNotNull(bufferPoolFactory.get());
+        setupInternal();
         partitionManager.registerResultPartition(this);
     }
+
+    /** Do the subclass's own setup operation. */
+    protected abstract void setupInternal() throws IOException;
 
     public String getOwningTaskName() {
         return owningTaskName;
@@ -173,11 +185,30 @@ public abstract class ResultPartition implements ResultPartitionWriter {
         return bufferPool;
     }
 
+    public void isNumberOfPartitionConsumerUndefined(boolean isNumberOfPartitionConsumerUndefined) {
+        this.isNumberOfPartitionConsumerUndefined = isNumberOfPartitionConsumerUndefined;
+    }
+
+    public boolean isNumberOfPartitionConsumerUndefined() {
+        return isNumberOfPartitionConsumerUndefined;
+    }
+
     /** Returns the total number of queued buffers of all subpartitions. */
     public abstract int getNumberOfQueuedBuffers();
 
+    /** Returns the total size in bytes of queued buffers of all subpartitions. */
+    public abstract long getSizeOfQueuedBuffersUnsafe();
+
     /** Returns the number of queued buffers of the given target subpartition. */
     public abstract int getNumberOfQueuedBuffers(int targetSubpartition);
+
+    public int getBuffersCountUnsafe(int targetSubpartition) {
+        return bufferPool.getBuffersCountUnsafe(targetSubpartition);
+    }
+
+    public void setMaxOverdraftBuffersPerGate(int maxOverdraftBuffersPerGate) {
+        this.bufferPool.setMaxOverdraftBuffersPerGate(maxOverdraftBuffersPerGate);
+    }
 
     /**
      * Returns the type of this result partition.
@@ -188,7 +219,30 @@ public abstract class ResultPartition implements ResultPartitionWriter {
         return partitionType;
     }
 
+    public ResultPartitionBytesCounter getResultPartitionBytes() {
+        return resultPartitionBytes;
+    }
+
     // ------------------------------------------------------------------------
+
+    @Override
+    public void notifyEndOfData(StopMode mode) throws IOException {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<Void> getAllDataProcessedFuture() {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * The subpartition notifies that the corresponding downstream task have processed all the user
+     * records.
+     *
+     * @see EndOfData
+     * @param subpartition The index of the subpartition sending the notification.
+     */
+    public void onSubpartitionAllDataProcessed(int subpartition) {}
 
     /**
      * Finishes the result partition.
@@ -230,15 +284,21 @@ public abstract class ResultPartition implements ResultPartitionWriter {
     /** Releases all produced data including both those stored in memory and persisted on disk. */
     protected abstract void releaseInternal();
 
-    @Override
-    public void close() {
+    private void closeBufferPool() {
         if (bufferPool != null) {
             bufferPool.lazyDestroy();
         }
     }
 
     @Override
+    public void close() {
+        closeBufferPool();
+    }
+
+    @Override
     public void fail(@Nullable Throwable throwable) {
+        // the task canceler thread will call this method to early release the output buffer pool
+        closeBufferPool();
         partitionManager.releasePartition(partitionId, throwable);
     }
 
@@ -255,7 +315,42 @@ public abstract class ResultPartition implements ResultPartitionWriter {
     public void setMetricGroup(TaskIOMetricGroup metrics) {
         numBytesOut = metrics.getNumBytesOutCounter();
         numBuffersOut = metrics.getNumBuffersOutCounter();
+        metrics.registerResultPartitionBytesCounter(
+                partitionId.getPartitionId(), resultPartitionBytes);
     }
+
+    @Override
+    public ResultSubpartitionView createSubpartitionView(
+            ResultSubpartitionIndexSet indexSet, BufferAvailabilityListener availabilityListener)
+            throws IOException {
+        if (indexSet.size() == 1) {
+            return createSubpartitionView(
+                    indexSet.values().iterator().next(), availabilityListener);
+        } else {
+            UnionResultSubpartitionView unionView =
+                    new UnionResultSubpartitionView(availabilityListener, indexSet.size());
+            try {
+                for (int i : indexSet.values()) {
+                    ResultSubpartitionView view = createSubpartitionView(i, unionView);
+                    unionView.notifyViewCreated(i, view);
+                }
+                return unionView;
+            } catch (Exception e) {
+                unionView.releaseAllResources();
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Returns a reader for the subpartition with the given index.
+     *
+     * <p>Given that the function to merge outputs from multiple subpartition views is supported
+     * uniformly in {@link UnionResultSubpartitionView}, subclasses of {@link ResultPartition} only
+     * needs to take care of creating subpartition view for a single subpartition.
+     */
+    protected abstract ResultSubpartitionView createSubpartitionView(
+            int index, BufferAvailabilityListener availabilityListener) throws IOException;
 
     /**
      * Whether this partition is released.

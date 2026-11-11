@@ -16,40 +16,75 @@
  * limitations under the License.
  */
 
-import { ChangeDetectionStrategy, ChangeDetectorRef, Component, Input, OnDestroy, OnInit } from '@angular/core';
-import { TaskManagerDetailInterface } from 'interfaces';
+import { DatePipe, NgIf } from '@angular/common';
+import { ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit } from '@angular/core';
+import { ActivatedRoute } from '@angular/router';
 import { Subject } from 'rxjs';
 import { takeUntil } from 'rxjs/operators';
-import { TaskManagerService } from 'services';
+
+import { BlockedBadgeComponent } from '@flink-runtime-web/components/blocked-badge/blocked-badge.component';
+import { HumanizeBytesPipe } from '@flink-runtime-web/components/humanize-bytes.pipe';
+import { NavigationComponent } from '@flink-runtime-web/components/navigation/navigation.component';
+import { TaskManagerDetail } from '@flink-runtime-web/interfaces';
+import { StatusService, TaskManagerService } from '@flink-runtime-web/services';
+import { NzAlertModule } from 'ng-zorro-antd/alert';
+import { NzDescriptionsModule } from 'ng-zorro-antd/descriptions';
+import { NzSkeletonModule } from 'ng-zorro-antd/skeleton';
+
+import { pollTaskManagerDetail } from '../task-manager-detail-poll';
 
 @Component({
   selector: 'flink-task-manager-status',
   templateUrl: './task-manager-status.component.html',
   styleUrls: ['./task-manager-status.component.less'],
-  changeDetection: ChangeDetectionStrategy.OnPush
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [
+    NgIf,
+    BlockedBadgeComponent,
+    NzAlertModule,
+    NzDescriptionsModule,
+    DatePipe,
+    HumanizeBytesPipe,
+    NavigationComponent,
+    NzSkeletonModule
+  ]
 })
 export class TaskManagerStatusComponent implements OnInit, OnDestroy {
-  @Input() isLoading = true;
-  listOfNavigation = [
+  public readonly listOfNavigation = [
     { path: 'metrics', title: 'Metrics' },
     { path: 'logs', title: 'Logs' },
     { path: 'stdout', title: 'Stdout' },
     { path: 'log-list', title: 'Log List' },
-    { path: 'thread-dump', title: 'Thread Dump' }
+    { path: 'thread-dump', title: 'Thread Dump' },
+    { path: 'profiler', title: 'Profiler' }
   ];
-  taskManagerDetail: TaskManagerDetailInterface;
-  private destroy$ = new Subject();
+  public taskManagerDetail?: TaskManagerDetail;
+  public loading = true;
+  public notFound = false;
 
-  constructor(private taskManagerService: TaskManagerService, private cdr: ChangeDetectorRef) {}
+  private readonly destroy$ = new Subject<void>();
 
-  ngOnInit(): void {
-    this.taskManagerService.taskManagerDetail$.pipe(takeUntil(this.destroy$)).subscribe(data => {
-      this.taskManagerDetail = data;
-      this.cdr.markForCheck();
-    });
+  constructor(
+    private readonly taskManagerService: TaskManagerService,
+    private readonly statusService: StatusService,
+    private readonly activatedRoute: ActivatedRoute,
+    private readonly cdr: ChangeDetectorRef
+  ) {}
+
+  public ngOnInit(): void {
+    pollTaskManagerDetail(this.statusService.refresh$, () =>
+      this.taskManagerService.loadManager(this.activatedRoute.snapshot.params.taskManagerId)
+    )
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(({ detail, notFound }) => {
+        this.taskManagerDetail = detail;
+        this.notFound = notFound;
+        this.loading = false;
+        this.cdr.markForCheck();
+      });
   }
 
-  ngOnDestroy(): void {
+  public ngOnDestroy(): void {
     this.destroy$.next();
     this.destroy$.complete();
   }

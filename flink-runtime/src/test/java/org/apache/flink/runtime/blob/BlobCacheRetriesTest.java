@@ -19,42 +19,37 @@
 package org.apache.flink.runtime.blob;
 
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.configuration.BlobServerOptions;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.HighAvailabilityOptions;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.testutils.junit.utils.TempDirUtils;
 
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
-import java.net.InetSocketAddress;
+import java.nio.file.Path;
 
 import static org.apache.flink.runtime.blob.BlobKey.BlobType.PERMANENT_BLOB;
 import static org.apache.flink.runtime.blob.BlobKey.BlobType.TRANSIENT_BLOB;
 import static org.apache.flink.runtime.blob.BlobServerPutTest.put;
 import static org.apache.flink.runtime.blob.BlobServerPutTest.verifyContents;
-import static org.junit.Assert.fail;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Unit tests for the blob cache retrying the connection to the server. */
-public class BlobCacheRetriesTest extends TestLogger {
+class BlobCacheRetriesTest {
 
-    @Rule public TemporaryFolder temporaryFolder = new TemporaryFolder();
+    @TempDir private Path tempDir;
 
     /**
      * A test where the connection fails twice and then the get operation succeeds (job-unrelated
      * blob).
      */
     @Test
-    public void testBlobFetchRetries() throws IOException {
-        final Configuration config = new Configuration();
-        config.setString(
-                BlobServerOptions.STORAGE_DIRECTORY, temporaryFolder.newFolder().getAbsolutePath());
-
-        testBlobFetchRetries(config, new VoidBlobStore(), null, TRANSIENT_BLOB);
+    void testBlobFetchRetries() throws IOException {
+        testBlobFetchRetries(new VoidBlobStore(), null, TRANSIENT_BLOB);
     }
 
     /**
@@ -62,12 +57,8 @@ public class BlobCacheRetriesTest extends TestLogger {
      * blob).
      */
     @Test
-    public void testBlobForJobFetchRetries() throws IOException {
-        final Configuration config = new Configuration();
-        config.setString(
-                BlobServerOptions.STORAGE_DIRECTORY, temporaryFolder.newFolder().getAbsolutePath());
-
-        testBlobFetchRetries(config, new VoidBlobStore(), new JobID(), TRANSIENT_BLOB);
+    void testBlobForJobFetchRetries() throws IOException {
+        testBlobFetchRetries(new VoidBlobStore(), new JobID(), TRANSIENT_BLOB);
     }
 
     /**
@@ -75,23 +66,22 @@ public class BlobCacheRetriesTest extends TestLogger {
      * availability set, job-related job).
      */
     @Test
-    public void testBlobFetchRetriesHa() throws IOException {
+    void testBlobFetchRetriesHa() throws IOException {
         final Configuration config = new Configuration();
-        config.setString(
-                BlobServerOptions.STORAGE_DIRECTORY, temporaryFolder.newFolder().getAbsolutePath());
-        config.setString(HighAvailabilityOptions.HA_MODE, "ZOOKEEPER");
-        config.setString(
-                HighAvailabilityOptions.HA_STORAGE_PATH, temporaryFolder.newFolder().getPath());
+        config.set(HighAvailabilityOptions.HA_MODE, "ZOOKEEPER");
+        config.set(
+                HighAvailabilityOptions.HA_STORAGE_PATH, TempDirUtils.newFolder(tempDir).getPath());
 
         BlobStoreService blobStoreService = null;
 
         try {
             blobStoreService = BlobUtils.createBlobStoreFromConfig(config);
 
-            testBlobFetchRetries(config, blobStoreService, new JobID(), PERMANENT_BLOB);
+            testBlobFetchRetries(blobStoreService, new JobID(), PERMANENT_BLOB);
         } finally {
             if (blobStoreService != null) {
-                blobStoreService.closeAndCleanupAllData();
+                blobStoreService.cleanupAllData();
+                blobStoreService.close();
             }
         }
     }
@@ -100,26 +90,18 @@ public class BlobCacheRetriesTest extends TestLogger {
      * A test where the BlobCache must use the BlobServer and the connection fails twice and then
      * the get operation succeeds.
      *
-     * @param config configuration to use (the BlobCache will get some additional settings set
-     *     compared to this one)
      * @param blobType whether the BLOB should become permanent or transient
      */
-    private static void testBlobFetchRetries(
-            final Configuration config,
-            final BlobStore blobStore,
-            @Nullable final JobID jobId,
-            BlobKey.BlobType blobType)
+    private void testBlobFetchRetries(
+            final BlobStore blobStore, @Nullable final JobID jobId, BlobKey.BlobType blobType)
             throws IOException {
-
         final byte[] data = new byte[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 0};
 
-        try (BlobServer server = new TestingFailingBlobServer(config, blobStore, 2);
-                BlobCacheService cache =
-                        new BlobCacheService(
-                                config,
-                                new VoidBlobStore(),
-                                new InetSocketAddress("localhost", server.getPort()))) {
+        Tuple2<BlobServer, BlobCacheService> serverAndCache =
+                TestingBlobUtils.createFailingServerAndCache(tempDir, blobStore, 1, 2);
 
+        try (BlobServer server = serverAndCache.f0;
+                BlobCacheService cache = serverAndCache.f1) {
             server.start();
 
             // upload some blob
@@ -136,12 +118,8 @@ public class BlobCacheRetriesTest extends TestLogger {
      * (job-unrelated blob).
      */
     @Test
-    public void testBlobNoJobFetchWithTooManyFailures() throws IOException {
-        final Configuration config = new Configuration();
-        config.setString(
-                BlobServerOptions.STORAGE_DIRECTORY, temporaryFolder.newFolder().getAbsolutePath());
-
-        testBlobFetchWithTooManyFailures(config, new VoidBlobStore(), null, TRANSIENT_BLOB);
+    void testBlobNoJobFetchWithTooManyFailures() throws IOException {
+        testBlobFetchWithTooManyFailures(new VoidBlobStore(), null, TRANSIENT_BLOB);
     }
 
     /**
@@ -149,12 +127,8 @@ public class BlobCacheRetriesTest extends TestLogger {
      * blob).
      */
     @Test
-    public void testBlobForJobFetchWithTooManyFailures() throws IOException {
-        final Configuration config = new Configuration();
-        config.setString(
-                BlobServerOptions.STORAGE_DIRECTORY, temporaryFolder.newFolder().getAbsolutePath());
-
-        testBlobFetchWithTooManyFailures(config, new VoidBlobStore(), new JobID(), TRANSIENT_BLOB);
+    void testBlobForJobFetchWithTooManyFailures() throws IOException {
+        testBlobFetchWithTooManyFailures(new VoidBlobStore(), new JobID(), TRANSIENT_BLOB);
     }
 
     /**
@@ -162,23 +136,21 @@ public class BlobCacheRetriesTest extends TestLogger {
      * availability set, job-related blob).
      */
     @Test
-    public void testBlobForJobFetchWithTooManyFailuresHa() throws IOException {
+    void testBlobForJobFetchWithTooManyFailuresHa() throws IOException {
         final Configuration config = new Configuration();
-        config.setString(
-                BlobServerOptions.STORAGE_DIRECTORY, temporaryFolder.newFolder().getAbsolutePath());
-        config.setString(HighAvailabilityOptions.HA_MODE, "ZOOKEEPER");
-        config.setString(
-                HighAvailabilityOptions.HA_STORAGE_PATH, temporaryFolder.getRoot().getPath());
+        config.set(HighAvailabilityOptions.HA_MODE, "ZOOKEEPER");
+        config.set(HighAvailabilityOptions.HA_STORAGE_PATH, tempDir.toString());
 
         BlobStoreService blobStoreService = null;
 
         try {
             blobStoreService = BlobUtils.createBlobStoreFromConfig(config);
 
-            testBlobFetchWithTooManyFailures(config, blobStoreService, new JobID(), PERMANENT_BLOB);
+            testBlobFetchWithTooManyFailures(blobStoreService, new JobID(), PERMANENT_BLOB);
         } finally {
             if (blobStoreService != null) {
-                blobStoreService.closeAndCleanupAllData();
+                blobStoreService.cleanupAllData();
+                blobStoreService.close();
             }
         }
     }
@@ -187,38 +159,26 @@ public class BlobCacheRetriesTest extends TestLogger {
      * A test where the BlobCache must use the BlobServer and the connection fails too often which
      * eventually fails the GET request.
      *
-     * @param config configuration to use (the BlobCache will get some additional settings set
-     *     compared to this one)
      * @param blobType whether the BLOB should become permanent or transient
      */
-    private static void testBlobFetchWithTooManyFailures(
-            final Configuration config,
-            final BlobStore blobStore,
-            @Nullable final JobID jobId,
-            BlobKey.BlobType blobType)
+    private void testBlobFetchWithTooManyFailures(
+            final BlobStore blobStore, @Nullable final JobID jobId, BlobKey.BlobType blobType)
             throws IOException {
-
         final byte[] data = new byte[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 0};
 
-        try (BlobServer server = new TestingFailingBlobServer(config, blobStore, 0, 10);
-                BlobCacheService cache =
-                        new BlobCacheService(
-                                config,
-                                new VoidBlobStore(),
-                                new InetSocketAddress("localhost", server.getPort()))) {
+        Tuple2<BlobServer, BlobCacheService> serverAndCache =
+                TestingBlobUtils.createFailingServerAndCache(tempDir, blobStore, 0, 10);
 
+        try (BlobServer server = serverAndCache.f0;
+                BlobCacheService cache = serverAndCache.f1) {
             server.start();
 
             // upload some blob
             final BlobKey key = put(server, jobId, data, blobType);
 
             // trigger a download - it should fail eventually
-            try {
-                verifyContents(cache, jobId, key, data);
-                fail("This should fail");
-            } catch (IOException e) {
-                // as we expected
-            }
+            assertThatThrownBy(() -> verifyContents(cache, jobId, key, data))
+                    .isInstanceOf(IOException.class);
         }
     }
 }

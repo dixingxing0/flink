@@ -18,55 +18,83 @@
 
 package org.apache.flink.cep;
 
+import org.apache.flink.api.common.eventtime.SerializableTimestampAssigner;
+import org.apache.flink.api.common.eventtime.TimestampAssignerSupplier;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.common.typeutils.base.LongSerializer;
 import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.cep.configuration.CEPCacheOptions;
 import org.apache.flink.cep.nfa.NFA;
 import org.apache.flink.cep.nfa.aftermatch.AfterMatchSkipStrategy;
 import org.apache.flink.cep.pattern.Pattern;
+import org.apache.flink.cep.pattern.WithinType;
+import org.apache.flink.cep.pattern.conditions.IterativeCondition;
 import org.apache.flink.cep.pattern.conditions.RichIterativeCondition;
 import org.apache.flink.cep.pattern.conditions.SimpleCondition;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
-import org.apache.flink.streaming.api.datastream.DataStreamUtils;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.AssignerWithPunctuatedWatermarks;
 import org.apache.flink.streaming.api.watermark.Watermark;
-import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.runtime.operators.util.WatermarkStrategyWithPunctuatedWatermarks;
 import org.apache.flink.test.util.AbstractTestBase;
-import org.apache.flink.types.Either;
+import org.apache.flink.testutils.junit.extensions.parameterized.Parameter;
+import org.apache.flink.testutils.junit.extensions.parameterized.ParameterizedTestExtension;
+import org.apache.flink.testutils.junit.extensions.parameterized.Parameters;
+import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.OutputTag;
 
-import org.junit.Test;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Comparator;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 
-import static org.junit.Assert.assertEquals;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** End to end tests of both CEP operators and {@link NFA}. */
 @SuppressWarnings("serial")
-public class CEPITCase extends AbstractTestBase {
+@ExtendWith(ParameterizedTestExtension.class)
+class CEPITCase extends AbstractTestBase {
+
+    @Parameter public Configuration envConfiguration;
+
+    @Parameters
+    public static Collection<Configuration> prepareSharedBufferCacheConfig() {
+        Configuration miniCacheConfig = new Configuration();
+        miniCacheConfig.set(CEPCacheOptions.CEP_CACHE_STATISTICS_INTERVAL, Duration.ofSeconds(1));
+        miniCacheConfig.set(CEPCacheOptions.CEP_SHARED_BUFFER_ENTRY_CACHE_SLOTS, 1);
+        miniCacheConfig.set(CEPCacheOptions.CEP_SHARED_BUFFER_EVENT_CACHE_SLOTS, 1);
+
+        Configuration bigCacheConfig = new Configuration();
+        miniCacheConfig.set(CEPCacheOptions.CEP_CACHE_STATISTICS_INTERVAL, Duration.ofSeconds(1));
+
+        return Arrays.asList(miniCacheConfig, bigCacheConfig);
+    }
 
     /**
      * Checks that a certain event sequence is recognized.
      *
      * @throws Exception
      */
-    @Test
-    public void testSimplePatternCEP() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testSimplePatternCEP() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
 
         DataStream<Event> input =
-                env.fromElements(
+                env.fromData(
                         new Event(1, "barfoo", 1.0),
                         new Event(2, "start", 2.0),
                         new Event(3, "foobar", 3.0),
@@ -79,33 +107,12 @@ public class CEPITCase extends AbstractTestBase {
 
         Pattern<Event, ?> pattern =
                 Pattern.<Event>begin("start")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("start");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("start")))
                         .followedByAny("middle")
                         .subtype(SubEvent.class)
-                        .where(
-                                new SimpleCondition<SubEvent>() {
-
-                                    @Override
-                                    public boolean filter(SubEvent value) throws Exception {
-                                        return value.getName().equals("middle");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("middle")))
                         .followedByAny("end")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("end");
-                                    }
-                                });
+                        .where(SimpleCondition.of(value -> value.getName().equals("end")));
 
         DataStream<String> result =
                 CEP.pattern(input, pattern)
@@ -126,18 +133,19 @@ public class CEPITCase extends AbstractTestBase {
 
         List<String> resultList = new ArrayList<>();
 
-        DataStreamUtils.collect(result).forEachRemaining(resultList::add);
+        result.executeAndCollect().forEachRemaining(resultList::add);
 
-        assertEquals(Arrays.asList("2,6,8"), resultList);
+        assertThat(resultList).containsExactly("2,6,8");
     }
 
-    @Test
-    public void testSimpleKeyedPatternCEP() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testSimpleKeyedPatternCEP() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
         env.setParallelism(2);
 
         DataStream<Event> input =
-                env.fromElements(
+                env.fromData(
                                 new Event(1, "barfoo", 1.0),
                                 new Event(2, "start", 2.0),
                                 new Event(3, "start", 2.1),
@@ -164,33 +172,12 @@ public class CEPITCase extends AbstractTestBase {
 
         Pattern<Event, ?> pattern =
                 Pattern.<Event>begin("start")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("start");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("start")))
                         .followedByAny("middle")
                         .subtype(SubEvent.class)
-                        .where(
-                                new SimpleCondition<SubEvent>() {
-
-                                    @Override
-                                    public boolean filter(SubEvent value) throws Exception {
-                                        return value.getName().equals("middle");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("middle")))
                         .followedByAny("end")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("end");
-                                    }
-                                });
+                        .where(SimpleCondition.of(value -> value.getName().equals("end")));
 
         DataStream<String> result =
                 CEP.pattern(input, pattern)
@@ -210,20 +197,19 @@ public class CEPITCase extends AbstractTestBase {
 
         List<String> resultList = new ArrayList<>();
 
-        DataStreamUtils.collect(result).forEachRemaining(resultList::add);
+        result.executeAndCollect().forEachRemaining(resultList::add);
 
-        resultList.sort(String::compareTo);
-
-        assertEquals(Arrays.asList("2,2,2", "3,3,3", "42,42,42"), resultList);
+        assertThat(resultList).containsExactlyInAnyOrder("2,2,2", "3,3,3", "42,42,42");
     }
 
-    @Test
-    public void testSimplePatternEventTime() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testSimplePatternEventTime() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
 
         // (Event, timestamp)
         DataStream<Event> input =
-                env.fromElements(
+                env.fromData(
                                 Tuple2.of(new Event(1, "start", 1.0), 5L),
                                 Tuple2.of(new Event(2, "middle", 2.0), 1L),
                                 Tuple2.of(new Event(3, "end", 3.0), 3L),
@@ -232,7 +218,8 @@ public class CEPITCase extends AbstractTestBase {
                                 // last element for high final watermark
                                 Tuple2.of(new Event(5, "middle", 5.0), 100L))
                         .assignTimestampsAndWatermarks(
-                                new AssignerWithPunctuatedWatermarks<Tuple2<Event, Long>>() {
+                                new WatermarkStrategyWithPunctuatedWatermarks<
+                                        Tuple2<Event, Long>>() {
 
                                     @Override
                                     public long extractTimestamp(
@@ -258,32 +245,11 @@ public class CEPITCase extends AbstractTestBase {
 
         Pattern<Event, ?> pattern =
                 Pattern.<Event>begin("start")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("start");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("start")))
                         .followedByAny("middle")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("middle");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("middle")))
                         .followedByAny("end")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("end");
-                                    }
-                                });
+                        .where(SimpleCondition.of(value -> value.getName().equals("end")));
 
         DataStream<String> result =
                 CEP.pattern(input, pattern)
@@ -306,21 +272,20 @@ public class CEPITCase extends AbstractTestBase {
 
         List<String> resultList = new ArrayList<>();
 
-        DataStreamUtils.collect(result).forEachRemaining(resultList::add);
+        result.executeAndCollect().forEachRemaining(resultList::add);
 
-        resultList.sort(String::compareTo);
-
-        assertEquals(Arrays.asList("1,5,4"), resultList);
+        assertThat(resultList).containsExactlyInAnyOrder("1,5,4");
     }
 
-    @Test
-    public void testSimpleKeyedPatternEventTime() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testSimpleKeyedPatternEventTime() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
         env.setParallelism(2);
 
         // (Event, timestamp)
         DataStream<Event> input =
-                env.fromElements(
+                env.fromData(
                                 Tuple2.of(new Event(1, "start", 1.0), 5L),
                                 Tuple2.of(new Event(1, "middle", 2.0), 1L),
                                 Tuple2.of(new Event(2, "middle", 2.0), 4L),
@@ -333,7 +298,8 @@ public class CEPITCase extends AbstractTestBase {
                                 Tuple2.of(new Event(3, "middle", 6.0), 9L),
                                 Tuple2.of(new Event(3, "end", 7.0), 7L))
                         .assignTimestampsAndWatermarks(
-                                new AssignerWithPunctuatedWatermarks<Tuple2<Event, Long>>() {
+                                new WatermarkStrategyWithPunctuatedWatermarks<
+                                        Tuple2<Event, Long>>() {
 
                                     @Override
                                     public long extractTimestamp(
@@ -367,32 +333,11 @@ public class CEPITCase extends AbstractTestBase {
 
         Pattern<Event, ?> pattern =
                 Pattern.<Event>begin("start")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("start");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("start")))
                         .followedByAny("middle")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("middle");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("middle")))
                         .followedByAny("end")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("end");
-                                    }
-                                });
+                        .where(SimpleCondition.of(value -> value.getName().equals("end")));
 
         DataStream<String> result =
                 CEP.pattern(input, pattern)
@@ -415,30 +360,22 @@ public class CEPITCase extends AbstractTestBase {
 
         List<String> resultList = new ArrayList<>();
 
-        DataStreamUtils.collect(result).forEachRemaining(resultList::add);
+        result.executeAndCollect().forEachRemaining(resultList::add);
 
-        resultList.sort(String::compareTo);
-
-        assertEquals(Arrays.asList("1,1,1", "2,2,2"), resultList);
+        assertThat(resultList).containsExactlyInAnyOrder("1,1,1", "2,2,2");
     }
 
-    @Test
-    public void testSimplePatternWithSingleState() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testSimplePatternWithSingleState() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
 
         DataStream<Tuple2<Integer, Integer>> input =
-                env.fromElements(new Tuple2<>(0, 1), new Tuple2<>(0, 2));
+                env.fromData(new Tuple2<>(0, 1), new Tuple2<>(0, 2));
 
         Pattern<Tuple2<Integer, Integer>, ?> pattern =
                 Pattern.<Tuple2<Integer, Integer>>begin("start")
-                        .where(
-                                new SimpleCondition<Tuple2<Integer, Integer>>() {
-                                    @Override
-                                    public boolean filter(Tuple2<Integer, Integer> rec)
-                                            throws Exception {
-                                        return rec.f1 == 1;
-                                    }
-                                });
+                        .where(SimpleCondition.of(rec -> rec.f1 == 1));
 
         PatternStream<Tuple2<Integer, Integer>> pStream =
                 CEP.pattern(input, pattern).inProcessingTime();
@@ -457,20 +394,32 @@ public class CEPITCase extends AbstractTestBase {
 
         List<Tuple2<Integer, Integer>> resultList = new ArrayList<>();
 
-        DataStreamUtils.collect(result).forEachRemaining(resultList::add);
+        result.executeAndCollect().forEachRemaining(resultList::add);
 
-        assertEquals(Arrays.asList(new Tuple2<>(0, 1)), resultList);
+        assertThat(resultList).containsExactly(new Tuple2<>(0, 1));
     }
 
-    @Test
-    public void testProcessingTimeWithWindow() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testProcessingTimeWithinBetweenFirstAndLast() throws Exception {
+        testProcessingTimeWithWindow(WithinType.FIRST_AND_LAST);
+    }
+
+    @TestTemplate
+    void testProcessingTimeWithinPreviousAndCurrent() throws Exception {
+        testProcessingTimeWithWindow(WithinType.PREVIOUS_AND_CURRENT);
+    }
+
+    private void testProcessingTimeWithWindow(WithinType withinType) throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
         env.setParallelism(1);
 
-        DataStream<Integer> input = env.fromElements(1, 2);
+        DataStream<Integer> input = env.fromData(1, 2);
 
         Pattern<Integer, ?> pattern =
-                Pattern.<Integer>begin("start").followedByAny("end").within(Time.days(1));
+                Pattern.<Integer>begin("start")
+                        .followedByAny("end")
+                        .within(Duration.ofDays(1), withinType);
 
         DataStream<Integer> result =
                 CEP.pattern(input, pattern)
@@ -487,25 +436,27 @@ public class CEPITCase extends AbstractTestBase {
 
         List<Integer> resultList = new ArrayList<>();
 
-        DataStreamUtils.collect(result).forEachRemaining(resultList::add);
+        result.executeAndCollect().forEachRemaining(resultList::add);
 
-        assertEquals(Arrays.asList(3), resultList);
+        assertThat(resultList).containsExactly(3);
     }
 
-    @Test
-    public void testTimeoutHandling() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testTimeoutHandlingWithinFirstAndLast() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
         env.setParallelism(1);
 
         // (Event, timestamp)
         DataStream<Event> input =
-                env.fromElements(
+                env.fromData(
                                 Tuple2.of(new Event(1, "start", 1.0), 1L),
                                 Tuple2.of(new Event(1, "middle", 2.0), 5L),
                                 Tuple2.of(new Event(1, "start", 2.0), 4L),
                                 Tuple2.of(new Event(1, "end", 2.0), 6L))
                         .assignTimestampsAndWatermarks(
-                                new AssignerWithPunctuatedWatermarks<Tuple2<Event, Long>>() {
+                                new WatermarkStrategyWithPunctuatedWatermarks<
+                                        Tuple2<Event, Long>>() {
 
                                     @Override
                                     public long extractTimestamp(
@@ -531,37 +482,18 @@ public class CEPITCase extends AbstractTestBase {
 
         Pattern<Event, ?> pattern =
                 Pattern.<Event>begin("start")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("start");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("start")))
                         .followedByAny("middle")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("middle");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("middle")))
                         .followedByAny("end")
-                        .where(
-                                new SimpleCondition<Event>() {
+                        .where(SimpleCondition.of(value -> value.getName().equals("end")))
+                        .within(Duration.ofMillis(3));
 
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("end");
-                                    }
-                                })
-                        .within(Time.milliseconds(3));
-
-        DataStream<Either<String, String>> result =
+        OutputTag<String> outputTag = new OutputTag<String>("side-output") {};
+        SingleOutputStreamOperator<String> result =
                 CEP.pattern(input, pattern)
                         .select(
+                                outputTag,
                                 new PatternTimeoutFunction<Event, String>() {
                                     @Override
                                     public String timeout(
@@ -586,20 +518,104 @@ public class CEPITCase extends AbstractTestBase {
                                     }
                                 });
 
-        List<Either<String, String>> resultList = new ArrayList<>();
+        List<String> resultList = new ArrayList<>();
 
-        DataStreamUtils.collect(result).forEachRemaining(resultList::add);
+        result.executeAndCollect().forEachRemaining(resultList::add);
 
-        resultList.sort(Comparator.comparing(either -> either.toString()));
+        List<String> timeoutList = new ArrayList<>();
+        result.getSideOutput(outputTag).executeAndCollect().forEachRemaining(timeoutList::add);
 
-        List<Either<String, String>> expected =
-                Arrays.asList(
-                        Either.Left.of("1.0"),
-                        Either.Left.of("2.0"),
-                        Either.Left.of("2.0"),
-                        Either.Right.of("2.0,2.0,2.0"));
+        assertThat(timeoutList).containsExactlyInAnyOrder("1.0", "2.0", "2.0");
+        assertThat(resultList).containsExactlyInAnyOrder("2.0,2.0,2.0");
+    }
 
-        assertEquals(expected, resultList);
+    @TestTemplate
+    void testTimeoutHandlingWithinPreviousAndCurrent() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
+        env.setParallelism(1);
+
+        // (Event, timestamp)
+        DataStream<Event> input =
+                env.fromData(
+                                Tuple2.of(new Event(1, "start", 1.0), 1L),
+                                Tuple2.of(new Event(1, "middle", 2.0), 5L),
+                                Tuple2.of(new Event(1, "start", 2.0), 4L),
+                                Tuple2.of(new Event(1, "end", 2.0), 6L))
+                        .assignTimestampsAndWatermarks(
+                                new WatermarkStrategyWithPunctuatedWatermarks<
+                                        Tuple2<Event, Long>>() {
+
+                                    @Override
+                                    public long extractTimestamp(
+                                            Tuple2<Event, Long> element, long currentTimestamp) {
+                                        return element.f1;
+                                    }
+
+                                    @Override
+                                    public Watermark checkAndGetNextWatermark(
+                                            Tuple2<Event, Long> lastElement,
+                                            long extractedTimestamp) {
+                                        return new Watermark(lastElement.f1 - 5);
+                                    }
+                                })
+                        .map(
+                                new MapFunction<Tuple2<Event, Long>, Event>() {
+
+                                    @Override
+                                    public Event map(Tuple2<Event, Long> value) throws Exception {
+                                        return value.f0;
+                                    }
+                                });
+
+        Pattern<Event, ?> pattern =
+                Pattern.<Event>begin("start")
+                        .where(SimpleCondition.of(value -> value.getName().equals("start")))
+                        .followedByAny("middle")
+                        .where(SimpleCondition.of(value -> value.getName().equals("middle")))
+                        .followedByAny("end")
+                        .where(SimpleCondition.of(value -> value.getName().equals("end")))
+                        .within(Duration.ofMillis(3), WithinType.PREVIOUS_AND_CURRENT);
+
+        OutputTag<String> outputTag = new OutputTag<String>("side-output") {};
+
+        SingleOutputStreamOperator<String> result =
+                CEP.pattern(input, pattern)
+                        .select(
+                                outputTag,
+                                new PatternTimeoutFunction<Event, String>() {
+                                    @Override
+                                    public String timeout(
+                                            Map<String, List<Event>> pattern, long timeoutTimestamp)
+                                            throws Exception {
+                                        return pattern.get("start").get(0).getPrice() + "";
+                                    }
+                                },
+                                new PatternSelectFunction<Event, String>() {
+
+                                    @Override
+                                    public String select(Map<String, List<Event>> pattern) {
+                                        StringBuilder builder = new StringBuilder();
+
+                                        builder.append(pattern.get("start").get(0).getPrice())
+                                                .append(",")
+                                                .append(pattern.get("middle").get(0).getPrice())
+                                                .append(",")
+                                                .append(pattern.get("end").get(0).getPrice());
+
+                                        return builder.toString();
+                                    }
+                                });
+
+        List<String> resultList = new ArrayList<>();
+
+        result.executeAndCollect().forEachRemaining(resultList::add);
+
+        List<String> timeoutList = new ArrayList<>();
+        result.getSideOutput(outputTag).executeAndCollect().forEachRemaining(timeoutList::add);
+
+        assertThat(timeoutList).containsExactlyInAnyOrder("1.0", "2.0");
+        assertThat(resultList).containsExactlyInAnyOrder("1.0,2.0,2.0", "2.0,2.0,2.0");
     }
 
     /**
@@ -607,12 +623,13 @@ public class CEPITCase extends AbstractTestBase {
      *
      * @throws Exception
      */
-    @Test
-    public void testSimpleOrFilterPatternCEP() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testSimpleOrFilterPatternCEP() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
 
         DataStream<Event> input =
-                env.fromElements(
+                env.fromData(
                         new Event(1, "start", 1.0),
                         new Event(2, "middle", 2.0),
                         new Event(3, "end", 3.0),
@@ -622,37 +639,12 @@ public class CEPITCase extends AbstractTestBase {
 
         Pattern<Event, ?> pattern =
                 Pattern.<Event>begin("start")
-                        .where(
-                                new SimpleCondition<Event>() {
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("start");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("start")))
                         .followedByAny("middle")
-                        .where(
-                                new SimpleCondition<Event>() {
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getPrice() == 2.0;
-                                    }
-                                })
-                        .or(
-                                new SimpleCondition<Event>() {
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getPrice() == 5.0;
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getPrice() == 2.0))
+                        .or(SimpleCondition.of(value -> value.getPrice() == 5.0))
                         .followedByAny("end")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("end");
-                                    }
-                                });
+                        .where(SimpleCondition.of(value -> value.getName().equals("end")));
 
         DataStream<String> result =
                 CEP.pattern(input, pattern)
@@ -676,15 +668,9 @@ public class CEPITCase extends AbstractTestBase {
 
         List<String> resultList = new ArrayList<>();
 
-        DataStreamUtils.collect(result).forEachRemaining(resultList::add);
+        result.executeAndCollect().forEachRemaining(resultList::add);
 
-        List<String> expected = Arrays.asList("1,5,6", "1,2,3", "4,5,6", "1,2,6");
-
-        expected.sort(String::compareTo);
-
-        resultList.sort(String::compareTo);
-
-        assertEquals(expected, resultList);
+        assertThat(resultList).containsExactlyInAnyOrder("1,5,6", "1,2,3", "4,5,6", "1,2,6");
     }
 
     /**
@@ -692,13 +678,14 @@ public class CEPITCase extends AbstractTestBase {
      *
      * @throws Exception
      */
-    @Test
-    public void testSimplePatternEventTimeWithComparator() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testSimplePatternEventTimeWithComparator() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
 
         // (Event, timestamp)
         DataStream<Event> input =
-                env.fromElements(
+                env.fromData(
                                 Tuple2.of(new Event(1, "start", 1.0), 5L),
                                 Tuple2.of(new Event(2, "middle", 2.0), 1L),
                                 Tuple2.of(new Event(3, "end", 3.0), 3L),
@@ -708,7 +695,8 @@ public class CEPITCase extends AbstractTestBase {
                                 // last element for high final watermark
                                 Tuple2.of(new Event(7, "middle", 5.0), 100L))
                         .assignTimestampsAndWatermarks(
-                                new AssignerWithPunctuatedWatermarks<Tuple2<Event, Long>>() {
+                                new WatermarkStrategyWithPunctuatedWatermarks<
+                                        Tuple2<Event, Long>>() {
 
                                     @Override
                                     public long extractTimestamp(
@@ -736,32 +724,11 @@ public class CEPITCase extends AbstractTestBase {
 
         Pattern<Event, ? extends Event> pattern =
                 Pattern.<Event>begin("start")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("start");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("start")))
                         .followedByAny("middle")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("middle");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("middle")))
                         .followedByAny("end")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("end");
-                                    }
-                                });
+                        .where(SimpleCondition.of(value -> value.getName().equals("end")));
 
         DataStream<String> result =
                 CEP.pattern(input, pattern, comparator)
@@ -784,15 +751,9 @@ public class CEPITCase extends AbstractTestBase {
 
         List<String> resultList = new ArrayList<>();
 
-        DataStreamUtils.collect(result).forEachRemaining(resultList::add);
+        result.executeAndCollect().forEachRemaining(resultList::add);
 
-        List<String> expected = Arrays.asList("1,6,4", "1,5,4");
-
-        expected.sort(String::compareTo);
-
-        resultList.sort(String::compareTo);
-
-        assertEquals(expected, resultList);
+        assertThat(resultList).containsExactlyInAnyOrder("1,6,4", "1,5,4");
     }
 
     private static class CustomEventComparator implements EventComparator<Event> {
@@ -802,12 +763,13 @@ public class CEPITCase extends AbstractTestBase {
         }
     }
 
-    @Test
-    public void testSimpleAfterMatchSkip() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testSimpleAfterMatchSkip() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
 
         DataStream<Tuple2<Integer, String>> input =
-                env.fromElements(
+                env.fromData(
                         new Tuple2<>(1, "a"),
                         new Tuple2<>(2, "a"),
                         new Tuple2<>(3, "a"),
@@ -816,14 +778,7 @@ public class CEPITCase extends AbstractTestBase {
         Pattern<Tuple2<Integer, String>, ?> pattern =
                 Pattern.<Tuple2<Integer, String>>begin(
                                 "start", AfterMatchSkipStrategy.skipPastLastEvent())
-                        .where(
-                                new SimpleCondition<Tuple2<Integer, String>>() {
-                                    @Override
-                                    public boolean filter(Tuple2<Integer, String> rec)
-                                            throws Exception {
-                                        return rec.f1.equals("a");
-                                    }
-                                })
+                        .where(SimpleCondition.of(rec -> rec.f1.equals("a")))
                         .times(2);
 
         PatternStream<Tuple2<Integer, String>> pStream =
@@ -843,22 +798,18 @@ public class CEPITCase extends AbstractTestBase {
 
         List<Tuple2<Integer, String>> resultList = new ArrayList<>();
 
-        DataStreamUtils.collect(result).forEachRemaining(resultList::add);
+        result.executeAndCollect().forEachRemaining(resultList::add);
 
-        resultList.sort(Comparator.comparing(tuple2 -> tuple2.toString()));
-
-        List<Tuple2<Integer, String>> expected =
-                Arrays.asList(Tuple2.of(1, "a"), Tuple2.of(3, "a"));
-
-        assertEquals(expected, resultList);
+        assertThat(resultList).containsExactlyInAnyOrder(Tuple2.of(1, "a"), Tuple2.of(3, "a"));
     }
 
-    @Test
-    public void testRichPatternFlatSelectFunction() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testRichPatternFlatSelectFunction() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
 
         DataStream<Event> input =
-                env.fromElements(
+                env.fromData(
                         new Event(1, "barfoo", 1.0),
                         new Event(2, "start", 2.0),
                         new Event(3, "foobar", 3.0),
@@ -882,23 +833,9 @@ public class CEPITCase extends AbstractTestBase {
                                 })
                         .followedByAny("middle")
                         .subtype(SubEvent.class)
-                        .where(
-                                new SimpleCondition<SubEvent>() {
-
-                                    @Override
-                                    public boolean filter(SubEvent value) throws Exception {
-                                        return value.getName().equals("middle");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("middle")))
                         .followedByAny("end")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("end");
-                                    }
-                                });
+                        .where(SimpleCondition.of(value -> value.getName().equals("end")));
 
         DataStream<String> result =
                 CEP.pattern(input, pattern)
@@ -907,7 +844,7 @@ public class CEPITCase extends AbstractTestBase {
                                 new RichPatternFlatSelectFunction<Event, String>() {
 
                                     @Override
-                                    public void open(Configuration config) {
+                                    public void open(OpenContext openContext) {
                                         try {
                                             getRuntimeContext()
                                                     .getMapState(
@@ -943,18 +880,19 @@ public class CEPITCase extends AbstractTestBase {
 
         List<String> resultList = new ArrayList<>();
 
-        DataStreamUtils.collect(result).forEachRemaining(resultList::add);
+        result.executeAndCollect().forEachRemaining(resultList::add);
 
-        assertEquals(Arrays.asList("2,6,8"), resultList);
+        assertThat(resultList).containsExactly("2,6,8");
     }
 
-    @Test
-    public void testRichPatternSelectFunction() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testRichPatternSelectFunction() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
         env.setParallelism(2);
 
         DataStream<Event> input =
-                env.fromElements(
+                env.fromData(
                                 new Event(1, "barfoo", 1.0),
                                 new Event(2, "start", 2.0),
                                 new Event(3, "start", 2.1),
@@ -992,23 +930,9 @@ public class CEPITCase extends AbstractTestBase {
                                 })
                         .followedByAny("middle")
                         .subtype(SubEvent.class)
-                        .where(
-                                new SimpleCondition<SubEvent>() {
-
-                                    @Override
-                                    public boolean filter(SubEvent value) throws Exception {
-                                        return value.getName().equals("middle");
-                                    }
-                                })
+                        .where(SimpleCondition.of(value -> value.getName().equals("middle")))
                         .followedByAny("end")
-                        .where(
-                                new SimpleCondition<Event>() {
-
-                                    @Override
-                                    public boolean filter(Event value) throws Exception {
-                                        return value.getName().equals("end");
-                                    }
-                                });
+                        .where(SimpleCondition.of(value -> value.getName().equals("end")));
 
         DataStream<String> result =
                 CEP.pattern(input, pattern)
@@ -1016,7 +940,7 @@ public class CEPITCase extends AbstractTestBase {
                         .select(
                                 new RichPatternSelectFunction<Event, String>() {
                                     @Override
-                                    public void open(Configuration config) {
+                                    public void open(OpenContext openContext) {
                                         try {
                                             getRuntimeContext()
                                                     .getMapState(
@@ -1050,18 +974,18 @@ public class CEPITCase extends AbstractTestBase {
 
         List<String> resultList = new ArrayList<>();
 
-        DataStreamUtils.collect(result).forEachRemaining(resultList::add);
+        result.executeAndCollect().forEachRemaining(resultList::add);
 
-        resultList.sort(String::compareTo);
-
-        assertEquals(Arrays.asList("2,2,2", "3,3,3", "42,42,42"), resultList);
+        assertThat(resultList).containsExactlyInAnyOrder("2,2,2", "3,3,3", "42,42,42");
     }
 
-    @Test
-    public void testFlatSelectSerializationWithAnonymousClass() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    @TestTemplate
+    void testFlatSelectSerializationWithAnonymousClass() throws Exception {
 
-        DataStreamSource<Integer> elements = env.fromElements(1, 2, 3);
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
+
+        DataStreamSource<Integer> elements = env.fromData(1, 2, 3);
         OutputTag<Integer> outputTag = new OutputTag<Integer>("AAA") {};
         CEP.pattern(elements, Pattern.begin("A"))
                 .inProcessingTime()
@@ -1083,5 +1007,70 @@ public class CEPITCase extends AbstractTestBase {
                         });
 
         env.execute();
+    }
+
+    @TestTemplate
+    void testPartialMatchTimeoutOutputCompletedMatch() throws Exception {
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(envConfiguration);
+
+        // (Event, timestamp)
+        DataStream<Event> input =
+                env.fromData(
+                                Tuple2.of(new Event(1, "start", 1.0), 0L),
+                                Tuple2.of(new Event(2, "start", 2.0), 1L),
+                                Tuple2.of(new Event(3, "start", 3.0), 2L),
+                                Tuple2.of(new Event(4, "start", 4.0), 3L),
+                                Tuple2.of(new Event(5, "end", 5.0), 4L))
+                        .assignTimestampsAndWatermarks(
+                                WatermarkStrategy.<Tuple2<Event, Long>>forBoundedOutOfOrderness(
+                                                Duration.ofMillis(5))
+                                        .withTimestampAssigner(
+                                                TimestampAssignerSupplier.of(
+                                                        (SerializableTimestampAssigner<
+                                                                        Tuple2<Event, Long>>)
+                                                                (element, recordTimestamp) ->
+                                                                        element.f1)))
+                        .map((MapFunction<Tuple2<Event, Long>, Event>) value -> value.f0);
+
+        Pattern<Event, ?> pattern =
+                Pattern.<Event>begin("start", AfterMatchSkipStrategy.skipPastLastEvent())
+                        .where(SimpleCondition.of(value -> value.getName().equals("start")))
+                        .oneOrMore()
+                        .consecutive()
+                        .greedy()
+                        .followedBy("middle")
+                        .where(
+                                new IterativeCondition<Event>() {
+                                    @Override
+                                    public boolean filter(Event value, Context<Event> ctx)
+                                            throws Exception {
+                                        int count = 0;
+                                        for (Event ignored : ctx.getEventsForPattern("start")) {
+                                            count++;
+                                        }
+                                        if (count > 2) {
+                                            return value.getName().equals("middle");
+                                        } else {
+                                            return value.getName().equals("end");
+                                        }
+                                    }
+                                })
+                        .within(Duration.ofMillis(100L));
+
+        DataStream<String> result =
+                CEP.pattern(input, pattern)
+                        .select(
+                                (PatternSelectFunction<Event, String>)
+                                        pattern1 ->
+                                                pattern1.get("start").get(0).getId()
+                                                        + ","
+                                                        + pattern1.get("middle").get(0).getId());
+
+        List<String> resultList = new ArrayList<>();
+        try (CloseableIterator<String> iterator = result.executeAndCollect()) {
+            iterator.forEachRemaining(resultList::add);
+        }
+        assertThat(resultList).containsExactlyInAnyOrder("3,5");
     }
 }

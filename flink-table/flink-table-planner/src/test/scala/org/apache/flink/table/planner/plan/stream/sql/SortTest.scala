@@ -1,0 +1,50 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.flink.table.planner.plan.stream.sql
+
+import org.apache.flink.table.api._
+import org.apache.flink.table.planner.utils.TableTestBase
+
+import org.junit.jupiter.api.Test
+
+class SortTest extends TableTestBase {
+
+  private val util = streamTestUtil()
+  util
+    .addDataStream[(Int, String, Long)]("MyTable", 'a, 'b, 'c, 'proctime.proctime, 'rowtime.rowtime)
+
+  @Test
+  def testSortProcessingTime(): Unit = {
+    // be converted to TemporalSort
+    util.verifyExecPlan("SELECT a FROM MyTable ORDER BY proctime, c")
+  }
+
+  @Test
+  def testSortRowTime(): Unit = {
+    // be converted to TemporalSort
+    util.verifyExecPlan("SELECT a FROM MyTable ORDER BY rowtime, c")
+  }
+
+  @Test
+  def testSortOnRowTimeAlias(): Unit = {
+    util.verifyExecPlan("SELECT a, rowtime AS t FROM MyTable ORDER BY t, c")
+  }
+
+  // Non-temporal streaming sorts (first sort field is not an ascending time attribute) are now
+  // rejected during optimization; see SortValidationTest for the corresponding negative cases.
+}

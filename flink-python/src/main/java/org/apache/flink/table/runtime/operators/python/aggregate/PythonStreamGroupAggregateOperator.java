@@ -23,12 +23,12 @@ import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.fnexecution.v1.FlinkFnApi;
 import org.apache.flink.table.functions.python.PythonAggregateFunctionInfo;
-import org.apache.flink.table.planner.typeutils.DataViewUtils;
+import org.apache.flink.table.runtime.dataview.DataViewSpec;
 import org.apache.flink.table.types.logical.RowType;
 
-/** The Python AggregateFunction operator for the blink planner. */
+/** The Python AggregateFunction operator. */
 @Internal
-public class PythonStreamGroupAggregateOperator extends AbstractPythonStreamAggregateOperator {
+public class PythonStreamGroupAggregateOperator extends AbstractPythonStreamGroupAggregateOperator {
 
     private static final long serialVersionUID = 1L;
 
@@ -44,7 +44,7 @@ public class PythonStreamGroupAggregateOperator extends AbstractPythonStreamAggr
             RowType inputType,
             RowType outputType,
             PythonAggregateFunctionInfo[] aggregateFunctions,
-            DataViewUtils.DataViewSpec[][] dataViewSpecs,
+            DataViewSpec[][] dataViewSpecs,
             int[] grouping,
             int indexOfCountStar,
             boolean countStarInserted,

@@ -27,8 +27,7 @@ under the License.
 	<parent>
 		<groupId>org.apache.flink</groupId>
 		<artifactId>flink-parent</artifactId>
-		<version>1.13-SNAPSHOT</version>
-		<relativePath>..</relativePath>
+		<version>2.5-SNAPSHOT</version>
 	</parent>
 
 	<artifactId>flink-state-backends</artifactId>
@@ -39,5 +38,8 @@ under the License.
 	<modules>
 		<module>flink-statebackend-rocksdb</module>
 		<module>flink-statebackend-heap-spillable</module>
-	</modules>
+		<module>flink-statebackend-changelog</module>
+		<module>flink-statebackend-common</module>
+        <module>flink-statebackend-forst</module>
+    </modules>
 </project>

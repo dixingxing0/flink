@@ -1,0 +1,3100 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.flink.table.planner.functions.casting;
+
+import org.apache.flink.api.common.typeutils.base.LocalDateSerializer;
+import org.apache.flink.api.common.typeutils.base.LocalDateTimeSerializer;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.TableRuntimeException;
+import org.apache.flink.table.api.config.ExecutionConfigOptions;
+import org.apache.flink.table.catalog.ObjectIdentifier;
+import org.apache.flink.table.data.DecimalData;
+import org.apache.flink.table.data.GenericArrayData;
+import org.apache.flink.table.data.GenericMapData;
+import org.apache.flink.table.data.GenericRowData;
+import org.apache.flink.table.data.MapData;
+import org.apache.flink.table.data.RawValueData;
+import org.apache.flink.table.data.StringData;
+import org.apache.flink.table.data.TimestampData;
+import org.apache.flink.table.data.binary.BinaryStringDataUtil;
+import org.apache.flink.table.data.utils.CastExecutor;
+import org.apache.flink.table.planner.codegen.CodeGeneratorContext;
+import org.apache.flink.table.planner.functions.CastFunctionITCase;
+import org.apache.flink.table.types.DataType;
+import org.apache.flink.table.types.logical.DistinctType;
+import org.apache.flink.table.types.logical.StructuredType;
+import org.apache.flink.table.utils.DateTimeUtils;
+import org.apache.flink.types.bitmap.Bitmap;
+import org.apache.flink.types.variant.BinaryVariant;
+import org.apache.flink.types.variant.BinaryVariantInternalBuilder;
+import org.apache.flink.types.variant.Variant;
+import org.apache.flink.types.variant.VariantBuilder;
+
+import org.assertj.core.api.AbstractThrowableAssert;
+import org.junit.jupiter.api.DynamicTest;
+import org.junit.jupiter.api.TestFactory;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
+
+import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
+import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+
+import static org.apache.flink.table.api.DataTypes.ARRAY;
+import static org.apache.flink.table.api.DataTypes.BIGINT;
+import static org.apache.flink.table.api.DataTypes.BINARY;
+import static org.apache.flink.table.api.DataTypes.BITMAP;
+import static org.apache.flink.table.api.DataTypes.BOOLEAN;
+import static org.apache.flink.table.api.DataTypes.BYTES;
+import static org.apache.flink.table.api.DataTypes.CHAR;
+import static org.apache.flink.table.api.DataTypes.DATE;
+import static org.apache.flink.table.api.DataTypes.DAY;
+import static org.apache.flink.table.api.DataTypes.DECIMAL;
+import static org.apache.flink.table.api.DataTypes.DOUBLE;
+import static org.apache.flink.table.api.DataTypes.FIELD;
+import static org.apache.flink.table.api.DataTypes.FLOAT;
+import static org.apache.flink.table.api.DataTypes.INT;
+import static org.apache.flink.table.api.DataTypes.INTERVAL;
+import static org.apache.flink.table.api.DataTypes.MAP;
+import static org.apache.flink.table.api.DataTypes.MONTH;
+import static org.apache.flink.table.api.DataTypes.MULTISET;
+import static org.apache.flink.table.api.DataTypes.NULL;
+import static org.apache.flink.table.api.DataTypes.RAW;
+import static org.apache.flink.table.api.DataTypes.ROW;
+import static org.apache.flink.table.api.DataTypes.SECOND;
+import static org.apache.flink.table.api.DataTypes.SMALLINT;
+import static org.apache.flink.table.api.DataTypes.STRING;
+import static org.apache.flink.table.api.DataTypes.STRUCTURED;
+import static org.apache.flink.table.api.DataTypes.TIME;
+import static org.apache.flink.table.api.DataTypes.TIMESTAMP;
+import static org.apache.flink.table.api.DataTypes.TIMESTAMP_LTZ;
+import static org.apache.flink.table.api.DataTypes.TINYINT;
+import static org.apache.flink.table.api.DataTypes.UUID;
+import static org.apache.flink.table.api.DataTypes.VARBINARY;
+import static org.apache.flink.table.api.DataTypes.VARCHAR;
+import static org.apache.flink.table.api.DataTypes.VARIANT;
+import static org.apache.flink.table.api.DataTypes.YEAR;
+import static org.apache.flink.table.data.DecimalData.fromBigDecimal;
+import static org.apache.flink.table.data.StringData.fromString;
+import static org.apache.flink.table.data.binary.BinaryStringData.EMPTY_UTF8;
+import static org.apache.flink.table.test.TableAssertions.assertThatGenericDataOfType;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/**
+ * This class runs unit tests of {@link CastRule} implementations. For IT test cases, check out the
+ * {@link CastFunctionITCase}
+ */
+@Execution(ExecutionMode.CONCURRENT)
+class CastRulesTest {
+
+    private static final ZoneId CET = ZoneId.of("CET");
+
+    private static final CodeGeneratorContext CTX =
+            new CodeGeneratorContext(
+                    new Configuration(), Thread.currentThread().getContextClassLoader());
+
+    private static final CodeGeneratorContext CTX_LEGACY_BYTES_TO_STRING =
+            new CodeGeneratorContext(
+                    new Configuration()
+                            .set(
+                                    ExecutionConfigOptions.TABLE_EXEC_LEGACY_BYTES_TO_STRING_CAST,
+                                    true),
+                    Thread.currentThread().getContextClassLoader());
+
+    private static final CastRule.Context CET_CONTEXT =
+            CastRule.Context.create(
+                    false, false, CET, Thread.currentThread().getContextClassLoader(), CTX);
+    private static final CastRule.Context CET_CONTEXT_LEGACY =
+            CastRule.Context.create(
+                    false, true, CET, Thread.currentThread().getContextClassLoader(), CTX);
+
+    private static final byte DEFAULT_POSITIVE_TINY_INT = (byte) 5;
+    private static final byte DEFAULT_NEGATIVE_TINY_INT = (byte) -5;
+    private static final short DEFAULT_POSITIVE_SMALL_INT = (short) 12345;
+    private static final short DEFAULT_NEGATIVE_SMALL_INT = (short) -12345;
+    private static final int DEFAULT_POSITIVE_INT = 1234567;
+    private static final int DEFAULT_NEGATIVE_INT = -1234567;
+    private static final long DEFAULT_POSITIVE_BIGINT = 12345678901L;
+    private static final long DEFAULT_NEGATIVE_BIGINT = -12345678901L;
+    private static final float DEFAULT_POSITIVE_FLOAT = 123.456f;
+    private static final float DEFAULT_NEGATIVE_FLOAT = -123.456f;
+    private static final double DEFAULT_POSITIVE_DOUBLE = 123.456789d;
+    private static final double DEFAULT_NEGATIVE_DOUBLE = -123.456789d;
+
+    private static final int DATE = DateTimeUtils.toInternal(LocalDate.parse("2021-09-24"));
+    private static final int TIME = DateTimeUtils.toInternal(LocalTime.parse("12:34:56.12345"));
+    private static final StringData DATE_STRING = fromString("2021-09-24");
+    private static final StringData TIME_STRING = fromString("12:34:56.123");
+
+    private static final TimestampData TIMESTAMP =
+            TimestampData.fromLocalDateTime(LocalDateTime.parse("2021-09-24T12:34:56.123456"));
+    private static final TimestampData TIMESTAMP_LTZ =
+            timestampDataFromInstant(2022, 1, 4, 12, 34, 56, 123456780);
+    private static final StringData TIMESTAMP_STRING = fromString("2021-09-24 12:34:56.123456");
+    private static final StringData TIMESTAMP_STRING_CET = fromString("2021-09-24 14:34:56.123456");
+
+    private static final Bitmap DEFAULT_BITMAP = Bitmap.fromArray(new int[] {0, 1, 2});
+
+    private static final String UUID_STRING = "550e8400-e29b-41d4-a716-446655440000";
+    private static final UUID UUID_VALUE = UUID.fromString(UUID_STRING);
+    private static final byte[] UUID_BYTES = uuidBytes(UUID_STRING);
+
+    private static byte[] uuidBytes(String uuid) {
+        final UUID value = UUID.fromString(uuid);
+        final byte[] result = new byte[16];
+        ByteBuffer.wrap(result)
+                .putLong(value.getMostSignificantBits())
+                .putLong(value.getLeastSignificantBits());
+        return result;
+    }
+
+    /** A two-byte lead followed by a byte that is not a continuation byte. */
+    private static final byte[] INVALID_UTF8 = new byte[] {(byte) 0xC3, (byte) 0x28};
+
+    /** U+1D54F, one code point but two UTF-16 units and four UTF-8 bytes. */
+    private static final String NON_BMP = "𝕏";
+
+    private static final VariantBuilder VARIANT_BUILDER = Variant.newBuilder();
+    private static final Variant VARIANT_ARRAY =
+            VARIANT_BUILDER
+                    .array()
+                    .add(VARIANT_BUILDER.of(1))
+                    .add(VARIANT_BUILDER.of("two"))
+                    .add(VARIANT_BUILDER.of(false))
+                    .add(VARIANT_BUILDER.ofNull())
+                    .build();
+
+    private static final Variant VARIANT_OBJECT =
+            VARIANT_BUILDER
+                    .object()
+                    .add(
+                            "k",
+                            VARIANT_BUILDER
+                                    .array()
+                                    .add(VARIANT_BUILDER.of(1))
+                                    .add(VARIANT_BUILDER.of(2))
+                                    .build())
+                    .build();
+
+    /** {@code [1, 2, 3]}, the design's running array value. */
+    private static final Variant VARIANT_INT_ARRAY =
+            VARIANT_BUILDER
+                    .array()
+                    .add(VARIANT_BUILDER.of(1))
+                    .add(VARIANT_BUILDER.of(2))
+                    .add(VARIANT_BUILDER.of(3))
+                    .build();
+
+    /** {@code [1, null, 3]}, an array carrying a VARIANT null element. */
+    private static final Variant VARIANT_INT_ARRAY_WITH_NULL =
+            VARIANT_BUILDER
+                    .array()
+                    .add(VARIANT_BUILDER.of(1))
+                    .add(VARIANT_BUILDER.ofNull())
+                    .add(VARIANT_BUILDER.of(3))
+                    .build();
+
+    /**
+     * {@code ["1", "22", "333"]}, stored strings of different lengths a numeric leaf must not
+     * parse.
+     */
+    private static final Variant VARIANT_STRING_ARRAY =
+            VARIANT_BUILDER
+                    .array()
+                    .add(VARIANT_BUILDER.of("1"))
+                    .add(VARIANT_BUILDER.of("22"))
+                    .add(VARIANT_BUILDER.of("333"))
+                    .build();
+
+    /** {@code [1, "a", 2, "b"]}, a heterogeneous array of integers and strings. */
+    private static final Variant VARIANT_MIXED_ARRAY =
+            VARIANT_BUILDER
+                    .array()
+                    .add(VARIANT_BUILDER.of(1))
+                    .add(VARIANT_BUILDER.of("a"))
+                    .add(VARIANT_BUILDER.of(2))
+                    .add(VARIANT_BUILDER.of("b"))
+                    .build();
+
+    /** {@code [[1, 2], [3]]}, a nested array of arrays. */
+    private static final Variant VARIANT_NESTED_ARRAY =
+            VARIANT_BUILDER
+                    .array()
+                    .add(
+                            VARIANT_BUILDER
+                                    .array()
+                                    .add(VARIANT_BUILDER.of(1))
+                                    .add(VARIANT_BUILDER.of(2))
+                                    .build())
+                    .add(VARIANT_BUILDER.array().add(VARIANT_BUILDER.of(3)).build())
+                    .build();
+
+    private static final Variant VARIANT_EMPTY_ARRAY = VARIANT_BUILDER.array().build();
+
+    /** {@code {"id": 7, "name": "ada", "active": true}}, the design's running object value. */
+    private static final Variant VARIANT_RECORD =
+            Variant.newBuilder()
+                    .object()
+                    .add("id", Variant.newBuilder().of(7))
+                    .add("name", Variant.newBuilder().of("ada"))
+                    .add("active", Variant.newBuilder().of(true))
+                    .build();
+
+    /**
+     * {@code {"id": 7, "email": null}}, an object with a field explicitly set to a VARIANT null.
+     */
+    private static final Variant VARIANT_RECORD_WITH_NULL =
+            Variant.newBuilder()
+                    .object()
+                    .add("id", Variant.newBuilder().of(7))
+                    .add("email", Variant.newBuilder().ofNull())
+                    .build();
+
+    /** {@code {"user": {"id": 1, "since": "2020-01-01"}, "tags": ["x", "y"]}}, a nested value. */
+    private static final Variant VARIANT_NESTED =
+            Variant.newBuilder()
+                    .object()
+                    .add(
+                            "user",
+                            Variant.newBuilder()
+                                    .object()
+                                    .add("id", Variant.newBuilder().of(1))
+                                    .add("since", Variant.newBuilder().of("2020-01-01"))
+                                    .build())
+                    .add(
+                            "tags",
+                            Variant.newBuilder()
+                                    .array()
+                                    .add(Variant.newBuilder().of("x"))
+                                    .add(Variant.newBuilder().of("y"))
+                                    .build())
+                    .build();
+
+    /** {@code {"f0": 7, "f1": "ada"}}, an object keyed by the default {@code ROW} field names. */
+    private static final Variant VARIANT_POSITIONAL_RECORD =
+            VARIANT_BUILDER
+                    .object()
+                    .add("f0", VARIANT_BUILDER.of(7))
+                    .add("f1", VARIANT_BUILDER.of("ada"))
+                    .build();
+
+    /**
+     * {@code {"a": 1, "b": 2, "c": "x", "d": ["p", "q"]}}, shaped for {@link #MY_STRUCTURED_TYPE}.
+     */
+    private static final Variant VARIANT_STRUCT_RECORD =
+            VARIANT_BUILDER
+                    .object()
+                    .add("a", VARIANT_BUILDER.of(1L))
+                    .add("b", VARIANT_BUILDER.of(2L))
+                    .add("c", VARIANT_BUILDER.of("x"))
+                    .add(
+                            "d",
+                            VARIANT_BUILDER
+                                    .array()
+                                    .add(VARIANT_BUILDER.of("p"))
+                                    .add(VARIANT_BUILDER.of("q"))
+                                    .build())
+                    .build();
+
+    /** {@code {"a": 1, "b": 2}}, an all-numeric object. */
+    private static final Variant VARIANT_NUM_OBJECT =
+            VARIANT_BUILDER
+                    .object()
+                    .add("a", VARIANT_BUILDER.of(1))
+                    .add("b", VARIANT_BUILDER.of(2))
+                    .build();
+
+    private static final Variant VARIANT_EMPTY_OBJECT = VARIANT_BUILDER.object().build();
+
+    /** {@code {"a": 1, "b": "x"}}, an object with a mixed integer and string value. */
+    private static final Variant VARIANT_MIXED_OBJECT =
+            VARIANT_BUILDER
+                    .object()
+                    .add("a", VARIANT_BUILDER.of(1))
+                    .add("b", VARIANT_BUILDER.of("x"))
+                    .build();
+
+    private static final DataType MY_STRUCTURED_TYPE =
+            STRUCTURED(
+                    MyStructuredType.class,
+                    FIELD("a", BIGINT().notNull()),
+                    FIELD("b", BIGINT()),
+                    FIELD("c", STRING()),
+                    FIELD("d", ARRAY(STRING())));
+    private static final DataType MY_STRUCTURED_TYPE_WITHOUT_IMPLEMENTATION_CLASS =
+            DataTypes.of(
+                    StructuredType.newBuilder(ObjectIdentifier.of("a", "b", "c"))
+                            .attributes(
+                                    Arrays.asList(
+                                            new StructuredType.StructuredAttribute(
+                                                    "a", BIGINT().notNull().getLogicalType()),
+                                            new StructuredType.StructuredAttribute(
+                                                    "b", BIGINT().getLogicalType()),
+                                            new StructuredType.StructuredAttribute(
+                                                    "c", STRING().getLogicalType()),
+                                            new StructuredType.StructuredAttribute(
+                                                    "d", ARRAY(STRING()).getLogicalType())))
+                            .build());
+
+    private static final DataType MY_DISTINCT_INT =
+            DataTypes.of(
+                    DistinctType.newBuilder(
+                                    ObjectIdentifier.of("a", "b", "money"), INT().getLogicalType())
+                            .build());
+
+    // Rebuilds a variant object field at position 0, matching the form a ROW cast produces when it
+    // serializes each field with BinaryRowWriter.writeVariant and reads it back.
+    private static Variant rowFieldVariant(Variant fieldView) {
+        final BinaryVariant view = (BinaryVariant) fieldView;
+        return new BinaryVariant(view.getValue(), view.getMetadata());
+    }
+
+    Stream<CastTestSpecBuilder> testCases() {
+        return Stream.of(
+                CastTestSpecBuilder.testCastTo(TINYINT())
+                        .fromCase(TINYINT(), null, null)
+                        .fail(CHAR(3), fromString("foo"), TableRuntimeException.class)
+                        .fail(VARCHAR(5), fromString("Flink"), TableRuntimeException.class)
+                        .fail(STRING(), fromString("Apache"), TableRuntimeException.class)
+                        .fromCase(STRING(), fromString("1.234"), (byte) 1)
+                        .fromCase(STRING(), fromString("123"), (byte) 123)
+                        .fromCase(STRING(), fromString(" 123 "), (byte) 123)
+                        .fail(STRING(), fromString("-130"), TableRuntimeException.class)
+                        .fromCase(
+                                DECIMAL(4, 3),
+                                fromBigDecimal(new BigDecimal("9.87"), 4, 3),
+                                (byte) 9)
+                        // https://issues.apache.org/jira/browse/FLINK-24420 - Check out of range
+                        // instead of overflow
+                        .fromCase(
+                                DECIMAL(10, 3),
+                                fromBigDecimal(new BigDecimal("9123.87"), 10, 3),
+                                (byte) -93)
+                        .fromCase(TINYINT(), DEFAULT_POSITIVE_TINY_INT, DEFAULT_POSITIVE_TINY_INT)
+                        .fromCase(TINYINT(), DEFAULT_NEGATIVE_TINY_INT, DEFAULT_NEGATIVE_TINY_INT)
+                        .fromCase(SMALLINT(), (short) 32, (byte) 32)
+                        .fromCase(SMALLINT(), DEFAULT_POSITIVE_SMALL_INT, (byte) 57)
+                        .fromCase(SMALLINT(), DEFAULT_NEGATIVE_SMALL_INT, (byte) -57)
+                        .fromCase(INT(), -12, (byte) -12)
+                        .fromCase(INT(), DEFAULT_POSITIVE_INT, (byte) -121)
+                        .fromCase(INT(), DEFAULT_NEGATIVE_INT, (byte) 121)
+                        .fromCase(BIGINT(), DEFAULT_POSITIVE_BIGINT, (byte) 53)
+                        .fromCase(BIGINT(), DEFAULT_NEGATIVE_BIGINT, (byte) -53)
+                        .fromCase(FLOAT(), DEFAULT_POSITIVE_FLOAT, (byte) 123)
+                        .fromCase(FLOAT(), DEFAULT_NEGATIVE_FLOAT, (byte) -123)
+                        .fromCase(DOUBLE(), DEFAULT_POSITIVE_DOUBLE, (byte) 123)
+                        .fromCase(DOUBLE(), DEFAULT_NEGATIVE_DOUBLE, (byte) -123)
+                        .fromCase(BOOLEAN(), true, (byte) 1)
+                        .fromCase(BOOLEAN(), false, (byte) 0),
+                CastTestSpecBuilder.testCastTo(SMALLINT())
+                        .fromCase(SMALLINT(), null, null)
+                        .fail(CHAR(3), fromString("foo"), TableRuntimeException.class)
+                        .fail(VARCHAR(5), fromString("Flink"), TableRuntimeException.class)
+                        .fail(STRING(), fromString("Apache"), TableRuntimeException.class)
+                        .fromCase(STRING(), fromString("1.234"), (short) 1)
+                        .fromCase(STRING(), fromString("123"), (short) 123)
+                        .fromCase(STRING(), fromString(" 123 "), (short) 123)
+                        .fail(STRING(), fromString("-32769"), TableRuntimeException.class)
+                        .fromCase(
+                                DECIMAL(4, 3),
+                                fromBigDecimal(new BigDecimal("9.87"), 4, 3),
+                                (short) 9)
+                        // https://issues.apache.org/jira/browse/FLINK-24420 - Check out of range
+                        // instead of overflow
+                        .fromCase(
+                                DECIMAL(10, 3),
+                                fromBigDecimal(new BigDecimal("91235.87"), 10, 3),
+                                (short) 25699)
+                        .fromCase(
+                                TINYINT(),
+                                DEFAULT_POSITIVE_TINY_INT,
+                                (short) DEFAULT_POSITIVE_TINY_INT)
+                        .fromCase(
+                                TINYINT(),
+                                DEFAULT_NEGATIVE_TINY_INT,
+                                (short) DEFAULT_NEGATIVE_TINY_INT)
+                        .fromCase(
+                                SMALLINT(), DEFAULT_POSITIVE_SMALL_INT, DEFAULT_POSITIVE_SMALL_INT)
+                        .fromCase(
+                                SMALLINT(), DEFAULT_NEGATIVE_SMALL_INT, DEFAULT_NEGATIVE_SMALL_INT)
+                        .fromCase(SMALLINT(), (short) 32780, (short) -32756)
+                        .fromCase(INT(), DEFAULT_POSITIVE_INT, (short) -10617)
+                        .fromCase(INT(), DEFAULT_NEGATIVE_INT, (short) 10617)
+                        .fromCase(INT(), -12, (short) -12)
+                        .fromCase(BIGINT(), 123L, (short) 123)
+                        .fromCase(BIGINT(), DEFAULT_POSITIVE_BIGINT, (short) 7221)
+                        .fromCase(BIGINT(), DEFAULT_NEGATIVE_BIGINT, (short) -7221)
+                        .fromCase(FLOAT(), DEFAULT_POSITIVE_FLOAT, (short) 123)
+                        .fromCase(FLOAT(), DEFAULT_NEGATIVE_FLOAT, (short) -123)
+                        .fromCase(FLOAT(), 123456.78f, (short) -7616)
+                        .fromCase(DOUBLE(), DEFAULT_POSITIVE_DOUBLE, (short) 123)
+                        .fromCase(DOUBLE(), DEFAULT_NEGATIVE_DOUBLE, (short) -123)
+                        .fromCase(DOUBLE(), 123456.7890d, (short) -7616)
+                        .fromCase(BOOLEAN(), true, (short) 1)
+                        .fromCase(BOOLEAN(), false, (short) 0),
+                CastTestSpecBuilder.testCastTo(INT())
+                        .fail(CHAR(3), fromString("foo"), TableRuntimeException.class)
+                        .fail(VARCHAR(5), fromString("Flink"), TableRuntimeException.class)
+                        .fail(STRING(), fromString("Apache"), TableRuntimeException.class)
+                        .fromCase(STRING(), fromString("1.234"), 1)
+                        .fromCase(STRING(), fromString("123"), 123)
+                        .fromCase(STRING(), fromString(" 123 "), 123)
+                        .fail(STRING(), fromString("-3276913443134"), TableRuntimeException.class)
+                        .fromCase(DECIMAL(4, 3), fromBigDecimal(new BigDecimal("9.87"), 4, 3), 9)
+                        // https://issues.apache.org/jira/browse/FLINK-24420 - Check out of range
+                        // instead of overflow
+                        .fromCase(
+                                DECIMAL(20, 3),
+                                fromBigDecimal(new BigDecimal("3276913443134.87"), 20, 3),
+                                -146603714)
+                        .fromCase(
+                                TINYINT(),
+                                DEFAULT_POSITIVE_TINY_INT,
+                                (int) DEFAULT_POSITIVE_TINY_INT)
+                        .fromCase(
+                                TINYINT(),
+                                DEFAULT_NEGATIVE_TINY_INT,
+                                (int) DEFAULT_NEGATIVE_TINY_INT)
+                        .fromCase(
+                                SMALLINT(),
+                                DEFAULT_POSITIVE_SMALL_INT,
+                                (int) DEFAULT_POSITIVE_SMALL_INT)
+                        .fromCase(
+                                SMALLINT(),
+                                DEFAULT_NEGATIVE_SMALL_INT,
+                                (int) DEFAULT_NEGATIVE_SMALL_INT)
+                        .fromCase(INT(), DEFAULT_POSITIVE_INT, DEFAULT_POSITIVE_INT)
+                        .fromCase(INT(), DEFAULT_NEGATIVE_INT, DEFAULT_NEGATIVE_INT)
+                        .fromCase(BIGINT(), 123L, 123)
+                        .fromCase(BIGINT(), DEFAULT_POSITIVE_BIGINT, -539222987)
+                        .fromCase(BIGINT(), DEFAULT_NEGATIVE_BIGINT, 539222987)
+                        .fromCase(FLOAT(), DEFAULT_POSITIVE_FLOAT, 123)
+                        .fromCase(FLOAT(), DEFAULT_NEGATIVE_FLOAT, -123)
+                        .fromCase(FLOAT(), 9234567891.12f, 2147483647)
+                        .fromCase(DOUBLE(), DEFAULT_POSITIVE_DOUBLE, 123)
+                        .fromCase(DOUBLE(), DEFAULT_NEGATIVE_DOUBLE, -123)
+                        .fromCase(DOUBLE(), 9234567891.12345d, 2147483647)
+                        .fromCase(INTERVAL(YEAR(), MONTH()), 123, 123)
+                        .fromCase(INTERVAL(DAY(), SECOND()), 123L, 123)
+                        .fromCase(BOOLEAN(), true, 1)
+                        .fromCase(BOOLEAN(), false, 0),
+                CastTestSpecBuilder.testCastTo(BIGINT())
+                        .fromCase(BIGINT(), null, null)
+                        .fail(CHAR(3), fromString("foo"), TableRuntimeException.class)
+                        .fail(VARCHAR(5), fromString("Flink"), TableRuntimeException.class)
+                        .fail(STRING(), fromString("Apache"), TableRuntimeException.class)
+                        .fromCase(STRING(), fromString("1.234"), 1L)
+                        .fromCase(STRING(), fromString("123"), 123L)
+                        .fromCase(STRING(), fromString(" 123 "), 123L)
+                        .fromCase(STRING(), fromString("-3276913443134"), -3276913443134L)
+                        .fromCase(DECIMAL(4, 3), fromBigDecimal(new BigDecimal("9.87"), 4, 3), 9L)
+                        .fromCase(
+                                DECIMAL(20, 3),
+                                fromBigDecimal(new BigDecimal("3276913443134.87"), 20, 3),
+                                3276913443134L)
+                        .fromCase(
+                                TINYINT(),
+                                DEFAULT_POSITIVE_TINY_INT,
+                                (long) DEFAULT_POSITIVE_TINY_INT)
+                        .fromCase(
+                                TINYINT(),
+                                DEFAULT_NEGATIVE_TINY_INT,
+                                (long) DEFAULT_NEGATIVE_TINY_INT)
+                        .fromCase(
+                                SMALLINT(),
+                                DEFAULT_POSITIVE_SMALL_INT,
+                                (long) DEFAULT_POSITIVE_SMALL_INT)
+                        .fromCase(
+                                SMALLINT(),
+                                DEFAULT_NEGATIVE_SMALL_INT,
+                                (long) DEFAULT_NEGATIVE_SMALL_INT)
+                        .fromCase(INT(), DEFAULT_POSITIVE_INT, (long) DEFAULT_POSITIVE_INT)
+                        .fromCase(INT(), DEFAULT_NEGATIVE_INT, (long) DEFAULT_NEGATIVE_INT)
+                        .fromCase(BIGINT(), DEFAULT_POSITIVE_BIGINT, DEFAULT_POSITIVE_BIGINT)
+                        .fromCase(BIGINT(), DEFAULT_NEGATIVE_BIGINT, DEFAULT_NEGATIVE_BIGINT)
+                        .fromCase(FLOAT(), DEFAULT_POSITIVE_FLOAT, 123L)
+                        .fromCase(FLOAT(), DEFAULT_NEGATIVE_FLOAT, -123L)
+                        .fromCase(FLOAT(), 9234567891.12f, 9234568192L)
+                        .fromCase(DOUBLE(), DEFAULT_POSITIVE_DOUBLE, 123L)
+                        .fromCase(DOUBLE(), DEFAULT_NEGATIVE_DOUBLE, -123L)
+                        .fromCase(DOUBLE(), 9234567891.12345d, 9234567891L)
+                        .fromCase(BOOLEAN(), true, 1L)
+                        .fromCase(BOOLEAN(), false, 0L),
+                CastTestSpecBuilder.testCastTo(FLOAT())
+                        .fromCase(FLOAT(), null, null)
+                        .fail(CHAR(3), fromString("foo"), TableRuntimeException.class)
+                        .fail(VARCHAR(5), fromString("Flink"), TableRuntimeException.class)
+                        .fail(STRING(), fromString("Apache"), TableRuntimeException.class)
+                        .fromCase(STRING(), fromString("1.234"), 1.234f)
+                        .fromCase(STRING(), fromString("123"), 123.0f)
+                        .fromCase(STRING(), fromString(" 123 "), 123.0f)
+                        .fromCase(STRING(), fromString("-3276913443134"), -3.27691351E12f)
+                        .fromCase(
+                                DECIMAL(4, 3), fromBigDecimal(new BigDecimal("9.87"), 4, 3), 9.87f)
+                        // https://issues.apache.org/jira/browse/FLINK-24420 - Check out of range
+                        // instead of overflow
+                        .fromCase(
+                                DECIMAL(20, 3),
+                                fromBigDecimal(new BigDecimal("3276913443134.87"), 20, 3),
+                                3.27691351E12f)
+                        .fromCase(
+                                TINYINT(),
+                                DEFAULT_POSITIVE_TINY_INT,
+                                (float) DEFAULT_POSITIVE_TINY_INT)
+                        .fromCase(
+                                TINYINT(),
+                                DEFAULT_NEGATIVE_TINY_INT,
+                                (float) DEFAULT_NEGATIVE_TINY_INT)
+                        .fromCase(
+                                SMALLINT(),
+                                DEFAULT_POSITIVE_SMALL_INT,
+                                (float) DEFAULT_POSITIVE_SMALL_INT)
+                        .fromCase(
+                                SMALLINT(),
+                                DEFAULT_NEGATIVE_SMALL_INT,
+                                (float) DEFAULT_NEGATIVE_SMALL_INT)
+                        .fromCase(INT(), DEFAULT_POSITIVE_INT, (float) DEFAULT_POSITIVE_INT)
+                        .fromCase(INT(), DEFAULT_NEGATIVE_INT, (float) DEFAULT_NEGATIVE_INT)
+                        .fromCase(
+                                BIGINT(), DEFAULT_POSITIVE_BIGINT, (float) DEFAULT_POSITIVE_BIGINT)
+                        .fromCase(
+                                BIGINT(), DEFAULT_NEGATIVE_BIGINT, (float) DEFAULT_NEGATIVE_BIGINT)
+                        .fromCase(FLOAT(), DEFAULT_POSITIVE_FLOAT, DEFAULT_POSITIVE_FLOAT)
+                        .fromCase(FLOAT(), DEFAULT_NEGATIVE_FLOAT, DEFAULT_NEGATIVE_FLOAT)
+                        .fromCase(FLOAT(), 9234567891.12f, 9234567891.12f)
+                        .fromCase(DOUBLE(), DEFAULT_POSITIVE_DOUBLE, 123.456789f)
+                        .fromCase(DOUBLE(), DEFAULT_NEGATIVE_DOUBLE, -123.456789f)
+                        .fromCase(DOUBLE(), 1239234567891.1234567891234d, 1.23923451E12f)
+                        .fromCase(BOOLEAN(), true, 1.0f)
+                        .fromCase(BOOLEAN(), false, 0.0f),
+                CastTestSpecBuilder.testCastTo(DOUBLE())
+                        .fromCase(DOUBLE(), null, null)
+                        .fail(CHAR(3), fromString("foo"), TableRuntimeException.class)
+                        .fail(VARCHAR(5), fromString("Flink"), TableRuntimeException.class)
+                        .fail(STRING(), fromString("Apache"), TableRuntimeException.class)
+                        .fromCase(STRING(), fromString("1.234"), 1.234d)
+                        .fromCase(STRING(), fromString("123"), 123.0d)
+                        .fromCase(STRING(), fromString(" 123 "), 123.0d)
+                        .fromCase(STRING(), fromString(" .123 "), 0.123d)
+                        .fromCase(STRING(), fromString("-3276913443134"), -3.276913443134E12d)
+                        .fromCase(
+                                DECIMAL(4, 3), fromBigDecimal(new BigDecimal("9.87"), 4, 3), 9.87d)
+                        .fromCase(
+                                DECIMAL(20, 3),
+                                fromBigDecimal(new BigDecimal("3276913443134.87"), 20, 3),
+                                3.27691344313487E12d)
+                        .fromCase(
+                                DECIMAL(30, 20),
+                                fromBigDecimal(
+                                        new BigDecimal("123456789.123456789123456789"), 30, 20),
+                                1.2345678912345679E8d)
+                        .fromCase(
+                                TINYINT(),
+                                DEFAULT_POSITIVE_TINY_INT,
+                                (double) DEFAULT_POSITIVE_TINY_INT)
+                        .fromCase(
+                                TINYINT(),
+                                DEFAULT_NEGATIVE_TINY_INT,
+                                (double) DEFAULT_NEGATIVE_TINY_INT)
+                        .fromCase(
+                                SMALLINT(),
+                                DEFAULT_POSITIVE_SMALL_INT,
+                                (double) DEFAULT_POSITIVE_SMALL_INT)
+                        .fromCase(
+                                SMALLINT(),
+                                DEFAULT_NEGATIVE_SMALL_INT,
+                                (double) DEFAULT_NEGATIVE_SMALL_INT)
+                        .fromCase(INT(), DEFAULT_POSITIVE_INT, (double) DEFAULT_POSITIVE_INT)
+                        .fromCase(INT(), DEFAULT_NEGATIVE_INT, (double) DEFAULT_NEGATIVE_INT)
+                        .fromCase(
+                                BIGINT(), DEFAULT_POSITIVE_BIGINT, (double) DEFAULT_POSITIVE_BIGINT)
+                        .fromCase(
+                                BIGINT(), DEFAULT_NEGATIVE_BIGINT, (double) DEFAULT_NEGATIVE_BIGINT)
+                        .fromCase(FLOAT(), DEFAULT_POSITIVE_FLOAT, 123.45600128173828d)
+                        .fromCase(FLOAT(), DEFAULT_NEGATIVE_FLOAT, -123.45600128173828)
+                        .fromCase(FLOAT(), 9234567891.12f, 9.234568192E9)
+                        .fromCase(DOUBLE(), DEFAULT_POSITIVE_DOUBLE, DEFAULT_POSITIVE_DOUBLE)
+                        .fromCase(DOUBLE(), DEFAULT_NEGATIVE_DOUBLE, DEFAULT_NEGATIVE_DOUBLE)
+                        .fromCase(DOUBLE(), 1239234567891.1234567891234d, 1.2392345678911235E12d)
+                        .fromCase(BOOLEAN(), true, 1.0d)
+                        .fromCase(BOOLEAN(), false, 0.0d),
+                CastTestSpecBuilder.testCastTo(DATE())
+                        .fail(CHAR(3), fromString("foo"), TableRuntimeException.class)
+                        .fail(VARCHAR(5), fromString("Flink"), TableRuntimeException.class)
+                        .fromCase(
+                                STRING(),
+                                fromString("123"),
+                                DateTimeUtils.toInternal(LocalDate.of(123, 1, 1)))
+                        .fromCase(
+                                STRING(),
+                                fromString("2021-09-27"),
+                                DateTimeUtils.toInternal(LocalDate.of(2021, 9, 27)))
+                        .fromCase(
+                                STRING(),
+                                fromString("2021-09-27 12:34:56.123456789"),
+                                DateTimeUtils.toInternal(LocalDate.of(2021, 9, 27)))
+                        .fail(STRING(), fromString("2021/09/27"), TableRuntimeException.class)
+                        .fromCase(
+                                TIMESTAMP(9),
+                                TIMESTAMP,
+                                DateTimeUtils.toInternal(LocalDate.of(2021, 9, 24)))
+                        .fromCase(
+                                TIMESTAMP_LTZ(8),
+                                TIMESTAMP_LTZ,
+                                DateTimeUtils.toInternal(LocalDate.of(2022, 1, 4))),
+                CastTestSpecBuilder.testCastTo(TIME())
+                        .fail(CHAR(3), fromString("foo"), TableRuntimeException.class)
+                        .fail(VARCHAR(5), fromString("Flink"), TableRuntimeException.class)
+                        .fromCase(
+                                STRING(),
+                                fromString("23"),
+                                DateTimeUtils.toInternal(LocalTime.of(23, 0, 0)))
+                        .fromCase(
+                                STRING(),
+                                fromString("23:45"),
+                                DateTimeUtils.toInternal(LocalTime.of(23, 45, 0)))
+                        .fail(STRING(), fromString("2021-09-27"), TableRuntimeException.class)
+                        .fail(
+                                STRING(),
+                                fromString("2021-09-27 12:34:56"),
+                                TableRuntimeException.class)
+                        // https://issues.apache.org/jira/browse/FLINK-39214
+                        // Fractional seconds below milliseconds are lost
+                        .fromCase(
+                                STRING(),
+                                fromString("12:34:56.123456789"),
+                                DateTimeUtils.toInternal(LocalTime.of(12, 34, 56, 0)))
+                        .fail(
+                                STRING(),
+                                fromString("2021-09-27 12:34:56.123456789"),
+                                TableRuntimeException.class)
+                        .fromCase(
+                                TIMESTAMP(6),
+                                TIMESTAMP,
+                                DateTimeUtils.toInternal(LocalTime.of(12, 34, 56, 0)))
+                        .fromCase(
+                                TIMESTAMP_LTZ(8),
+                                TIMESTAMP_LTZ,
+                                DateTimeUtils.toInternal(LocalTime.of(11, 34, 56, 0))),
+                CastTestSpecBuilder.testCastTo(TIMESTAMP(9))
+                        .fail(CHAR(3), fromString("foo"), TableRuntimeException.class)
+                        .fail(VARCHAR(5), fromString("Flink"), TableRuntimeException.class)
+                        .fail(STRING(), fromString("123"), TableRuntimeException.class)
+                        .fromCase(
+                                STRING(),
+                                fromString("2021-09-27"),
+                                timestampDataFromLocalDateTime(2021, 9, 27, 0, 0, 0, 0))
+                        .fail(STRING(), fromString("2021/09/27"), TableRuntimeException.class)
+                        .fromCase(
+                                STRING(),
+                                fromString("2021-09-27 12:34:56.123"),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2021, 9, 27, 12, 34, 56, 123000000)))
+                        .fromCase(
+                                STRING(),
+                                fromString("2021-9-1 1:1:1.123"),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2021, 9, 1, 1, 1, 1, 123000000)))
+                        .fromCase(
+                                STRING(),
+                                fromString("2021-9-01 1:01:10.123"),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2021, 9, 1, 1, 1, 10, 123000000)))
+                        .fromCase(
+                                STRING(),
+                                fromString("2021-09-1 01:1:01.123"),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2021, 9, 1, 1, 1, 1, 123000000)))
+                        .fromCase(
+                                STRING(),
+                                fromString("2021-09-27 12:34:56.123400000"),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2021, 9, 27, 12, 34, 56, 123400000)))
+                        .fromCase(
+                                STRING(),
+                                fromString("2021-09-27 12:34:56.123456789"),
+                                timestampDataFromLocalDateTime(
+                                        2021, 9, 27, 12, 34, 56, 123_456_789))
+                        .fromCase(
+                                DATE(),
+                                DateTimeUtils.toInternal(LocalDate.of(2022, 1, 4)),
+                                timestampDataFromLocalDateTime(2022, 1, 4, 0, 0, 0, 0))
+                        // https://issues.apache.org/jira/browse/FLINK-39214
+                        // Fractional seconds below milliseconds are lost
+                        .fromCase(
+                                TIME(5),
+                                TIME,
+                                timestampDataFromLocalDateTime(1970, 1, 1, 12, 34, 56, 123_000_000))
+                        .fromCase(
+                                TIMESTAMP_LTZ(8),
+                                TIMESTAMP_LTZ,
+                                timestampDataFromLocalDateTime(
+                                        2022, 1, 4, 11, 34, 56, 123_456_780)),
+                CastTestSpecBuilder.testCastTo(TIMESTAMP(4))
+                        .fromCase(
+                                TIMESTAMP(2),
+                                timestampDataFromLocalDateTime(2021, 9, 27, 0, 0, 0, 120_000_000),
+                                timestampDataFromLocalDateTime(2021, 9, 27, 0, 0, 0, 120_000_000))
+                        .fromCase(
+                                TIMESTAMP(4),
+                                timestampDataFromLocalDateTime(2021, 9, 27, 0, 0, 0, 123_400_000),
+                                timestampDataFromLocalDateTime(2021, 9, 27, 0, 0, 0, 123_400_000))
+                        .fromCase(
+                                TIMESTAMP(7),
+                                timestampDataFromLocalDateTime(2021, 9, 27, 0, 0, 0, 123_456_700),
+                                timestampDataFromLocalDateTime(2021, 9, 27, 0, 0, 0, 123_400_000))
+                        .fromCase(
+                                TIMESTAMP_LTZ(2),
+                                timestampDataFromInstant(2021, 9, 27, 0, 0, 0, 120_000_000),
+                                timestampDataFromLocalDateTime(2021, 9, 26, 22, 0, 0, 120_000_000))
+                        .fromCase(
+                                TIMESTAMP_LTZ(4),
+                                timestampDataFromInstant(2021, 9, 27, 0, 0, 0, 123_400_000),
+                                timestampDataFromLocalDateTime(2021, 9, 26, 22, 0, 0, 123_400_000))
+                        .fromCase(
+                                TIMESTAMP_LTZ(7),
+                                timestampDataFromInstant(2021, 9, 27, 0, 0, 0, 123_456_700),
+                                timestampDataFromLocalDateTime(2021, 9, 26, 22, 0, 0, 123_400_000))
+                        .fromCase(
+                                STRING(),
+                                fromString("2021-09-27 12:34:56.123"),
+                                timestampDataFromLocalDateTime(2021, 9, 27, 12, 34, 56, 123000000))
+                        .fromCase(
+                                STRING(),
+                                fromString("2021-09-27 12:34:56.12345"),
+                                timestampDataFromLocalDateTime(2021, 9, 27, 12, 34, 56, 123400000)),
+                CastTestSpecBuilder.testCastTo(TIMESTAMP_LTZ(9))
+                        .fail(CHAR(3), fromString("foo"), TableRuntimeException.class)
+                        .fail(VARCHAR(5), fromString("Flink"), TableRuntimeException.class)
+                        .fail(STRING(), fromString("123"), TableRuntimeException.class)
+                        .fromCase(
+                                STRING(),
+                                CET_CONTEXT,
+                                fromString("2021-09-27"),
+                                timestampDataFromInstant(2021, 9, 27, 0, 0, 0, 0))
+                        .fromCase(
+                                STRING(),
+                                CET_CONTEXT,
+                                fromString("2021-09-27 12:34:56"),
+                                timestampDataFromInstant(2021, 9, 27, 12, 34, 56, 0))
+                        .fromCase(
+                                STRING(),
+                                CET_CONTEXT,
+                                fromString("2021-09-27 12:34:56.123"),
+                                timestampDataFromInstant(2021, 9, 27, 12, 34, 56, 123_000_000))
+                        .fromCase(
+                                STRING(),
+                                CET_CONTEXT,
+                                fromString("2021-09-27 12:34:56.1234"),
+                                timestampDataFromInstant(2021, 9, 27, 12, 34, 56, 123400000))
+                        .fromCase(
+                                STRING(),
+                                CET_CONTEXT,
+                                fromString("2021-09-27 12:34:56.123456789"),
+                                timestampDataFromInstant(2021, 9, 27, 12, 34, 56, 123456789))
+                        .fromCase(
+                                DATE(),
+                                DateTimeUtils.toInternal(LocalDate.of(2022, 1, 4)),
+                                timestampDataFromInstant(2022, 1, 4, 1, 0, 0, 0))
+                        // https://issues.apache.org/jira/browse/FLINK-39214
+                        // Fractional seconds below milliseconds are lost
+                        .fromCase(
+                                TIME(5),
+                                TIME,
+                                timestampDataFromInstant(1970, 1, 1, 13, 34, 56, 123_000_000))
+                        .fromCase(
+                                TIMESTAMP(6),
+                                TIMESTAMP,
+                                timestampDataFromInstant(2021, 9, 24, 14, 34, 56, 123_456_000)),
+                CastTestSpecBuilder.testCastTo(TIMESTAMP_LTZ(4))
+                        .fromCase(
+                                TIMESTAMP(2),
+                                timestampDataFromLocalDateTime(2021, 9, 27, 0, 0, 0, 120_000_000),
+                                timestampDataFromInstant(2021, 9, 27, 2, 0, 0, 120_000_000))
+                        .fromCase(
+                                TIMESTAMP(4),
+                                timestampDataFromLocalDateTime(2021, 9, 27, 0, 0, 0, 123_400_000),
+                                timestampDataFromInstant(2021, 9, 27, 2, 0, 0, 123_400_000))
+                        .fromCase(
+                                TIMESTAMP(7),
+                                timestampDataFromLocalDateTime(2021, 9, 27, 0, 0, 0, 123_456_700),
+                                timestampDataFromInstant(2021, 9, 27, 2, 0, 0, 123_400_000))
+                        .fromCase(
+                                TIMESTAMP_LTZ(2),
+                                timestampDataFromInstant(2021, 9, 27, 0, 0, 0, 120_000_000),
+                                timestampDataFromInstant(2021, 9, 27, 0, 0, 0, 120_000_000))
+                        .fromCase(
+                                TIMESTAMP_LTZ(4),
+                                timestampDataFromInstant(2021, 9, 27, 0, 0, 0, 123_400_000),
+                                timestampDataFromInstant(2021, 9, 27, 0, 0, 0, 123_400_000))
+                        .fromCase(
+                                TIMESTAMP_LTZ(7),
+                                timestampDataFromInstant(2021, 9, 27, 0, 0, 0, 123_456_700),
+                                timestampDataFromInstant(2021, 9, 27, 0, 0, 0, 123_400_000))
+                        .fromCase(
+                                STRING(),
+                                CET_CONTEXT,
+                                fromString("2021-09-27 12:34:56.123"),
+                                timestampDataFromInstant(2021, 9, 27, 12, 34, 56, 123000000))
+                        .fromCase(
+                                STRING(),
+                                CET_CONTEXT,
+                                fromString("2021-09-27 12:34:56.12345"),
+                                timestampDataFromInstant(2021, 9, 27, 12, 34, 56, 123400000)),
+                CastTestSpecBuilder.testCastTo(STRING())
+                        .fromCase(STRING(), null, null)
+                        .fromCase(NULL(), null, BinaryStringDataUtil.NULL_STRING)
+                        .fromCase(CHAR(3), fromString("foo"), fromString("foo"))
+                        .fromCase(VARCHAR(5), fromString("Flink"), fromString("Flink"))
+                        .fromCase(VARCHAR(10), fromString("Flink"), fromString("Flink"))
+                        .fromCase(STRING(), fromString("Apache Flink"), fromString("Apache Flink"))
+                        .fromCase(BOOLEAN(), true, fromString("TRUE"))
+                        .fromCase(BOOLEAN(), false, fromString("FALSE"))
+                        .fromCaseLegacy(BOOLEAN(), true, fromString("true"))
+                        .fromCaseLegacy(BOOLEAN(), false, fromString("false"))
+                        .fromCase(BINARY(2), new byte[] {0, 1}, fromString("\u0000\u0001"))
+                        .fromCaseLegacy(BINARY(2), new byte[] {0, 1}, fromString("\u0000\u0001"))
+                        .fromCase(
+                                VARBINARY(3),
+                                new byte[] {0, 1, 2},
+                                fromString("\u0000\u0001\u0002"))
+                        .fromCaseLegacy(
+                                VARBINARY(3),
+                                new byte[] {0, 1, 2},
+                                fromString("\u0000\u0001\u0002"))
+                        .fromCaseLegacy(VARBINARY(5), new byte[] {102, 111, 111}, fromString("foo"))
+                        .fromCaseLegacy(VARBINARY(5), new byte[] {102, 111, 111}, fromString("foo"))
+                        .fromCaseLegacy(
+                                BYTES(), new byte[] {70, 108, 105, 110, 107}, fromString("Flink"))
+                        .fromCaseLegacy(
+                                BYTES(), new byte[] {70, 108, 105, 110, 107}, fromString("Flink"))
+                        .fromCasePrinting(
+                                BYTES(),
+                                new byte[] {70, 108, 105, 110, 107},
+                                fromString("x'466c696e6b'"))
+                        // Strict UTF-8 validation across all BINARY_STRING family roots.
+                        .fail(BINARY(1), new byte[] {(byte) 0x80}, TableRuntimeException.class)
+                        .fail(
+                                VARBINARY(2),
+                                new byte[] {(byte) 0xC0, (byte) 0xAF},
+                                TableRuntimeException.class)
+                        .fail(BYTES(), new byte[] {(byte) 0x80}, TableRuntimeException.class)
+                        // table.exec.legacy-bytes-to-string-cast=true restores silent substitution.
+                        .fromCaseLegacyBytesToString(
+                                BYTES(), new byte[] {(byte) 0x80}, fromString("�"))
+                        .fromCaseLegacyBytesToString(
+                                VARBINARY(2),
+                                new byte[] {(byte) 0xC0, (byte) 0xAF},
+                                fromString("��"))
+                        .fromCase(
+                                BYTES(),
+                                "é€😀".getBytes(StandardCharsets.UTF_8),
+                                fromString("é€😀"))
+                        .fromCasePrinting(BYTES(), new byte[] {(byte) 0x80}, fromString("x'80'"))
+                        .fromCase(BOOLEAN(), true, StringData.fromString("TRUE"))
+                        .fromCase(BOOLEAN(), false, StringData.fromString("FALSE"))
+                        .fromCase(
+                                DECIMAL(4, 3),
+                                fromBigDecimal(new BigDecimal("9.87"), 4, 3),
+                                fromString("9.870"))
+                        .fromCase(
+                                DECIMAL(5, 3),
+                                fromBigDecimal(new BigDecimal("9.87"), 5, 3),
+                                fromString("9.870"))
+                        .fromCase(TINYINT(), (byte) -125, fromString("-125"))
+                        .fromCase(SMALLINT(), (short) 32767, fromString("32767"))
+                        .fromCase(INT(), -12345678, fromString("-12345678"))
+                        .fromCase(BIGINT(), 1234567891234L, fromString("1234567891234"))
+                        .fromCase(FLOAT(), -123.456f, fromString("-123.456"))
+                        .fromCase(DOUBLE(), 12345.678901d, fromString("12345.678901"))
+                        .fromCase(
+                                FLOAT(),
+                                Float.MAX_VALUE,
+                                fromString(String.valueOf(Float.MAX_VALUE)))
+                        .fromCase(
+                                DOUBLE(),
+                                Double.MAX_VALUE,
+                                fromString(String.valueOf(Double.MAX_VALUE)))
+                        .fromCase(STRING(), fromString("Hello"), fromString("Hello"))
+                        .fromCase(TIMESTAMP(), TIMESTAMP, TIMESTAMP_STRING)
+                        .fromCase(
+                                TIMESTAMP(9),
+                                TIMESTAMP,
+                                fromString("2021-09-24 12:34:56.123456000"))
+                        .fromCase(
+                                TIMESTAMP(7), TIMESTAMP, fromString("2021-09-24 12:34:56.1234560"))
+                        .fromCase(
+                                TIMESTAMP(3),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.parse("2021-09-24T12:34:56.1")),
+                                fromString("2021-09-24 12:34:56.100"))
+                        .fromCase(TIMESTAMP_LTZ(), CET_CONTEXT, TIMESTAMP, TIMESTAMP_STRING_CET)
+                        .fromCase(
+                                TIMESTAMP_LTZ(9),
+                                CET_CONTEXT,
+                                TIMESTAMP,
+                                fromString("2021-09-24 14:34:56.123456000"))
+                        .fromCase(
+                                TIMESTAMP_LTZ(7),
+                                CET_CONTEXT,
+                                TIMESTAMP,
+                                fromString("2021-09-24 14:34:56.1234560"))
+                        .fromCase(
+                                TIMESTAMP_LTZ(3),
+                                CET_CONTEXT,
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.parse("2021-09-24T12:34:56.1")),
+                                fromString("2021-09-24 14:34:56.100"))
+                        .fromCase(DATE(), DATE, DATE_STRING)
+                        .fromCase(TIME(5), TIME, TIME_STRING)
+                        .fromCase(INTERVAL(YEAR()), 84, fromString("+7-00"))
+                        .fromCase(INTERVAL(MONTH()), 5, fromString("+0-05"))
+                        .fromCase(INTERVAL(MONTH()), 123, fromString("+10-03"))
+                        .fromCase(INTERVAL(MONTH()), 12334, fromString("+1027-10"))
+                        .fromCase(INTERVAL(DAY()), 10L, fromString("+0 00:00:00.010"))
+                        .fromCase(INTERVAL(DAY()), 123456789L, fromString("+1 10:17:36.789"))
+                        .fromCase(
+                                INTERVAL(DAY()),
+                                Duration.ofHours(36).toMillis(),
+                                fromString("+1 12:00:00.000"))
+                        .fromCase(
+                                ARRAY(INTERVAL(MONTH())),
+                                new GenericArrayData(new int[] {-123, 123}),
+                                fromString("[-10-03, +10-03]"))
+                        .fromCase(
+                                ARRAY(INT()),
+                                new GenericArrayData(new int[] {-123, 456}),
+                                fromString("[-123, 456]"))
+                        .fromCase(
+                                ARRAY(INT().nullable()),
+                                new GenericArrayData(new Integer[] {null, 456}),
+                                fromString("[NULL, 456]"))
+                        .fromCaseLegacy(
+                                ARRAY(INT().nullable()),
+                                new GenericArrayData(new Integer[] {null, 456}),
+                                fromString("[null, 456]"))
+                        .fromCase(
+                                ARRAY(INT()),
+                                new GenericArrayData(new Integer[] {}),
+                                fromString("[]"))
+                        .fromCase(
+                                MAP(STRING(), INTERVAL(MONTH())),
+                                mapData(entry(fromString("a"), -123), entry(fromString("b"), 123)),
+                                fromString("{a=-10-03, b=+10-03}"))
+                        .fromCase(
+                                MULTISET(STRING()),
+                                mapData(entry(fromString("a"), 1), entry(fromString("b"), 1)),
+                                fromString("{a=1, b=1}"))
+                        .fromCase(
+                                MAP(STRING().nullable(), INTERVAL(MONTH()).nullable()),
+                                mapData(entry(null, -123), entry(fromString("b"), null)),
+                                fromString("{NULL=-10-03, b=NULL}"))
+                        .fromCase(
+                                MAP(STRING().nullable(), INTERVAL(MONTH()).nullable()),
+                                mapData(entry(null, null)),
+                                fromString("{NULL=NULL}"))
+                        .fromCaseLegacy(
+                                MAP(STRING().nullable(), INTERVAL(MONTH()).nullable()),
+                                mapData(entry(null, null)),
+                                fromString("{null=null}"))
+                        .fromCase(MAP(STRING(), INTERVAL(MONTH())), mapData(), fromString("{}"))
+                        .fromCase(
+                                ROW(FIELD("f0", INT()), FIELD("f1", STRING())),
+                                GenericRowData.of(123, fromString("abc")),
+                                fromString("(123, abc)"))
+                        .fromCase(
+                                ROW(FIELD("f0", STRING()), FIELD("f1", STRING())),
+                                GenericRowData.of(fromString("abc"), fromString("def")),
+                                fromString("(abc, def)"))
+                        .fromCaseLegacy(
+                                ROW(FIELD("f0", STRING()), FIELD("f1", STRING())),
+                                GenericRowData.of(fromString("abc"), fromString("def")),
+                                fromString("(abc,def)"))
+                        .fromCase(
+                                ROW(FIELD("f0", INT().nullable()), FIELD("f1", STRING())),
+                                GenericRowData.of(null, fromString("abc")),
+                                fromString("(NULL, abc)"))
+                        .fromCaseLegacy(
+                                ROW(FIELD("f0", INT().nullable()), FIELD("f1", STRING())),
+                                GenericRowData.of(null, fromString("abc")),
+                                fromString("(null,abc)"))
+                        .fromCase(ROW(), GenericRowData.of(), fromString("()"))
+                        .fromCase(
+                                RAW(LocalDateTime.class, LocalDateTimeSerializer.INSTANCE),
+                                RawValueData.fromObject(
+                                        LocalDateTime.parse("2020-11-11T18:08:01.123")),
+                                fromString("2020-11-11T18:08:01.123"))
+                        .fromCase(
+                                MY_STRUCTURED_TYPE,
+                                GenericRowData.of(
+                                        10L,
+                                        null,
+                                        TIME_STRING,
+                                        new GenericArrayData(
+                                                new Object[] {
+                                                    fromString("a"),
+                                                    fromString("b"),
+                                                    fromString("c")
+                                                })),
+                                fromString("(a=10, b=NULL, c=12:34:56.123, d=[a, b, c])"))
+                        .fromCase(
+                                MY_STRUCTURED_TYPE_WITHOUT_IMPLEMENTATION_CLASS,
+                                GenericRowData.of(
+                                        10L,
+                                        null,
+                                        TIME_STRING,
+                                        new GenericArrayData(
+                                                new Object[] {
+                                                    fromString("a"),
+                                                    fromString("b"),
+                                                    fromString("c")
+                                                })),
+                                fromString("(a=10, b=NULL, c=12:34:56.123, d=[a, b, c])")),
+                CastTestSpecBuilder.testCastTo(CHAR(6))
+                        .fromCase(STRING(), null, EMPTY_UTF8)
+                        .fromCaseLegacy(STRING(), null, EMPTY_UTF8)
+                        .fromCase(CHAR(6), fromString("Apache"), fromString("Apache"))
+                        .fromCaseLegacy(CHAR(6), fromString("Apache"), fromString("Apache"))
+                        .fromCase(VARCHAR(5), fromString("Flink"), fromString("Flink "))
+                        .fromCaseLegacy(VARCHAR(5), fromString("Flink"), fromString("Flink"))
+                        .fromCase(STRING(), fromString("foo"), fromString("foo   "))
+                        .fromCaseLegacy(STRING(), fromString("foo"), fromString("foo"))
+                        .fromCase(BOOLEAN(), true, fromString("TRUE  "))
+                        .fromCaseLegacy(BOOLEAN(), true, fromString("true"))
+                        .fromCase(BOOLEAN(), false, fromString("FALSE "))
+                        .fromCaseLegacy(BOOLEAN(), false, fromString("false"))
+                        .fromCase(BINARY(1), new byte[] {102}, fromString("f     "))
+                        .fromCaseLegacy(BINARY(1), new byte[] {102}, fromString("f"))
+                        .fromCase(VARBINARY(1), new byte[] {33}, fromString("\u0021     "))
+                        .fromCaseLegacy(VARBINARY(1), new byte[] {33}, fromString("\u0021"))
+                        .fromCase(BYTES(), new byte[] {32}, fromString("      "))
+                        .fromCaseLegacy(BYTES(), new byte[] {32}, fromString(" "))
+                        // Strict UTF-8 validation must fire before trim/pad on a CHAR(n) target.
+                        .fail(BYTES(), new byte[] {(byte) 0x80}, TableRuntimeException.class)
+                        // Legacy-bytes-to-string mode: invalid byte becomes U+FFFD then is padded.
+                        .fromCaseLegacyBytesToString(
+                                BYTES(), new byte[] {(byte) 0x80}, fromString("�     "))
+                        .fromCase(TINYINT(), (byte) -125, fromString("-125  "))
+                        .fromCaseLegacy(TINYINT(), (byte) -125, fromString("-125"))
+                        .fromCase(SMALLINT(), (short) 32767, fromString("32767 "))
+                        .fromCaseLegacy(SMALLINT(), (short) 32767, fromString("32767"))
+                        .fromCase(INT(), -1234, fromString("-1234 "))
+                        .fromCaseLegacy(INT(), -1234, fromString("-1234"))
+                        .fromCase(BIGINT(), 12345L, fromString("12345 "))
+                        .fromCaseLegacy(BIGINT(), 12345L, fromString("12345"))
+                        .fromCase(FLOAT(), -1.23f, fromString("-1.23 "))
+                        .fromCaseLegacy(FLOAT(), -1.23f, fromString("-1.23"))
+                        .fromCase(DOUBLE(), 123.4d, fromString("123.4 "))
+                        .fromCaseLegacy(DOUBLE(), 123.4d, fromString("123.4"))
+                        .fromCase(INTERVAL(YEAR()), 84, fromString("+7-00 "))
+                        .fromCaseLegacy(INTERVAL(YEAR()), 84, fromString("+7-00"))
+                        .fromCase(INTERVAL(MONTH()), 5, fromString("+0-05 "))
+                        .fromCaseLegacy(INTERVAL(MONTH()), 5, fromString("+0-05")),
+                CastTestSpecBuilder.testCastTo(CHAR(12))
+                        .fromCase(
+                                BINARY(4),
+                                new byte[] {1, 11, 111, 2},
+                                fromString("\u0001\u000B\u006F\u0002        "))
+                        .fromCaseLegacy(
+                                BINARY(4),
+                                new byte[] {1, 11, 111, 2},
+                                fromString("\u0001\u000B\u006F\u0002"))
+                        .fromCase(
+                                VARBINARY(4),
+                                new byte[] {1, 11, 22},
+                                fromString("\u0001\u000B\u0016         "))
+                        .fromCaseLegacy(
+                                VARBINARY(4),
+                                new byte[] {1, 11, 22},
+                                fromString("\u0001\u000B\u0016"))
+                        .fromCase(
+                                ARRAY(INT()),
+                                new GenericArrayData(new int[] {-1, 2, 3}),
+                                fromString("[-1, 2, 3]  "))
+                        .fromCaseLegacy(
+                                ARRAY(INT()),
+                                new GenericArrayData(new int[] {-1, 2, 3}),
+                                fromString("[-1, 2, 3]"))
+                        .fromCase(ARRAY(INT()).nullable(), null, EMPTY_UTF8)
+                        .fromCaseLegacy(ARRAY(INT()).nullable(), null, EMPTY_UTF8)
+                        .fromCase(
+                                MAP(STRING(), INT()),
+                                mapData(entry(fromString("a"), 1), entry(fromString("b"), 8)),
+                                fromString("{a=1, b=8}  "))
+                        .fromCaseLegacy(
+                                MAP(STRING(), INT()),
+                                mapData(entry(fromString("a"), 1), entry(fromString("b"), 8)),
+                                fromString("{a=1, b=8}"))
+                        .fromCaseLegacy(
+                                MAP(STRING(), INTERVAL(MONTH())).nullable(), null, EMPTY_UTF8)
+                        .fromCase(MAP(STRING(), INTERVAL(MONTH())).nullable(), null, EMPTY_UTF8)
+                        .fromCase(
+                                MULTISET(STRING()),
+                                mapData(entry(fromString("a"), 1), entry(fromString("b"), 1)),
+                                fromString("{a=1, b=1}  "))
+                        .fromCaseLegacy(
+                                MULTISET(STRING()),
+                                mapData(entry(fromString("a"), 1), entry(fromString("b"), 1)),
+                                fromString("{a=1, b=1}"))
+                        .fromCase(MULTISET(STRING()).nullable(), null, EMPTY_UTF8)
+                        .fromCaseLegacy(MULTISET(STRING()), null, EMPTY_UTF8)
+                        .fromCase(
+                                ROW(FIELD("f0", INT()), FIELD("f1", STRING())),
+                                GenericRowData.of(123, fromString("foo")),
+                                fromString("(123, foo)  "))
+                        .fromCaseLegacy(
+                                ROW(FIELD("f0", INT()), FIELD("f1", STRING())),
+                                GenericRowData.of(123, fromString("foo")),
+                                fromString("(123,foo)"))
+                        .fromCase(
+                                ROW(FIELD("f0", STRING()), FIELD("f1", STRING())).nullable(),
+                                null,
+                                EMPTY_UTF8)
+                        .fromCaseLegacy(
+                                ROW(FIELD("f0", STRING()), FIELD("f1", STRING())).nullable(),
+                                null,
+                                EMPTY_UTF8)
+                        .fromCase(
+                                RAW(LocalDate.class, LocalDateSerializer.INSTANCE),
+                                RawValueData.fromObject(LocalDate.parse("2020-12-09")),
+                                fromString("2020-12-09  "))
+                        .fromCaseLegacy(
+                                RAW(LocalDate.class, LocalDateSerializer.INSTANCE),
+                                RawValueData.fromObject(LocalDate.parse("2020-12-09")),
+                                fromString("2020-12-09"))
+                        .fromCase(
+                                RAW(LocalDateTime.class, LocalDateTimeSerializer.INSTANCE)
+                                        .nullable(),
+                                null,
+                                EMPTY_UTF8)
+                        .fromCaseLegacy(
+                                RAW(LocalDateTime.class, LocalDateTimeSerializer.INSTANCE)
+                                        .nullable(),
+                                null,
+                                EMPTY_UTF8),
+                CastTestSpecBuilder.testCastTo(VARCHAR(3))
+                        .fromCase(STRING(), null, EMPTY_UTF8)
+                        .fromCaseLegacy(STRING(), null, EMPTY_UTF8)
+                        .fromCase(CHAR(6), fromString("Apache"), fromString("Apa"))
+                        .fromCaseLegacy(CHAR(6), fromString("Apache"), fromString("Apache"))
+                        .fromCase(VARCHAR(5), fromString("Flink"), fromString("Fli"))
+                        .fromCaseLegacy(VARCHAR(5), fromString("Flink"), fromString("Flink"))
+                        // We assume that the input length is respected, therefore, no trimming is
+                        // applied
+                        .fromCase(CHAR(2), fromString("Apache"), fromString("Apache"))
+                        .fromCaseLegacy(CHAR(2), fromString("Apache"), fromString("Apache"))
+                        .fromCase(VARCHAR(2), fromString("Apache"), fromString("Apache"))
+                        .fromCaseLegacy(VARCHAR(2), fromString("Apache"), fromString("Apache"))
+                        //
+                        .fromCase(STRING(), fromString("Apache Flink"), fromString("Apa"))
+                        .fromCaseLegacy(
+                                STRING(), fromString("Apache Flink"), fromString("Apache Flink"))
+                        .fromCase(BOOLEAN(), true, fromString("TRU"))
+                        .fromCaseLegacy(BOOLEAN(), true, fromString("true"))
+                        .fromCase(BOOLEAN(), false, fromString("FAL"))
+                        .fromCaseLegacy(BOOLEAN(), false, fromString("false"))
+                        .fromCase(BINARY(2), new byte[] {0, 1}, fromString("\u0000\u0001"))
+                        .fromCaseLegacy(BINARY(1), new byte[] {0, 1}, fromString("\u0000\u0001"))
+                        .fromCase(
+                                BINARY(5),
+                                new byte[] {0, 1, 2, 3, 4},
+                                fromString("\u0000\u0001\u0002"))
+                        .fromCaseLegacy(
+                                BINARY(5),
+                                new byte[] {0, 1, 2, 3, 4},
+                                fromString("\u0000\u0001\u0002\u0003\u0004"))
+                        .fromCase(
+                                VARBINARY(5),
+                                new byte[] {0, 1, 2, 3, 4},
+                                fromString("\u0000\u0001\u0002"))
+                        .fromCaseLegacy(
+                                VARBINARY(5),
+                                new byte[] {0, 1, 2, 3, 4},
+                                fromString("\u0000\u0001\u0002\u0003\u0004"))
+                        .fromCase(
+                                BYTES(),
+                                new byte[] {0, 1, 2, 3, 4},
+                                fromString("\u0000\u0001\u0002"))
+                        .fromCaseLegacy(
+                                BYTES(),
+                                new byte[] {0, 1, 2, 3, 4},
+                                fromString("\u0000\u0001\u0002\u0003\u0004"))
+                        .fromCase(
+                                DECIMAL(4, 3),
+                                fromBigDecimal(new BigDecimal("9.8765"), 5, 4),
+                                fromString("9.8"))
+                        .fromCaseLegacy(
+                                DECIMAL(4, 3),
+                                fromBigDecimal(new BigDecimal("9.8765"), 5, 4),
+                                fromString("9.8765"))
+                        .fromCase(TINYINT(), (byte) -125, fromString("-12"))
+                        .fromCaseLegacy(TINYINT(), (byte) -125, fromString("-125"))
+                        .fromCase(SMALLINT(), (short) 32767, fromString("327"))
+                        .fromCaseLegacy(SMALLINT(), (short) 32767, fromString("32767"))
+                        .fromCase(INT(), -12345678, fromString("-12"))
+                        .fromCaseLegacy(INT(), -12345678, fromString("-12345678"))
+                        .fromCase(BIGINT(), 1234567891234L, fromString("123"))
+                        .fromCaseLegacy(BIGINT(), 1234567891234L, fromString("1234567891234"))
+                        .fromCase(FLOAT(), -123.456f, fromString("-12"))
+                        .fromCaseLegacy(FLOAT(), -123.456f, fromString("-123.456"))
+                        .fromCase(DOUBLE(), 12345.678901d, fromString("123"))
+                        .fromCaseLegacy(DOUBLE(), 12345.678901d, fromString("12345.678901"))
+                        .fromCase(FLOAT(), Float.MAX_VALUE, fromString("3.4"))
+                        .fromCaseLegacy(
+                                FLOAT(),
+                                Float.MAX_VALUE,
+                                fromString(String.valueOf(Float.MAX_VALUE)))
+                        .fromCase(DOUBLE(), Double.MAX_VALUE, fromString("1.7"))
+                        .fromCaseLegacy(
+                                DOUBLE(),
+                                Double.MAX_VALUE,
+                                fromString(String.valueOf(Double.MAX_VALUE)))
+                        .fromCase(TIMESTAMP(), TIMESTAMP, fromString("202"))
+                        .fromCaseLegacy(TIMESTAMP(), TIMESTAMP, TIMESTAMP_STRING)
+                        .fromCase(TIMESTAMP_LTZ(), CET_CONTEXT, TIMESTAMP, fromString("202"))
+                        .fromCase(
+                                TIMESTAMP_LTZ(),
+                                CET_CONTEXT_LEGACY,
+                                TIMESTAMP,
+                                TIMESTAMP_STRING_CET)
+                        .fromCase(DATE(), DATE, fromString("202"))
+                        .fromCaseLegacy(DATE(), DATE, DATE_STRING)
+                        .fromCase(TIME(5), TIME, fromString("12:"))
+                        .fromCaseLegacy(TIME(5), TIME, TIME_STRING)
+                        .fromCase(INTERVAL(YEAR()), 84, fromString("+7-"))
+                        .fromCaseLegacy(INTERVAL(YEAR()), 84, fromString("+7-00"))
+                        .fromCase(INTERVAL(MONTH()), 5, fromString("+0-"))
+                        .fromCaseLegacy(INTERVAL(MONTH()), 5, fromString("+0-05"))
+                        .fromCase(INTERVAL(DAY()), 10L, fromString("+0 "))
+                        .fromCaseLegacy(INTERVAL(DAY()), 10L, fromString("+0 00:00:00.010"))
+                        .fromCase(
+                                ARRAY(INT()),
+                                new GenericArrayData(new int[] {-123, 456}),
+                                fromString("[-1"))
+                        .fromCaseLegacy(
+                                ARRAY(INT()),
+                                new GenericArrayData(new int[] {-123, 456}),
+                                fromString("[-123, 456]"))
+                        .fromCase(ARRAY(INT()).nullable(), null, EMPTY_UTF8)
+                        .fromCaseLegacy(ARRAY(INT()).nullable(), null, EMPTY_UTF8)
+                        .fromCase(
+                                MAP(STRING(), INTERVAL(MONTH())),
+                                mapData(entry(fromString("a"), -123), entry(fromString("b"), 123)),
+                                fromString("{a="))
+                        .fromCaseLegacy(
+                                MAP(STRING(), INTERVAL(MONTH())),
+                                mapData(entry(fromString("a"), -123), entry(fromString("b"), 123)),
+                                fromString("{a=-10-03, b=+10-03}"))
+                        .fromCase(MAP(STRING(), INTERVAL(MONTH())).nullable(), null, EMPTY_UTF8)
+                        .fromCaseLegacy(
+                                MAP(STRING(), INTERVAL(MONTH())).nullable(), null, EMPTY_UTF8)
+                        .fromCase(MAP(STRING(), INTERVAL(MONTH())).nullable(), null, EMPTY_UTF8)
+                        .fromCase(
+                                MULTISET(STRING()),
+                                mapData(entry(fromString("a"), 1), entry(fromString("b"), 1)),
+                                fromString("{a="))
+                        .fromCaseLegacy(
+                                MULTISET(STRING()),
+                                mapData(entry(fromString("a"), 1), entry(fromString("b"), 1)),
+                                fromString("{a=1, b=1}"))
+                        .fromCase(MULTISET(STRING()).nullable(), null, EMPTY_UTF8)
+                        .fromCaseLegacy(MULTISET(STRING()), null, EMPTY_UTF8)
+                        .fromCase(
+                                ROW(FIELD("f0", INT()), FIELD("f1", STRING())),
+                                GenericRowData.of(123, fromString("abc")),
+                                fromString("(12"))
+                        .fromCaseLegacy(
+                                ROW(FIELD("f0", INT()), FIELD("f1", STRING())),
+                                GenericRowData.of(123, fromString("abc")),
+                                fromString("(123,abc)"))
+                        .fromCase(
+                                ROW(FIELD("f0", STRING()), FIELD("f1", STRING())).nullable(),
+                                null,
+                                EMPTY_UTF8)
+                        .fromCaseLegacy(
+                                ROW(FIELD("f0", STRING()), FIELD("f1", STRING())).nullable(),
+                                null,
+                                EMPTY_UTF8)
+                        .fromCase(
+                                RAW(LocalDateTime.class, LocalDateTimeSerializer.INSTANCE),
+                                RawValueData.fromObject(
+                                        LocalDateTime.parse("2020-11-11T18:08:01.123")),
+                                fromString("202"))
+                        .fromCaseLegacy(
+                                RAW(LocalDateTime.class, LocalDateTimeSerializer.INSTANCE),
+                                RawValueData.fromObject(
+                                        LocalDateTime.parse("2020-11-11T18:08:01.123")),
+                                fromString("2020-11-11T18:08:01.123"))
+                        .fromCase(
+                                RAW(LocalDateTime.class, LocalDateTimeSerializer.INSTANCE)
+                                        .nullable(),
+                                null,
+                                EMPTY_UTF8)
+                        .fromCaseLegacy(
+                                RAW(LocalDateTime.class, LocalDateTimeSerializer.INSTANCE)
+                                        .nullable(),
+                                null,
+                                EMPTY_UTF8),
+                CastTestSpecBuilder.testCastTo(BOOLEAN())
+                        .fromCase(BOOLEAN(), null, null)
+                        .fail(CHAR(3), fromString("foo"), TableRuntimeException.class)
+                        .fromCase(CHAR(4), fromString("true"), true)
+                        .fromCase(VARCHAR(5), fromString("FalsE"), false)
+                        .fail(STRING(), fromString("Apache Flink"), TableRuntimeException.class)
+                        .fromCase(STRING(), fromString("TRUE"), true)
+                        .fail(STRING(), fromString(""), TableRuntimeException.class)
+                        // Should fail when https://issues.apache.org/jira/browse/FLINK-24576 is
+                        // fixed
+                        .fromCase(
+                                DECIMAL(5, 3), fromBigDecimal(new BigDecimal("0.000"), 5, 3), false)
+                        .fromCase(
+                                DECIMAL(4, 3), fromBigDecimal(new BigDecimal("1.987"), 4, 3), true)
+                        .fromCase(TINYINT(), DEFAULT_POSITIVE_TINY_INT, true)
+                        .fromCase(TINYINT(), DEFAULT_NEGATIVE_TINY_INT, true)
+                        .fromCase(TINYINT(), (byte) 0, false)
+                        .fromCase(SMALLINT(), DEFAULT_POSITIVE_SMALL_INT, true)
+                        .fromCase(SMALLINT(), DEFAULT_NEGATIVE_SMALL_INT, true)
+                        .fromCase(SMALLINT(), (short) 0, false)
+                        .fromCase(INT(), DEFAULT_POSITIVE_INT, true)
+                        .fromCase(INT(), DEFAULT_NEGATIVE_INT, true)
+                        .fromCase(INT(), 0, false)
+                        .fromCase(BIGINT(), DEFAULT_POSITIVE_BIGINT, true)
+                        .fromCase(BIGINT(), DEFAULT_NEGATIVE_BIGINT, true)
+                        .fromCase(BIGINT(), 0L, false)
+                        // Should fail when https://issues.apache.org/jira/browse/FLINK-24576 is
+                        // fixed
+                        .fromCase(FLOAT(), 0f, false)
+                        .fromCase(FLOAT(), 1.1234f, true)
+                        .fromCase(DOUBLE(), 0.0d, false)
+                        .fromCase(DOUBLE(), -0.12345678d, true),
+                CastTestSpecBuilder.testCastTo(BINARY(4))
+                        .fromCase(CHAR(4), fromString("66"), new byte[] {54, 54, 0, 0})
+                        .fromCaseLegacy(CHAR(4), fromString("66"), new byte[] {54, 54})
+                        .fromCase(CHAR(3), fromString("foo"), new byte[] {102, 111, 111, 0})
+                        .fromCaseLegacy(CHAR(3), fromString("foo"), new byte[] {102, 111, 111})
+                        .fromCase(CHAR(10), fromString("66A2"), new byte[] {54, 54, 65, 50})
+                        .fromCaseLegacy(CHAR(10), fromString("66A2"), new byte[] {54, 54, 65, 50})
+                        .fromCase(CHAR(1), fromString("f"), new byte[] {102, 0, 0, 0})
+                        .fromCaseLegacy(CHAR(1), fromString("f"), new byte[] {102})
+                        .fromCase(CHAR(16), fromString("12f4aBc7"), new byte[] {49, 50, 102, 52})
+                        .fromCase(CHAR(3), fromString("A f "), new byte[] {65, 32, 102, 32})
+                        .fromCase(VARCHAR(8), fromString("bAC"), new byte[] {98, 65, 67, 0})
+                        .fromCase(VARCHAR(5), fromString("Flink"), new byte[] {70, 108, 105, 110})
+                        .fromCaseLegacy(
+                                VARCHAR(5),
+                                fromString("Flink"),
+                                new byte[] {70, 108, 105, 110, 107})
+                        .fromCase(STRING(), fromString("Apache"), new byte[] {65, 112, 97, 99})
+                        .fromCaseLegacy(
+                                STRING(),
+                                fromString("Apache"),
+                                new byte[] {65, 112, 97, 99, 104, 101})
+                        .fromCase(BINARY(2), new byte[] {1, 2}, new byte[] {1, 2, 0, 0})
+                        .fromCaseLegacy(BINARY(2), new byte[] {1, 2}, new byte[] {1, 2})
+                        .fromCase(VARBINARY(3), new byte[] {1, 2, 3}, new byte[] {1, 2, 3, 0})
+                        .fromCaseLegacy(VARBINARY(3), new byte[] {1, 2, 3}, new byte[] {1, 2, 3})
+                        .fromCase(BYTES(), new byte[] {1, 2, 3}, new byte[] {1, 2, 3, 0})
+                        .fromCaseLegacy(BYTES(), new byte[] {1, 2, 3}, new byte[] {1, 2, 3}),
+                CastTestSpecBuilder.testCastTo(VARBINARY(4))
+                        .fromCase(CHAR(4), fromString("c9"), new byte[] {99, 57})
+                        .fromCaseLegacy(CHAR(4), fromString("c9"), new byte[] {99, 57})
+                        .fromCase(CHAR(3), fromString("foo"), new byte[] {102, 111, 111})
+                        .fromCaseLegacy(CHAR(3), fromString("foo"), new byte[] {102, 111, 111})
+                        .fromCase(VARCHAR(8), fromString("7de2"), new byte[] {55, 100, 101, 50})
+                        .fromCaseLegacy(
+                                VARCHAR(8), fromString("7de2"), new byte[] {55, 100, 101, 50})
+                        .fromCase(VARCHAR(5), fromString("Flink"), new byte[] {70, 108, 105, 110})
+                        .fromCaseLegacy(
+                                VARCHAR(5),
+                                fromString("Flink"),
+                                new byte[] {70, 108, 105, 110, 107})
+                        .fromCase(STRING(), fromString("12F4a bC7"), new byte[] {49, 50, 70, 52})
+                        .fromCaseLegacy(
+                                STRING(),
+                                fromString("12F4a bC7"),
+                                new byte[] {49, 50, 70, 52, 97, 32, 98, 67, 55})
+                        .fromCaseLegacy(
+                                STRING(),
+                                fromString("Apache"),
+                                new byte[] {65, 112, 97, 99, 104, 101})
+                        // We assume that the input length is respected, therefore, no trimming is
+                        // applied
+                        .fromCase(BINARY(2), new byte[] {1, 2, 3, 4, 5}, new byte[] {1, 2, 3, 4, 5})
+                        .fromCaseLegacy(
+                                BINARY(2), new byte[] {1, 2, 3, 4, 5}, new byte[] {1, 2, 3, 4, 5})
+                        .fromCase(
+                                VARBINARY(2),
+                                new byte[] {1, 2, 3, 4, 5},
+                                new byte[] {1, 2, 3, 4, 5})
+                        .fromCaseLegacy(
+                                VARBINARY(2),
+                                new byte[] {1, 2, 3, 4, 5},
+                                new byte[] {1, 2, 3, 4, 5}),
+                CastTestSpecBuilder.testCastTo(BYTES())
+                        .fromCase(CHAR(4), fromString("9C"), new byte[] {57, 67})
+                        .fromCaseLegacy(CHAR(4), fromString("9C"), new byte[] {57, 67})
+                        .fromCase(CHAR(3), fromString("foo"), new byte[] {102, 111, 111})
+                        .fromCaseLegacy(CHAR(3), fromString("foo"), new byte[] {102, 111, 111})
+                        .fromCase(VARCHAR(8), fromString("3ee3"), new byte[] {51, 101, 101, 51})
+                        .fromCaseLegacy(
+                                VARCHAR(8), fromString("3ee3"), new byte[] {51, 101, 101, 51})
+                        .fromCase(
+                                VARCHAR(5),
+                                fromString("Flink"),
+                                new byte[] {70, 108, 105, 110, 107})
+                        .fromCaseLegacy(
+                                VARCHAR(5),
+                                fromString("Flink"),
+                                new byte[] {70, 108, 105, 110, 107})
+                        .fromCase(
+                                STRING(),
+                                fromString("AAbb Cc Dd"),
+                                new byte[] {65, 65, 98, 98, 32, 67, 99, 32, 68, 100})
+                        .fromCaseLegacy(
+                                STRING(),
+                                fromString("AAbb Cc Dd"),
+                                new byte[] {65, 65, 98, 98, 32, 67, 99, 32, 68, 100})
+                        .fromCase(
+                                STRING(),
+                                fromString("Apache"),
+                                new byte[] {65, 112, 97, 99, 104, 101})
+                        .fromCaseLegacy(
+                                STRING(),
+                                fromString("Apache"),
+                                new byte[] {65, 112, 97, 99, 104, 101}),
+                CastTestSpecBuilder.testCastTo(DECIMAL(5, 3))
+                        .fail(CHAR(3), fromString("foo"), TableRuntimeException.class)
+                        .fail(VARCHAR(5), fromString("Flink"), TableRuntimeException.class)
+                        .fail(STRING(), fromString("Apache"), TableRuntimeException.class)
+                        .fromCase(
+                                STRING(),
+                                fromString("1.234"),
+                                fromBigDecimal(new BigDecimal("1.234"), 5, 3))
+                        .fromCase(
+                                STRING(),
+                                fromString("1.2"),
+                                fromBigDecimal(new BigDecimal("1.200"), 5, 3))
+                        .fromCase(
+                                STRING(),
+                                fromString(" 1.2 "),
+                                fromBigDecimal(new BigDecimal("1.200"), 5, 3))
+                        .fromCase(
+                                STRING(),
+                                fromString(" .2 "),
+                                fromBigDecimal(new BigDecimal("0.200"), 5, 3))
+                        .fromCase(
+                                DECIMAL(4, 3),
+                                fromBigDecimal(new BigDecimal("9.87"), 4, 3),
+                                fromBigDecimal(new BigDecimal("9.870"), 5, 3))
+                        .fromCase(
+                                TINYINT(),
+                                (byte) -1,
+                                fromBigDecimal(new BigDecimal("-1.000"), 5, 3))
+                        .fromCase(
+                                SMALLINT(),
+                                (short) 3,
+                                fromBigDecimal(new BigDecimal("3.000"), 5, 3))
+                        .fromCase(INT(), 42, fromBigDecimal(new BigDecimal("42.000"), 5, 3))
+                        .fromCase(BIGINT(), 8L, fromBigDecimal(new BigDecimal("8.000"), 5, 3))
+                        .fromCase(
+                                FLOAT(), -12.345f, fromBigDecimal(new BigDecimal("-12.345"), 5, 3))
+                        .fromCase(DOUBLE(), 12.678d, fromBigDecimal(new BigDecimal("12.678"), 5, 3))
+                        .fromCase(BOOLEAN(), true, fromBigDecimal(BigDecimal.ONE, 5, 3))
+                        .fromCase(BOOLEAN(), false, fromBigDecimal(BigDecimal.ZERO, 5, 3)),
+                CastTestSpecBuilder.testCastTo(ARRAY(STRING().nullable()))
+                        .fromCase(
+                                ARRAY(TIMESTAMP().nullable()),
+                                new GenericArrayData(
+                                        new Object[] {
+                                            TIMESTAMP,
+                                            null,
+                                            TimestampData.fromLocalDateTime(
+                                                    LocalDateTime.parse(
+                                                            "2021-09-24T14:34:56.123456"))
+                                        }),
+                                new GenericArrayData(
+                                        new Object[] {
+                                            TIMESTAMP_STRING,
+                                            null,
+                                            fromString("2021-09-24 14:34:56.123456")
+                                        })),
+                CastTestSpecBuilder.testCastTo(ARRAY(VARBINARY(1)))
+                        .fromCase(ARRAY(BYTES()), null, null)
+                        .fromCase(
+                                ARRAY(BYTES()),
+                                new GenericArrayData(new byte[][] {}),
+                                new GenericArrayData(new byte[][] {}))
+                        .fromCase(
+                                ARRAY(BYTES()),
+                                new GenericArrayData(new byte[][] {{1}, {2, 3}, null, {}}),
+                                new GenericArrayData(new byte[][] {{1}, {2}, null, {}})),
+                CastTestSpecBuilder.testCastTo(ARRAY(BINARY(2).notNull()))
+                        .fromCase(
+                                ARRAY(BYTES().notNull()),
+                                new GenericArrayData(new byte[][] {{1}, {2, 3, 4}}),
+                                new GenericArrayData(new byte[][] {{1, 0}, {2, 3}})),
+                CastTestSpecBuilder.testCastTo(ARRAY(BIGINT().nullable()))
+                        .fromCase(
+                                ARRAY(INT().nullable()),
+                                new GenericArrayData(new Integer[] {1, null, 2}),
+                                new GenericArrayData(new Long[] {1L, null, 2L})),
+                CastTestSpecBuilder.testCastTo(ARRAY(BIGINT().notNull()))
+                        .fromCase(
+                                ARRAY(INT().notNull()),
+                                new GenericArrayData(new int[] {1, 2}),
+                                new GenericArrayData(new long[] {1L, 2L})),
+                CastTestSpecBuilder.testCastTo(ARRAY(ARRAY(BIGINT().notNull())))
+                        .fail(
+                                ARRAY(ARRAY(INT().nullable())),
+                                new GenericArrayData(
+                                        new GenericArrayData[] {
+                                            new GenericArrayData(new Integer[] {1, 2, null}),
+                                            new GenericArrayData(new Integer[] {3})
+                                        }),
+                                TableRuntimeException.class)
+                        .fromCase(
+                                ARRAY(ARRAY(INT().nullable())),
+                                new GenericArrayData(
+                                        new GenericArrayData[] {
+                                            new GenericArrayData(new Integer[] {1, 2}),
+                                            new GenericArrayData(new Integer[] {3})
+                                        }),
+                                new GenericArrayData(
+                                        new GenericArrayData[] {
+                                            new GenericArrayData(new Long[] {1L, 2L}),
+                                            new GenericArrayData(new Long[] {3L})
+                                        })),
+                CastTestSpecBuilder.testCastTo(ARRAY(ARRAY(DECIMAL(10, 2).notNull())))
+                        .fromCase(
+                                ARRAY(ARRAY(INT().notNull())),
+                                new GenericArrayData(
+                                        new GenericArrayData[] {
+                                            new GenericArrayData(new Integer[] {1, 2}),
+                                            new GenericArrayData(new Integer[] {3})
+                                        }),
+                                new GenericArrayData(
+                                        new GenericArrayData[] {
+                                            new GenericArrayData(
+                                                    new Object[] {
+                                                        DecimalData.fromBigDecimal(
+                                                                BigDecimal.ONE, 10, 2),
+                                                        DecimalData.fromBigDecimal(
+                                                                new BigDecimal(2), 10, 2)
+                                                    }),
+                                            new GenericArrayData(
+                                                    new Object[] {
+                                                        DecimalData.fromBigDecimal(
+                                                                new BigDecimal(3), 10, 2)
+                                                    })
+                                        })),
+                CastTestSpecBuilder.testCastTo(MAP(DOUBLE().notNull(), DOUBLE().notNull()))
+                        .fromCase(
+                                MAP(INT().nullable(), INT().nullable()),
+                                mapData(entry(1, 2)),
+                                mapData(entry(1d, 2d))),
+                CastTestSpecBuilder.testCastTo(MAP(BIGINT().nullable(), BIGINT().nullable()))
+                        .fromCase(
+                                MAP(INT().nullable(), INT().nullable()),
+                                mapData(entry(1, 2)),
+                                mapData(entry(1L, 2L))),
+                CastTestSpecBuilder.testCastTo(MAP(BIGINT().nullable(), BIGINT().nullable()))
+                        .fromCase(
+                                MAP(INT().nullable(), INT().nullable()),
+                                mapData(entry(1, 2), entry(null, 3), entry(4, null)),
+                                mapData(entry(1L, 2L), entry(null, 3L), entry(4L, null))),
+                CastTestSpecBuilder.testCastTo(MAP(STRING().nullable(), STRING().nullable()))
+                        .fromCase(
+                                MAP(TIMESTAMP().nullable(), DOUBLE().nullable()),
+                                mapData(entry(TIMESTAMP, 123.456)),
+                                mapData(entry(TIMESTAMP_STRING, fromString("123.456")))),
+                CastTestSpecBuilder.testCastTo(MAP(STRING().notNull(), STRING().nullable()))
+                        .fail(
+                                MAP(INT().nullable(), DOUBLE().nullable()),
+                                mapData(entry(null, 1d)),
+                                TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(MAP(STRING().notNull(), STRING().notNull()))
+                        .fail(
+                                MAP(INT().nullable(), DOUBLE().nullable()),
+                                mapData(entry(123, null)),
+                                TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(MULTISET(DOUBLE().notNull()))
+                        .fromCase(
+                                MULTISET(INT().nullable()),
+                                mapData(entry(1, 1)),
+                                mapData(entry(1d, 1))),
+                CastTestSpecBuilder.testCastTo(MULTISET(STRING().notNull()))
+                        .fromCase(
+                                MULTISET(INT().nullable()),
+                                mapData(entry(1, 1)),
+                                mapData(entry(fromString("1"), 1))),
+                CastTestSpecBuilder.testCastTo(MULTISET(FLOAT().nullable()))
+                        .fromCase(
+                                MULTISET(INT().nullable()),
+                                mapData(entry(null, 1)),
+                                mapData(entry(null, 1))),
+                CastTestSpecBuilder.testCastTo(MULTISET(STRING().notNull()))
+                        .fail(
+                                MULTISET(INT().nullable()),
+                                mapData(entry(null, 1)),
+                                TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(
+                                ROW(BIGINT().notNull(), BIGINT(), STRING(), ARRAY(STRING())))
+                        .fromCase(
+                                ROW(INT().notNull(), INT(), TIME(5), ARRAY(TIMESTAMP())),
+                                GenericRowData.of(
+                                        10,
+                                        null,
+                                        TIME,
+                                        new GenericArrayData(
+                                                new Object[] {TIMESTAMP, TIMESTAMP, TIMESTAMP})),
+                                GenericRowData.of(
+                                        10L,
+                                        null,
+                                        TIME_STRING,
+                                        new GenericArrayData(
+                                                new Object[] {
+                                                    TIMESTAMP_STRING,
+                                                    TIMESTAMP_STRING,
+                                                    TIMESTAMP_STRING
+                                                })))
+                        .fromCase(
+                                ROW(INT().notNull(), INT(), DATE(), ARRAY(STRING()), TIME(5)),
+                                GenericRowData.of(
+                                        10,
+                                        100,
+                                        DATE,
+                                        new GenericArrayData(
+                                                new Object[] {
+                                                    fromString("a"),
+                                                    fromString("b"),
+                                                    fromString("c")
+                                                }),
+                                        TIME),
+                                GenericRowData.of(
+                                        10L,
+                                        100L,
+                                        DATE_STRING,
+                                        new GenericArrayData(
+                                                new Object[] {
+                                                    fromString("a"),
+                                                    fromString("b"),
+                                                    fromString("c")
+                                                }))),
+                CastTestSpecBuilder.testCastTo(
+                                ROW(MAP(BIGINT().notNull(), STRING()), MULTISET(STRING())))
+                        .fromCase(
+                                ROW(MAP(INT().notNull(), INT()), MULTISET(TIMESTAMP())),
+                                GenericRowData.of(
+                                        mapData(entry(1, 2)), mapData(entry(TIMESTAMP, 1))),
+                                GenericRowData.of(
+                                        mapData(entry(1L, fromString("2"))),
+                                        mapData(entry(TIMESTAMP_STRING, 1)))),
+                CastTestSpecBuilder.testCastTo(MY_STRUCTURED_TYPE)
+                        .fromCase(
+                                ROW(INT().notNull(), INT(), TIME(5), ARRAY(TIMESTAMP())),
+                                GenericRowData.of(
+                                        10,
+                                        null,
+                                        TIME,
+                                        new GenericArrayData(
+                                                new Object[] {TIMESTAMP, TIMESTAMP, TIMESTAMP})),
+                                GenericRowData.of(
+                                        10L,
+                                        null,
+                                        TIME_STRING,
+                                        new GenericArrayData(
+                                                new Object[] {
+                                                    TIMESTAMP_STRING,
+                                                    TIMESTAMP_STRING,
+                                                    TIMESTAMP_STRING
+                                                }))),
+                // BITMAP cast rules
+                CastTestSpecBuilder.testCastTo(CHAR(5))
+                        .fromCase(BITMAP(), DEFAULT_BITMAP, fromString("{0,1,"))
+                        .fromCase(BITMAP(), Bitmap.empty(), fromString("{}   "))
+                        .fromCase(BITMAP(), null, EMPTY_UTF8),
+                CastTestSpecBuilder.testCastTo(VARCHAR(5))
+                        .fromCase(BITMAP(), DEFAULT_BITMAP, fromString("{0,1,"))
+                        .fromCase(BITMAP(), Bitmap.empty(), fromString("{}"))
+                        .fromCase(BITMAP(), null, EMPTY_UTF8),
+                CastTestSpecBuilder.testCastTo(STRING())
+                        .fromCase(BITMAP(), DEFAULT_BITMAP, fromString("{0,1,2}"))
+                        .fromCase(BITMAP(), Bitmap.empty(), fromString("{}"))
+                        .fromCase(BITMAP(), null, null),
+                CastTestSpecBuilder.testCastTo(BYTES())
+                        .fromCase(BITMAP(), DEFAULT_BITMAP, DEFAULT_BITMAP.toBytes())
+                        .fromCase(BITMAP(), Bitmap.empty(), Bitmap.empty().toBytes())
+                        .fromCase(BITMAP(), null, null),
+                // UUID cast rules. A UUID renders as its canonical lower-case 8-4-4-4-12 form and
+                // maps to its 16-byte big-endian encoding.
+                CastTestSpecBuilder.testCastTo(STRING())
+                        .fromCase(UUID(), UUID_BYTES, fromString(UUID_STRING))
+                        .fromCase(UUID(), null, null),
+                // a bounded character target trims, and CHAR pads to its fixed width
+                CastTestSpecBuilder.testCastTo(VARCHAR(8))
+                        .fromCase(UUID(), UUID_BYTES, fromString("550e8400")),
+                CastTestSpecBuilder.testCastTo(CHAR(38))
+                        .fromCase(UUID(), UUID_BYTES, fromString(UUID_STRING + "  ")),
+                CastTestSpecBuilder.testCastTo(BINARY(16))
+                        .fromCase(UUID(), UUID_BYTES, UUID_BYTES)
+                        .fromCase(UUID(), null, null),
+                // a VARBINARY(n) with n >= 16 holds the value without trimming
+                CastTestSpecBuilder.testCastTo(VARBINARY(16))
+                        .fromCase(UUID(), UUID_BYTES, UUID_BYTES)
+                        .fromCase(UUID(), null, null),
+                CastTestSpecBuilder.testCastTo(BYTES())
+                        .fromCase(UUID(), UUID_BYTES, UUID_BYTES)
+                        .fromCase(UUID(), null, null),
+                // a UUID is parsed leniently from a string, following PostgreSQL conventions
+                CastTestSpecBuilder.testCastTo(UUID())
+                        .fromCase(STRING(), fromString(UUID_STRING), UUID_BYTES)
+                        .fromCase(STRING(), fromString(UUID_STRING.toUpperCase()), UUID_BYTES)
+                        .fromCase(STRING(), fromString("{" + UUID_STRING + "}"), UUID_BYTES)
+                        .fromCase(STRING(), fromString(UUID_STRING.replace("-", "")), UUID_BYTES)
+                        // a hyphen may follow any group of four digits, PostgreSQL style
+                        .fromCase(
+                                STRING(),
+                                fromString("550e-8400-e29b-41d4-a716-4466-5544-0000"),
+                                UUID_BYTES)
+                        .fromCase(STRING(), null, null)
+                        // a malformed value fails, and yields null for TRY_CAST
+                        .fail(
+                                STRING(),
+                                fromString("not-a-uuid"),
+                                TableRuntimeException.class,
+                                "32 hexadecimal digits")
+                        .fail(
+                                STRING(),
+                                fromString("550e8400"),
+                                TableRuntimeException.class,
+                                "32 hexadecimal digits")
+                        // too many hexadecimal digits
+                        .fail(
+                                STRING(),
+                                fromString(UUID_STRING + "00"),
+                                TableRuntimeException.class,
+                                "32 hexadecimal digits")
+                        // a hyphen inside a four-digit group is rejected
+                        .fail(
+                                STRING(),
+                                fromString("5-50e8400e29b41d4a716446655440000"),
+                                TableRuntimeException.class,
+                                "32 hexadecimal digits"),
+                // a binary value is reinterpreted, and has to be exactly 16 bytes long
+                CastTestSpecBuilder.testCastTo(UUID())
+                        .fromCase(BYTES(), UUID_BYTES, UUID_BYTES)
+                        .fromCase(BINARY(16), UUID_BYTES, UUID_BYTES)
+                        .fromCase(BYTES(), null, null)
+                        .fail(
+                                BYTES(),
+                                new byte[] {1, 2, 3},
+                                TableRuntimeException.class,
+                                "requires exactly 16 bytes"),
+                // From VARIANT to primitive types. A cast succeeds only when the target holds the
+                // stored value unaltered, except for the approximate FLOAT and DOUBLE.
+                // A character string renders like a regular cast of the stored kind, so these
+                // expectations reuse the constants of the native cases above.
+                CastTestSpecBuilder.testCastTo(STRING())
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(true), fromString("TRUE"))
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(false), fromString("FALSE"))
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of("foo"), fromString("foo"))
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(42), fromString("42"))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(new BigDecimal("123.456")),
+                                fromString("123.456"))
+                        // a small scale stays plain instead of turning into scientific notation
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(new BigDecimal("0.0000000001")),
+                                fromString("0.0000000001"))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(LocalDate.parse("2021-09-24")),
+                                DATE_STRING)
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(TIMESTAMP.toLocalDateTime()),
+                                TIMESTAMP_STRING)
+                        .fromCase(
+                                VARIANT(),
+                                CET_CONTEXT,
+                                VARIANT_BUILDER.of(TIMESTAMP.toInstant()),
+                                TIMESTAMP_STRING_CET)
+                        // a time renders at millisecond resolution, the same as a regular TIME to
+                        // string cast, so the stored microseconds are truncated
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder().of(LocalTime.of(12, 34, 56, 123_456_000)),
+                                fromString("12:34:56.123"))
+                        // a nanosecond timestamp keeps its full precision when rendered
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder()
+                                        .of(LocalDateTime.of(2021, 9, 24, 12, 34, 56, 123_456_789)),
+                                fromString("2021-09-24 12:34:56.123456789"))
+                        .fromCase(
+                                VARIANT(),
+                                CET_CONTEXT,
+                                Variant.newBuilder()
+                                        .of(Instant.parse("2021-09-24T12:34:56.123456789Z")),
+                                fromString("2021-09-24 14:34:56.123456789"))
+                        // a UUID renders in its canonical lower-case 8-4-4-4-12 form, the same as
+                        // a regular UUID to string cast
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder().of(UUID_VALUE),
+                                fromString(UUID_STRING))
+                        // a binary value is read as UTF-8, like a regular BINARY to string cast
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of("hello".getBytes(StandardCharsets.UTF_8)),
+                                fromString("hello"))
+                        // a multi-byte sequence passes the well-formedness check unchanged
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of("héllo".getBytes(StandardCharsets.UTF_8)),
+                                fromString("héllo"))
+                        // bytes that are not valid UTF-8 are rejected rather than decoded into
+                        // the U+FFFD replacement character
+                        .fail(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(INVALID_UTF8),
+                                TableRuntimeException.class)
+                        // a byte value nested in a container is rendered unbounded, so its error
+                        // names STRING rather than the container's target; the same holds for an
+                        // object field value
+                        .fail(
+                                VARIANT(),
+                                VARIANT_BUILDER
+                                        .array()
+                                        .add(VARIANT_BUILDER.of(INVALID_UTF8))
+                                        .build(),
+                                TableRuntimeException.class,
+                                "binary value to STRING")
+                        .fail(
+                                VARIANT(),
+                                VARIANT_BUILDER
+                                        .object()
+                                        .add("k", VARIANT_BUILDER.of(INVALID_UTF8))
+                                        .build(),
+                                TableRuntimeException.class,
+                                "binary value to STRING")
+                        // an object or an array has no scalar form, so it renders like a regular
+                        // ARRAY or MAP to string cast, with strings unquoted and a nested null
+                        // shown as NULL
+                        .fromCase(VARIANT(), VARIANT_ARRAY, fromString("[1, two, FALSE, NULL]"))
+                        .fromCase(VARIANT(), VARIANT_OBJECT, fromString("{k=[1, 2]}"))
+                        // printing renders the same way but never fails
+                        .fromCasePrinting(
+                                VARIANT(), VARIANT_ARRAY, fromString("[1, two, FALSE, NULL]"))
+                        .fromCasePrinting(VARIANT(), VARIANT_OBJECT, fromString("{k=[1, 2]}"))
+                        .fromCasePrinting(VARIANT(), VARIANT_BUILDER.of("foo"), fromString("foo"))
+                        .fromCasePrinting(VARIANT(), VARIANT_BUILDER.of(42), fromString("42"))
+                        .fromCasePrinting(VARIANT(), VARIANT_BUILDER.ofNull(), fromString("NULL")),
+                // A bounded character target pads and trims like any other cast into it, and its
+                // length counts code points, so a character outside the BMP fills one position
+                // even though it occupies two UTF-16 units.
+                CastTestSpecBuilder.testCastTo(CHAR(1))
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of("x"), fromString("x"))
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(NON_BMP), fromString(NON_BMP))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(NON_BMP + NON_BMP),
+                                fromString(NON_BMP))
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of("abcdefghij"), fromString("a")),
+                CastTestSpecBuilder.testCastTo(CHAR(5))
+                        // shorter than the target, so it is padded to the fixed width
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of("ab"), fromString("ab   "))
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of("abcdefghij"), fromString("abcde")),
+                CastTestSpecBuilder.testCastTo(VARCHAR(2))
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(NON_BMP), fromString(NON_BMP))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(NON_BMP + NON_BMP),
+                                fromString(NON_BMP + NON_BMP))
+                        // longer than the target, so it is trimmed rather than rejected, and a
+                        // variable width target is not padded
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(NON_BMP + NON_BMP + NON_BMP),
+                                fromString(NON_BMP + NON_BMP))
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of("a"), fromString("a")),
+                CastTestSpecBuilder.testCastTo(VARIANT())
+                        .fromCase(BOOLEAN(), true, VARIANT_BUILDER.of(true))
+                        // an integer keeps the width of its SQL type, even when a smaller one fits
+                        .fromCase(TINYINT(), (byte) 42, VARIANT_BUILDER.of((byte) 42))
+                        .fromCase(SMALLINT(), (short) 42, VARIANT_BUILDER.of((short) 42))
+                        .fromCase(INT(), 42, VARIANT_BUILDER.of(42))
+                        .fromCase(BIGINT(), 1L, VARIANT_BUILDER.of(1L))
+                        .fromCase(BIGINT(), 42L, VARIANT_BUILDER.of(42L))
+                        .fromCase(
+                                BIGINT(),
+                                DEFAULT_NEGATIVE_BIGINT,
+                                VARIANT_BUILDER.of(DEFAULT_NEGATIVE_BIGINT))
+                        .fromCase(BIGINT(), Long.MAX_VALUE, VARIANT_BUILDER.of(Long.MAX_VALUE))
+                        .fromCase(FLOAT(), 1.5f, VARIANT_BUILDER.of(1.5f))
+                        .fromCase(DOUBLE(), 1.5d, VARIANT_BUILDER.of(1.5d))
+                        .fromCase(DOUBLE(), Double.MAX_VALUE, VARIANT_BUILDER.of(Double.MAX_VALUE))
+                        // a VARIANT is not limited to JSON, so NaN and infinity are kept
+                        .fromCase(FLOAT(), Float.NaN, VARIANT_BUILDER.of(Float.NaN))
+                        .fromCase(
+                                FLOAT(),
+                                Float.POSITIVE_INFINITY,
+                                VARIANT_BUILDER.of(Float.POSITIVE_INFINITY))
+                        .fromCase(DOUBLE(), Double.NaN, VARIANT_BUILDER.of(Double.NaN))
+                        .fromCase(
+                                DOUBLE(),
+                                Double.NEGATIVE_INFINITY,
+                                VARIANT_BUILDER.of(Double.NEGATIVE_INFINITY))
+                        // a decimal keeps its scale
+                        .fromCase(
+                                DECIMAL(4, 2),
+                                fromBigDecimal(new BigDecimal("12.50"), 4, 2),
+                                VARIANT_BUILDER.of(new BigDecimal("12.50")))
+                        .fromCase(
+                                DECIMAL(38, 0),
+                                fromBigDecimal(new BigDecimal("9".repeat(38)), 38, 0),
+                                VARIANT_BUILDER.of(new BigDecimal("9".repeat(38))))
+                        // a string is wrapped, never parsed as JSON
+                        .fromCase(
+                                STRING(), fromString("{\"a\":1}"), VARIANT_BUILDER.of("{\"a\":1}"))
+                        .fromCase(CHAR(4), fromString("ab  "), VARIANT_BUILDER.of("ab  "))
+                        .fromCase(
+                                BYTES(),
+                                new byte[] {1, 2, 3},
+                                VARIANT_BUILDER.of(new byte[] {1, 2, 3}))
+                        .fromCase(DATE(), DATE, VARIANT_BUILDER.of(LocalDate.parse("2021-09-24")))
+                        // VARIANT stores TIME in microseconds, so every Flink TIME fits exactly,
+                        // since the runtime keeps milliseconds
+                        .fromCase(TIME(), TIME, VARIANT_BUILDER.of(LocalTime.parse("12:34:56.123")))
+                        .fromCase(
+                                TIME(0),
+                                DateTimeUtils.toInternal(LocalTime.of(12, 34, 56)),
+                                VARIANT_BUILDER.of(LocalTime.of(12, 34, 56)))
+                        .fromCase(
+                                TIME(3),
+                                DateTimeUtils.toInternal(LocalTime.of(12, 34, 56, 123_000_000)),
+                                VARIANT_BUILDER.of(LocalTime.of(12, 34, 56, 123_000_000)))
+                        .fromCase(TIME(0), 0, VARIANT_BUILDER.of(LocalTime.MIDNIGHT))
+                        .fromCase(
+                                TIME(3),
+                                DateTimeUtils.toInternal(LocalTime.of(23, 59, 59, 999_000_000)),
+                                VARIANT_BUILDER.of(LocalTime.of(23, 59, 59, 999_000_000)))
+                        // microsecond precision and below is stored as a TIMESTAMP
+                        .fromCase(
+                                TIMESTAMP(3),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.parse("2021-09-24T12:34:56.123")),
+                                VARIANT_BUILDER.of(LocalDateTime.parse("2021-09-24T12:34:56.123")))
+                        .fromCase(
+                                TIMESTAMP(6),
+                                TIMESTAMP,
+                                VARIANT_BUILDER.of(
+                                        LocalDateTime.parse("2021-09-24T12:34:56.123456")))
+                        // micros before the epoch are negative, 1969-12-31T23:59:59.999999 is -1
+                        .fromCase(
+                                TIMESTAMP(6),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.parse("1969-12-31T23:59:59.999999")),
+                                VARIANT_BUILDER.of(
+                                        LocalDateTime.parse("1969-12-31T23:59:59.999999")))
+                        .fromCase(
+                                TIMESTAMP_LTZ(6),
+                                TimestampData.fromInstant(
+                                        Instant.parse("1969-12-31T23:59:59.999999Z")),
+                                VARIANT_BUILDER.of(Instant.parse("1969-12-31T23:59:59.999999Z")))
+                        // a microsecond precision holds any year, so a late date still casts
+                        .fromCase(
+                                TIMESTAMP(6),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.parse("3000-01-01T00:00")),
+                                VARIANT_BUILDER.of(LocalDateTime.parse("3000-01-01T00:00")))
+                        // a precision above 6 is stored with nanoseconds, even for a value that has
+                        // no digits below a microsecond
+                        .fromCase(
+                                TIMESTAMP(9),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.parse("2021-09-24T12:34:56.123456789")),
+                                VARIANT_BUILDER.of(
+                                        LocalDateTime.parse("2021-09-24T12:34:56.123456789")))
+                        .fromCase(
+                                TIMESTAMP(9),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.parse("2021-09-24T12:34:56.123456")),
+                                timestampNanosVariant(
+                                        LocalDateTime.parse("2021-09-24T12:34:56.123456")))
+                        .fromCase(
+                                TIMESTAMP_LTZ(3),
+                                TimestampData.fromInstant(
+                                        Instant.parse("2022-01-04T12:34:56.123Z")),
+                                VARIANT_BUILDER.of(Instant.parse("2022-01-04T12:34:56.123Z")))
+                        .fromCase(
+                                TIMESTAMP_LTZ(9),
+                                TIMESTAMP_LTZ,
+                                VARIANT_BUILDER.of(TIMESTAMP_LTZ.toInstant()))
+                        .fromCase(
+                                TIMESTAMP_LTZ(9),
+                                TimestampData.fromInstant(Instant.parse("2022-01-04T12:34:56Z")),
+                                timestampLtzNanosVariant(Instant.parse("2022-01-04T12:34:56Z")))
+                        // nanoseconds only cover 1677-09-21 to 2262-04-11
+                        .fail(
+                                TIMESTAMP(9),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.parse("3000-01-01T00:00")),
+                                TableRuntimeException.class,
+                                "1677-09-21 to 2262-04-11")
+                        .fail(
+                                TIMESTAMP_LTZ(7),
+                                TimestampData.fromInstant(Instant.parse("1500-01-01T00:00:00Z")),
+                                TableRuntimeException.class,
+                                "1677-09-21 to 2262-04-11")
+                        // a TIME holds the milliseconds of one day
+                        .fail(
+                                TIME(),
+                                -1,
+                                TableRuntimeException.class,
+                                "A TIME holds the milliseconds of one day")
+                        .fromCase(UUID(), UUID_BYTES, VARIANT_BUILDER.of(UUID_VALUE))
+                        // a DISTINCT type is stored like its source type
+                        .fromCase(MY_DISTINCT_INT, 42, VARIANT_BUILDER.of(42))
+                        // a SQL NULL stays a SQL NULL rather than becoming a variant null
+                        .fromCase(INT(), null, null)
+                        .fromCase(STRING(), null, null),
+                // a constructed type casts element by element, and a NULL element stays SQL NULL.
+                // A constructed element becomes one VARIANT, like a cast of the element alone.
+                CastTestSpecBuilder.testCastTo(ARRAY(VARIANT()))
+                        .fromCase(
+                                ARRAY(INT()),
+                                new GenericArrayData(new Integer[] {1, null}),
+                                new GenericArrayData(new Object[] {VARIANT_BUILDER.of(1), null}))
+                        .fromCase(
+                                ARRAY(ROW(FIELD("id", BIGINT()), FIELD("name", STRING()))),
+                                new GenericArrayData(
+                                        new Object[] {
+                                            GenericRowData.of(7L, fromString("ada")), null
+                                        }),
+                                new GenericArrayData(
+                                        new Object[] {
+                                            VARIANT_BUILDER
+                                                    .object()
+                                                    .add("id", VARIANT_BUILDER.of(7L))
+                                                    .add("name", VARIANT_BUILDER.of("ada"))
+                                                    .build(),
+                                            null
+                                        })),
+                CastTestSpecBuilder.testCastTo(ROW(FIELD("a", VARIANT()), FIELD("b", VARIANT())))
+                        .fromCase(
+                                ROW(FIELD("a", INT()), FIELD("b", STRING())),
+                                GenericRowData.of(7, null),
+                                GenericRowData.of(VARIANT_BUILDER.of(7), null))
+                        .fromCase(
+                                ROW(
+                                        FIELD("a", ROW(FIELD("id", BIGINT()))),
+                                        FIELD("b", ARRAY(INT()))),
+                                GenericRowData.of(
+                                        GenericRowData.of(7L), new GenericArrayData(new int[] {1})),
+                                GenericRowData.of(
+                                        VARIANT_BUILDER
+                                                .object()
+                                                .add("id", VARIANT_BUILDER.of(7L))
+                                                .build(),
+                                        VARIANT_BUILDER
+                                                .array()
+                                                .add(VARIANT_BUILDER.of(1))
+                                                .build())),
+                CastTestSpecBuilder.testCastTo(MAP(STRING(), VARIANT()))
+                        .fromCase(
+                                MAP(STRING(), INT()),
+                                mapData(entry(fromString("a"), 1)),
+                                mapData(entry(fromString("a"), VARIANT_BUILDER.of(1))))
+                        .fromCase(
+                                MAP(STRING(), ROW(FIELD("id", BIGINT()))),
+                                mapData(entry(fromString("a"), GenericRowData.of(7L))),
+                                mapData(
+                                        entry(
+                                                fromString("a"),
+                                                VARIANT_BUILDER
+                                                        .object()
+                                                        .add("id", VARIANT_BUILDER.of(7L))
+                                                        .build()))),
+                CastTestSpecBuilder.testCastTo(MAP(VARIANT(), STRING()))
+                        .fromCase(
+                                MAP(INT(), STRING()),
+                                mapData(entry(1, fromString("a"))),
+                                mapData(entry(VARIANT_BUILDER.of(1), fromString("a")))),
+                CastTestSpecBuilder.testCastTo(MULTISET(VARIANT()))
+                        .fromCase(
+                                MULTISET(INT()),
+                                mapData(entry(1, 2)),
+                                mapData(entry(VARIANT_BUILDER.of(1), 2))),
+                // a whole constructed value becomes one VARIANT, and a NULL element or field
+                // becomes a variant null
+                CastTestSpecBuilder.testCastTo(VARIANT())
+                        .fromCase(
+                                ARRAY(INT()),
+                                new GenericArrayData(new Integer[] {1, null}),
+                                VARIANT_BUILDER
+                                        .array()
+                                        .add(VARIANT_BUILDER.of(1))
+                                        .add(VARIANT_BUILDER.ofNull())
+                                        .build())
+                        .fromCase(
+                                MAP(STRING(), INT()),
+                                mapData(entry(fromString("a"), 1)),
+                                VARIANT_BUILDER.object().add("a", VARIANT_BUILDER.of(1)).build())
+                        .fromCase(
+                                ROW(FIELD("id", BIGINT()), FIELD("tags", ARRAY(STRING()))),
+                                GenericRowData.of(
+                                        7L, new GenericArrayData(new Object[] {fromString("x")})),
+                                VARIANT_BUILDER
+                                        .object()
+                                        .add("id", VARIANT_BUILDER.of(7L))
+                                        .add(
+                                                "tags",
+                                                VARIANT_BUILDER
+                                                        .array()
+                                                        .add(VARIANT_BUILDER.of("x"))
+                                                        .build())
+                                        .build())
+                        .fromCase(
+                                ROW(FIELD("v", VARIANT())),
+                                GenericRowData.of(VARIANT_BUILDER.ofNull()),
+                                VARIANT_BUILDER.object().add("v", VARIANT_BUILDER.ofNull()).build())
+                        .fail(
+                                MAP(STRING(), INT()),
+                                mapData(entry(null, 1)),
+                                TableRuntimeException.class,
+                                "A VARIANT object key cannot be NULL."),
+                CastTestSpecBuilder.testCastTo(BOOLEAN())
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(true), true)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(false), false)
+                        .fail(VARIANT(), VARIANT_BUILDER.of(1), TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(TINYINT())
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of((byte) 42), (byte) 42)
+                        // a wider integer kind narrows while the value is in range
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(42), (byte) 42)
+                        // out of range is rejected instead of wrapping
+                        .fail(VARIANT(), VARIANT_BUILDER.of(1000), TableRuntimeException.class)
+                        .fail(VARIANT(), VARIANT_BUILDER.of("x"), TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(SMALLINT())
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of((short) 42), (short) 42)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of((byte) 42), (short) 42)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(1000), (short) 1000)
+                        .fail(VARIANT(), VARIANT_BUILDER.of(40000), TableRuntimeException.class)
+                        .fail(VARIANT(), VARIANT_BUILDER.of(true), TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(INT())
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(42), 42)
+                        // every integer kind converts as long as the value fits
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of((byte) 42), 42)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of((short) 42), 42)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(42L), 42)
+                        .fail(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(2147483648L),
+                                TableRuntimeException.class)
+                        // an approximate or decimal kind converts when the value is integral
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(7.0d), 7)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(new BigDecimal("7.0")), 7)
+                        // a fractional value would have to be rounded away, so it is rejected
+                        .fail(VARIANT(), VARIANT_BUILDER.of(7.2d), TableRuntimeException.class)
+                        .fail(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(new BigDecimal("7.2")),
+                                TableRuntimeException.class)
+                        // a non-numeric variant cannot be cast to a number
+                        .fail(VARIANT(), VARIANT_BUILDER.of("foo"), TableRuntimeException.class)
+                        .fail(VARIANT(), VARIANT_BUILDER.of(true), TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(BIGINT())
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(42L), 42L)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(42), 42L)
+                        .fail(VARIANT(), VARIANT_BUILDER.of("x"), TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(FLOAT())
+                        // every numeric kind reaches an approximate target
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(1.5f), 1.5f)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(1.5d), 1.5f)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(3), 3.0f)
+                        .fromCase(
+                                VARIANT(), VARIANT_BUILDER.of(new BigDecimal("123.456")), 123.456f)
+                        // a magnitude a FLOAT cannot represent is still rejected
+                        .fail(VARIANT(), VARIANT_BUILDER.of(1e40d), TableRuntimeException.class)
+                        // a stored NaN or infinity is not an overflow and is kept
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(Double.NaN), Float.NaN)
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(Double.POSITIVE_INFINITY),
+                                Float.POSITIVE_INFINITY)
+                        .fail(VARIANT(), VARIANT_BUILDER.of("x"), TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(DOUBLE())
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(1.5d), 1.5d)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(1.5f), 1.5d)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(3), 3.0d)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(Double.NaN), Double.NaN)
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(Float.NEGATIVE_INFINITY),
+                                Double.NEGATIVE_INFINITY)
+                        .fromCase(
+                                VARIANT(), VARIANT_BUILDER.of(new BigDecimal("123.456")), 123.456d)
+                        .fail(VARIANT(), VARIANT_BUILDER.of("x"), TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(DECIMAL(5, 2))
+                        .fromCase(VARIANT(), null, null)
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(new BigDecimal("123.45")),
+                                DecimalData.fromBigDecimal(new BigDecimal("123.45"), 5, 2))
+                        // trailing zeros may be appended to reach the target scale
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(new BigDecimal("123.4")),
+                                DecimalData.fromBigDecimal(new BigDecimal("123.40"), 5, 2))
+                        // an integer is exact, so it converts when it fits
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(42),
+                                DecimalData.fromBigDecimal(new BigDecimal("42.00"), 5, 2))
+                        // a scale that would have to round is rejected
+                        .fail(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(new BigDecimal("123.456")),
+                                TableRuntimeException.class)
+                        // an approximate kind is not read as a decimal
+                        .fail(VARIANT(), VARIANT_BUILDER.of(1.5d), TableRuntimeException.class)
+                        .fail(VARIANT(), VARIANT_BUILDER.of("x"), TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(BYTES())
+                        .fromCase(VARIANT(), null, null)
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(new byte[] {1, 2, 3}),
+                                new byte[] {1, 2, 3})
+                        // the raw bytes stay reachable when the character string cast rejects
+                        // them, which is what makes this the way to inspect such a value
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of(INVALID_UTF8), INVALID_UTF8)
+                        .fromCase(VARIANT(), VARIANT_BUILDER.of("ab"), new byte[] {'a', 'b'})
+                        .fail(VARIANT(), VARIANT_BUILDER.of(true), TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(UUID())
+                        .fromCase(VARIANT(), null, null)
+                        .fromCase(VARIANT(), Variant.newBuilder().of(UUID_VALUE), UUID_BYTES)
+                        .fail(VARIANT(), VARIANT_BUILDER.of("foo"), TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(DATE())
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(LocalDate.of(2020, 1, 1)),
+                                (int) LocalDate.of(2020, 1, 1).toEpochDay())
+                        // a timestamp keeps its date, in the session time zone for a TIMESTAMP_LTZ
+                        .fromCase(
+                                VARIANT(),
+                                CET_CONTEXT,
+                                VARIANT_BUILDER.of(Instant.parse("2020-01-01T23:30:00Z")),
+                                (int) LocalDate.of(2020, 1, 2).toEpochDay())
+                        // before 1970 and the 1582 calendar switch, the timestamp keeps its day
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(LocalDateTime.of(1582, 10, 4, 23, 0)),
+                                (int) LocalDate.of(1582, 10, 4).toEpochDay())
+                        .fail(VARIANT(), Variant.newBuilder().of(1), TableRuntimeException.class)
+                        // a TIME has no date
+                        .fail(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(LocalTime.of(12, 0)),
+                                TableRuntimeException.class,
+                                "Cannot cast a VARIANT TIME value to DATE."),
+                // A variant keeps microseconds for TIME, so fractional seconds beyond the target
+                // precision are truncated, matching a regular cast into a narrower TIME.
+                CastTestSpecBuilder.testCastTo(TIME(3))
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder()
+                                        .of(LocalTime.of(12, 0, 0).plus(Duration.ofMillis(123))),
+                                DateTimeUtils.toInternal(
+                                        LocalTime.of(12, 0, 0).plus(Duration.ofMillis(123))))
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder().of(LocalTime.of(12, 0, 0, 123_456_000)),
+                                DateTimeUtils.toInternal(LocalTime.of(12, 0, 0, 123_000_000)))
+                        // a timestamp keeps its time of day, in the session time zone for a
+                        // TIMESTAMP_LTZ only
+                        .fromCase(
+                                VARIANT(),
+                                CET_CONTEXT,
+                                VARIANT_BUILDER.of(LocalDateTime.of(2020, 1, 1, 23, 30)),
+                                DateTimeUtils.toInternal(LocalTime.of(23, 30)))
+                        .fromCase(
+                                VARIANT(),
+                                CET_CONTEXT,
+                                VARIANT_BUILDER.of(Instant.parse("2020-01-01T23:30:00.123456Z")),
+                                DateTimeUtils.toInternal(LocalTime.of(0, 30, 0, 123_000_000)))
+                        .fail(VARIANT(), Variant.newBuilder().of(1), TableRuntimeException.class),
+                // TIME has no runtime representation finer than milliseconds, so a target
+                // precision above 3 truncates no further than TIME(3) already does.
+                CastTestSpecBuilder.testCastTo(TIME(6))
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder().of(LocalTime.of(12, 0, 0, 123_456_789)),
+                                DateTimeUtils.toInternal(LocalTime.of(12, 0, 0, 123_000_000))),
+                CastTestSpecBuilder.testCastTo(TIMESTAMP())
+                        .fromCase(VARIANT(), null, null)
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(LocalDateTime.of(2020, 1, 1, 12, 0, 0)),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0)))
+                        // the default precision keeps microseconds, truncating the nanoseconds
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder()
+                                        .of(LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123456789)),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123456000)))
+                        // a TIMESTAMP_LTZ is shifted into the session time zone
+                        .fromCase(
+                                VARIANT(),
+                                CET_CONTEXT,
+                                VARIANT_BUILDER.of(Instant.parse("2020-01-01T23:30:00Z")),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2020, 1, 2, 0, 30)))
+                        .fail(VARIANT(), Variant.newBuilder().of(1), TableRuntimeException.class)
+                        // a TIME has no date
+                        .fail(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(LocalTime.of(12, 0)),
+                                TableRuntimeException.class,
+                                "Cannot cast a VARIANT TIME value to TIMESTAMP(6)."),
+                // A variant keeps microseconds, so fractional seconds beyond the target precision
+                // are truncated, matching a regular cast into a narrower TIMESTAMP.
+                CastTestSpecBuilder.testCastTo(TIMESTAMP(3))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(LocalDateTime.of(2020, 1, 1, 12, 0, 0)),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0)))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123000000)),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123000000)))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123456000)),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123000000))),
+                CastTestSpecBuilder.testCastTo(TIMESTAMP(0))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123000000)),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0)))
+                        // before 1970, truncating still moves toward the past
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(
+                                        LocalDateTime.of(1969, 12, 31, 23, 59, 58, 500_000_000)),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(1969, 12, 31, 23, 59, 58))),
+                // A fraction with leading zeros (.000123456) is still truncated to the precision.
+                CastTestSpecBuilder.testCastTo(TIMESTAMP(6))
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder()
+                                        .of(LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123_456)),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123_000))),
+                // The cast accepts either storage kind: TIMESTAMP_NS for a value that needs
+                // nanosecond precision, plain TIMESTAMP when microseconds already hold it exactly.
+                CastTestSpecBuilder.testCastTo(TIMESTAMP(9))
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder()
+                                        .of(LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123456789)),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123456789)))
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder()
+                                        .of(LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123456000)),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123456000)))
+                        // a TIMESTAMP_LTZ_NS keeps its nanoseconds
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder()
+                                        .of(Instant.parse("2020-01-01T12:00:00.123456789Z")),
+                                TimestampData.fromLocalDateTime(
+                                        LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123456789))),
+                CastTestSpecBuilder.testCastTo(TIMESTAMP_LTZ())
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(Instant.ofEpochSecond(1_600_000_000L)),
+                                TimestampData.fromInstant(Instant.ofEpochSecond(1_600_000_000L)))
+                        // a TIMESTAMP is read as a wall-clock time in the session time zone
+                        .fromCase(
+                                VARIANT(),
+                                CET_CONTEXT,
+                                VARIANT_BUILDER.of(LocalDateTime.of(2020, 1, 1, 12, 0, 0)),
+                                TimestampData.fromInstant(Instant.parse("2020-01-01T11:00:00Z")))
+                        .fail(VARIANT(), VARIANT_BUILDER.of(1), TableRuntimeException.class)
+                        // a DATE has no time of day
+                        .fail(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(LocalDate.of(2020, 1, 1)),
+                                TableRuntimeException.class,
+                                "Cannot cast a VARIANT DATE value to TIMESTAMP_LTZ(6)."),
+                CastTestSpecBuilder.testCastTo(TIMESTAMP_LTZ(3))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(
+                                        Instant.ofEpochSecond(1_600_000_000L, 123456000)),
+                                TimestampData.fromInstant(
+                                        Instant.ofEpochSecond(1_600_000_000L, 123000000))),
+                // The cast accepts either storage kind: TIMESTAMP_LTZ_NS for a value that needs
+                // nanosecond precision, plain TIMESTAMP_LTZ when microseconds already hold it
+                // exactly.
+                CastTestSpecBuilder.testCastTo(TIMESTAMP_LTZ(9))
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder()
+                                        .of(Instant.ofEpochSecond(1_600_000_000L, 123456789)),
+                                TimestampData.fromInstant(
+                                        Instant.ofEpochSecond(1_600_000_000L, 123456789)))
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder()
+                                        .of(Instant.ofEpochSecond(1_600_000_000L, 123456000)),
+                                TimestampData.fromInstant(
+                                        Instant.ofEpochSecond(1_600_000_000L, 123456000)))
+                        // a TIMESTAMP_NS keeps its nanoseconds
+                        .fromCase(
+                                VARIANT(),
+                                Variant.newBuilder()
+                                        .of(LocalDateTime.of(2020, 1, 1, 12, 0, 0, 123456789)),
+                                TimestampData.fromInstant(
+                                        Instant.parse("2020-01-01T12:00:00.123456789Z"))),
+                // A binary target pads a shorter value and truncates a longer one, matching a
+                // regular cast into the same type.
+                CastTestSpecBuilder.testCastTo(BINARY(4))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(new byte[] {1, 2, 3, 4}),
+                                new byte[] {1, 2, 3, 4})
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(new byte[] {1, 2}),
+                                new byte[] {1, 2, 0, 0})
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(new byte[] {1, 2, 3, 4, 5, 6}),
+                                new byte[] {1, 2, 3, 4}),
+                CastTestSpecBuilder.testCastTo(VARBINARY(4))
+                        // a variable width target is trimmed but never padded
+                        .fromCase(
+                                VARIANT(), VARIANT_BUILDER.of(new byte[] {1, 2}), new byte[] {1, 2})
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER.of(new byte[] {1, 2, 3, 4, 5, 6}),
+                                new byte[] {1, 2, 3, 4}),
+                // From VARIANT to a constructed target. A constructed cast is the scalar cast
+                // applied to every leaf plus a shape check at each level.
+                CastTestSpecBuilder.testCastTo(ARRAY(INT()))
+                        .fromCase(VARIANT(), null, null)
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_INT_ARRAY,
+                                new GenericArrayData(new Integer[] {1, 2, 3}))
+                        // a VARIANT null element maps to SQL NULL for a nullable element type
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_INT_ARRAY_WITH_NULL,
+                                new GenericArrayData(new Integer[] {1, null, 3}))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_EMPTY_ARRAY,
+                                new GenericArrayData(new Integer[] {}))
+                        // a stored string is never parsed into an integer
+                        .fail(VARIANT(), VARIANT_STRING_ARRAY, TableRuntimeException.class)
+                        // a heterogeneous array fails on an element that is not an integer
+                        .fail(VARIANT(), VARIANT_MIXED_ARRAY, TableRuntimeException.class)
+                        // an object or a scalar is not an array
+                        .fail(VARIANT(), VARIANT_OBJECT, TableRuntimeException.class)
+                        .fail(VARIANT(), VARIANT_BUILDER.of(1), TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(ARRAY(INT().notNull()))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_INT_ARRAY,
+                                new GenericArrayData(new int[] {1, 2, 3}))
+                        // a VARIANT null element fails a NOT NULL element type
+                        .fail(VARIANT(), VARIANT_INT_ARRAY_WITH_NULL, TableRuntimeException.class),
+                CastTestSpecBuilder.testCastTo(ARRAY(BYTES()))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_BUILDER
+                                        .array()
+                                        .add(VARIANT_BUILDER.of(new byte[] {1}))
+                                        .add(VARIANT_BUILDER.of(new byte[] {2, 3}))
+                                        .add(VARIANT_BUILDER.ofNull())
+                                        .build(),
+                                new GenericArrayData(new byte[][] {{1}, {2, 3}, null})),
+                CastTestSpecBuilder.testCastTo(ARRAY(STRING()))
+                        // each element renders to string like the scalar cast
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_INT_ARRAY,
+                                new GenericArrayData(
+                                        new Object[] {
+                                            fromString("1"), fromString("2"), fromString("3")
+                                        }))
+                        // a heterogeneous array renders every element to string
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_MIXED_ARRAY,
+                                new GenericArrayData(
+                                        new Object[] {
+                                            fromString("1"),
+                                            fromString("a"),
+                                            fromString("2"),
+                                            fromString("b")
+                                        }))
+                        // stored strings of different lengths render unchanged
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_STRING_ARRAY,
+                                new GenericArrayData(
+                                        new Object[] {
+                                            fromString("1"), fromString("22"), fromString("333")
+                                        })),
+                CastTestSpecBuilder.testCastTo(ARRAY(DOUBLE()))
+                        // an approximate leaf takes any numeric kind
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_INT_ARRAY,
+                                new GenericArrayData(new Double[] {1.0, 2.0, 3.0})),
+                // the recursion composes: an array of arrays with no special case
+                CastTestSpecBuilder.testCastTo(ARRAY(ARRAY(INT())))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_NESTED_ARRAY,
+                                new GenericArrayData(
+                                        new GenericArrayData[] {
+                                            new GenericArrayData(new Integer[] {1, 2}),
+                                            new GenericArrayData(new Integer[] {3})
+                                        })),
+                // an ARRAY<VARIANT> leaf is the identity cast, keeping each element as a variant
+                CastTestSpecBuilder.testCastTo(ARRAY(VARIANT()))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_INT_ARRAY,
+                                new GenericArrayData(
+                                        new Variant[] {
+                                            VARIANT_INT_ARRAY.getElement(0),
+                                            VARIANT_INT_ARRAY.getElement(1),
+                                            VARIANT_INT_ARRAY.getElement(2)
+                                        }))
+                        // the identity cast keeps a VARIANT null element as a variant null, not a
+                        // SQL NULL
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_INT_ARRAY_WITH_NULL,
+                                new GenericArrayData(
+                                        new Variant[] {
+                                            VARIANT_INT_ARRAY_WITH_NULL.getElement(0),
+                                            VARIANT_INT_ARRAY_WITH_NULL.getElement(1),
+                                            VARIANT_INT_ARRAY_WITH_NULL.getElement(2)
+                                        })),
+                CastTestSpecBuilder.testCastTo(ROW(FIELD("id", INT()), FIELD("name", STRING())))
+                        .fromCase(VARIANT(), null, null)
+                        .fromCase(
+                                VARIANT(), VARIANT_RECORD, GenericRowData.of(7, fromString("ada")))
+                        // an array or a scalar is not an object
+                        .fail(
+                                VARIANT(),
+                                VARIANT_INT_ARRAY,
+                                TableRuntimeException.class,
+                                "requires an object"),
+                // field order of the target is free, since matching is by name
+                CastTestSpecBuilder.testCastTo(ROW(FIELD("name", STRING()), FIELD("id", INT())))
+                        .fromCase(
+                                VARIANT(), VARIANT_RECORD, GenericRowData.of(fromString("ada"), 7)),
+                // a field absent from the object fails the cast, nullable or not
+                CastTestSpecBuilder.testCastTo(ROW(FIELD("id", INT()), FIELD("email", STRING())))
+                        .fail(
+                                VARIANT(),
+                                VARIANT_RECORD,
+                                TableRuntimeException.class,
+                                "is not present in the VARIANT"),
+                CastTestSpecBuilder.testCastTo(
+                                ROW(FIELD("id", INT()), FIELD("email", STRING().notNull())))
+                        .fail(
+                                VARIANT(),
+                                VARIANT_RECORD,
+                                TableRuntimeException.class,
+                                "is not present in the VARIANT"),
+                // a field present but set to a VARIANT null maps to NULL when nullable
+                CastTestSpecBuilder.testCastTo(ROW(FIELD("id", INT()), FIELD("email", STRING())))
+                        .fromCase(VARIANT(), VARIANT_RECORD_WITH_NULL, GenericRowData.of(7, null)),
+                // and fails when the field is NOT NULL
+                CastTestSpecBuilder.testCastTo(
+                                ROW(FIELD("id", INT()), FIELD("email", STRING().notNull())))
+                        .fail(
+                                VARIANT(),
+                                VARIANT_RECORD_WITH_NULL,
+                                TableRuntimeException.class,
+                                "does not accept NULL"),
+                // extra object fields are dropped, so the row is a projection
+                CastTestSpecBuilder.testCastTo(ROW(FIELD("id", INT())))
+                        .fromCase(VARIANT(), VARIANT_RECORD, GenericRowData.of(7)),
+                // a ROW<VARIANT> field is the identity: each field is kept as a variant, one level
+                // shredded
+                CastTestSpecBuilder.testCastTo(
+                                ROW(FIELD("id", VARIANT()), FIELD("name", VARIANT())))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_RECORD,
+                                GenericRowData.of(
+                                        rowFieldVariant(VARIANT_RECORD.getField("id")),
+                                        rowFieldVariant(VARIANT_RECORD.getField("name")))),
+                // a VARIANT target field keeps a variant null as a variant null, not SQL NULL
+                CastTestSpecBuilder.testCastTo(
+                                ROW(FIELD("id", VARIANT()), FIELD("email", VARIANT())))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_RECORD_WITH_NULL,
+                                GenericRowData.of(
+                                        rowFieldVariant(VARIANT_RECORD_WITH_NULL.getField("id")),
+                                        rowFieldVariant(
+                                                VARIANT_RECORD_WITH_NULL.getField("email")))),
+                // a typed field beside a VARIANT field keeps the variant null only on the VARIANT
+                // side
+                CastTestSpecBuilder.testCastTo(ROW(FIELD("id", INT()), FIELD("email", VARIANT())))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_RECORD_WITH_NULL,
+                                GenericRowData.of(
+                                        7,
+                                        rowFieldVariant(
+                                                VARIANT_RECORD_WITH_NULL.getField("email")))),
+                // a ROW without declared field names uses the default names f0, f1, ...; matching
+                // is
+                // still by name, not by position
+                CastTestSpecBuilder.testCastTo(ROW(INT(), STRING()))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_POSITIONAL_RECORD,
+                                GenericRowData.of(7, fromString("ada")))
+                        // an object without the default names fails, position is never used
+                        .fail(
+                                VARIANT(),
+                                VARIANT_RECORD,
+                                TableRuntimeException.class,
+                                "is not present in the VARIANT"),
+                // a STRUCTURED target is served by the same rule, matching attributes to object
+                // fields by name
+                CastTestSpecBuilder.testCastTo(MY_STRUCTURED_TYPE)
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_STRUCT_RECORD,
+                                GenericRowData.of(
+                                        1L,
+                                        2L,
+                                        fromString("x"),
+                                        new GenericArrayData(
+                                                new Object[] {fromString("p"), fromString("q")}))),
+                // the recursion composes: a row of a row and an array with no special case
+                CastTestSpecBuilder.testCastTo(
+                                ROW(
+                                        FIELD(
+                                                "user",
+                                                ROW(FIELD("id", INT()), FIELD("since", STRING()))),
+                                        FIELD("tags", ARRAY(STRING()))))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_NESTED,
+                                GenericRowData.of(
+                                        GenericRowData.of(1, fromString("2020-01-01")),
+                                        new GenericArrayData(
+                                                new Object[] {fromString("x"), fromString("y")}))),
+                CastTestSpecBuilder.testCastTo(MAP(STRING(), STRING()))
+                        .fromCase(VARIANT(), null, null)
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_RECORD,
+                                mapData(
+                                        entry(fromString("id"), fromString("7")),
+                                        entry(fromString("name"), fromString("ada")),
+                                        entry(fromString("active"), fromString("TRUE"))))
+                        // an empty object casts to an empty map
+                        .fromCase(VARIANT(), VARIANT_EMPTY_OBJECT, mapData())
+                        // a value present but set to a variant null maps to SQL NULL when nullable
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_RECORD_WITH_NULL,
+                                mapData(
+                                        entry(fromString("id"), fromString("7")),
+                                        entry(fromString("email"), null)))
+                        // a mixed object renders every value to STRING
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_MIXED_OBJECT,
+                                mapData(
+                                        entry(fromString("a"), fromString("1")),
+                                        entry(fromString("b"), fromString("x"))))
+                        // an array is not an object
+                        .fail(
+                                VARIANT(),
+                                VARIANT_INT_ARRAY,
+                                TableRuntimeException.class,
+                                "requires an object"),
+                // a NOT NULL value type rejects a variant null value
+                CastTestSpecBuilder.testCastTo(MAP(STRING(), STRING().notNull()))
+                        .fail(
+                                VARIANT(),
+                                VARIANT_RECORD_WITH_NULL,
+                                TableRuntimeException.class,
+                                "NOT NULL map value type"),
+                // MAP<STRING, VARIANT> keeps each value a variant, one level shredded
+                CastTestSpecBuilder.testCastTo(MAP(STRING(), VARIANT()))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_NUM_OBJECT,
+                                mapData(
+                                        entry(fromString("a"), VARIANT_NUM_OBJECT.getField("a")),
+                                        entry(fromString("b"), VARIANT_NUM_OBJECT.getField("b"))))
+                        // a VARIANT value keeps a variant null as a variant null, not SQL NULL
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_RECORD_WITH_NULL,
+                                mapData(
+                                        entry(
+                                                fromString("id"),
+                                                VARIANT_RECORD_WITH_NULL.getField("id")),
+                                        entry(
+                                                fromString("email"),
+                                                VARIANT_RECORD_WITH_NULL.getField("email")))),
+                CastTestSpecBuilder.testCastTo(MAP(STRING(), INT()))
+                        .fromCase(
+                                VARIANT(),
+                                VARIANT_NUM_OBJECT,
+                                mapData(entry(fromString("a"), 1), entry(fromString("b"), 2)))
+                        // a value that is not an integer fails the cast
+                        .fail(
+                                VARIANT(),
+                                VARIANT_MIXED_OBJECT,
+                                TableRuntimeException.class,
+                                "does not change the type"));
+    }
+
+    @TestFactory
+    Stream<DynamicTest> castTests() {
+        return DynamicTest.stream(
+                testCases().flatMap(CastTestSpecBuilder::toSpecs),
+                CastTestSpec::toString,
+                CastTestSpec::run);
+    }
+
+    private static <K, V> Map.Entry<K, V> entry(K k, V v) {
+        return new AbstractMap.SimpleImmutableEntry<>(k, v);
+    }
+
+    @SafeVarargs
+    private static <K, V> MapData mapData(Map.Entry<K, V>... entries) {
+        if (entries == null) {
+            return new GenericMapData(Collections.emptyMap());
+        }
+        Map<K, V> map = new HashMap<>();
+        for (Map.Entry<K, V> entry : entries) {
+            map.put(entry.getKey(), entry.getValue());
+        }
+        return new GenericMapData(map);
+    }
+
+    public static class MyStructuredType {
+        public long a;
+        public Long b;
+        public String c;
+        public String[] d;
+
+        public MyStructuredType(long a, Long b, String c, String[] d) {
+            this.a = a;
+            this.b = b;
+            this.c = c;
+            this.d = d;
+        }
+
+        @Override
+        public String toString() {
+            return "My fancy string representation{"
+                    + "a="
+                    + a
+                    + ", b="
+                    + b
+                    + ", c='"
+                    + c
+                    + '\''
+                    + ", d="
+                    + Arrays.toString(d)
+                    + '}';
+        }
+    }
+
+    @SuppressWarnings({"rawtypes"})
+    private static class CastTestSpec {
+        private final DataType inputType;
+        private final DataType targetType;
+        private final Consumer<CastExecutor> assertionExecutor;
+        private final String description;
+        private final CastRule.Context castContext;
+
+        public CastTestSpec(
+                DataType inputType,
+                DataType targetType,
+                Consumer<CastExecutor> assertionExecutor,
+                String description,
+                CastRule.Context castContext) {
+            this.inputType = inputType;
+            this.targetType = targetType;
+            this.assertionExecutor = assertionExecutor;
+            this.description = description;
+            this.castContext = castContext;
+        }
+
+        public void run() throws Exception {
+            CastExecutor executor =
+                    CastRuleProvider.create(
+                            this.castContext,
+                            this.inputType.getLogicalType(),
+                            this.targetType.getLogicalType());
+            assertThat(executor)
+                    .as(
+                            "Cannot resolve an executor for input "
+                                    + this.inputType
+                                    + " and target "
+                                    + this.targetType)
+                    .isNotNull();
+
+            this.assertionExecutor.accept(executor);
+        }
+
+        @Override
+        public String toString() {
+            return inputType + " => " + targetType + " " + description;
+        }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static class CastTestSpecBuilder {
+        private DataType targetType;
+        private final List<DataType> inputTypes = new ArrayList<>();
+        private final List<Consumer<CastExecutor>> assertionExecutors = new ArrayList<>();
+        private final List<String> descriptions = new ArrayList<>();
+        private final List<CastRule.Context> castContexts = new ArrayList<>();
+
+        private static CastTestSpecBuilder testCastTo(DataType targetType) {
+            CastTestSpecBuilder tsb = new CastTestSpecBuilder();
+            tsb.targetType = targetType;
+            return tsb;
+        }
+
+        private CastTestSpecBuilder fromCase(DataType srcDataType, Object src, Object target) {
+            return fromCase(
+                    srcDataType,
+                    CastRule.Context.create(
+                            false,
+                            false,
+                            DateTimeUtils.UTC_ZONE.toZoneId(),
+                            Thread.currentThread().getContextClassLoader(),
+                            CTX),
+                    src,
+                    target);
+        }
+
+        private CastTestSpecBuilder fromCasePrinting(
+                DataType srcDataType, Object src, Object target) {
+            return fromCase(
+                    srcDataType,
+                    CastRule.Context.create(
+                            true,
+                            false,
+                            DateTimeUtils.UTC_ZONE.toZoneId(),
+                            Thread.currentThread().getContextClassLoader(),
+                            CTX),
+                    src,
+                    target);
+        }
+
+        private CastTestSpecBuilder fromCaseLegacy(
+                DataType srcDataType, Object src, Object target) {
+            return fromCase(
+                    srcDataType,
+                    CastRule.Context.create(
+                            false,
+                            true,
+                            DateTimeUtils.UTC_ZONE.toZoneId(),
+                            Thread.currentThread().getContextClassLoader(),
+                            CTX),
+                    src,
+                    target);
+        }
+
+        private CastTestSpecBuilder fromCaseLegacyBytesToString(
+                DataType srcDataType, Object src, Object target) {
+            return fromCase(
+                    srcDataType,
+                    CastRule.Context.create(
+                            false,
+                            false,
+                            DateTimeUtils.UTC_ZONE.toZoneId(),
+                            Thread.currentThread().getContextClassLoader(),
+                            CTX_LEGACY_BYTES_TO_STRING),
+                    src,
+                    target);
+        }
+
+        private CastTestSpecBuilder fromCase(
+                DataType srcDataType, CastRule.Context castContext, Object src, Object target) {
+            this.inputTypes.add(srcDataType);
+            this.assertionExecutors.add(
+                    executor -> {
+                        assertThatGenericDataOfType(executor.cast(src), targetType)
+                                .isEqualTo(target);
+                        assertThatGenericDataOfType(executor.cast(src), targetType)
+                                .as(
+                                        "Error when reusing the rule. Perhaps there is some state that needs to be reset")
+                                .isEqualTo(target);
+                    });
+            this.descriptions.add("{" + src + " => " + target + "}");
+            this.castContexts.add(castContext);
+            return this;
+        }
+
+        private CastTestSpecBuilder fail(
+                DataType dataType, Object src, Class<? extends Throwable> exception) {
+            return fail(dataType, src, exception, null);
+        }
+
+        private CastTestSpecBuilder fail(
+                DataType dataType,
+                Object src,
+                Class<? extends Throwable> exception,
+                String messageSubstring) {
+            return fail(
+                    dataType,
+                    CastRule.Context.create(
+                            false,
+                            false,
+                            DateTimeUtils.UTC_ZONE.toZoneId(),
+                            Thread.currentThread().getContextClassLoader(),
+                            CTX),
+                    src,
+                    exception,
+                    messageSubstring);
+        }
+
+        private CastTestSpecBuilder fail(
+                DataType dataType,
+                CastRule.Context castContext,
+                Object src,
+                Class<? extends Throwable> exception) {
+            return fail(dataType, castContext, src, exception, null);
+        }
+
+        private CastTestSpecBuilder fail(
+                DataType dataType,
+                CastRule.Context castContext,
+                Object src,
+                Class<? extends Throwable> exception,
+                String messageSubstring) {
+            this.inputTypes.add(dataType);
+            this.assertionExecutors.add(
+                    executor -> {
+                        final AbstractThrowableAssert<?, ?> thrown =
+                                assertThatThrownBy(() -> executor.cast(src))
+                                        .isInstanceOf(exception);
+                        if (messageSubstring != null) {
+                            thrown.hasStackTraceContaining(messageSubstring);
+                        }
+                    });
+            this.descriptions.add("{" + src + " => " + exception.getName() + "}");
+            this.castContexts.add(castContext);
+            return this;
+        }
+
+        private Stream<CastTestSpec> toSpecs() {
+            CastTestSpec[] testSpecs = new CastTestSpec[assertionExecutors.size()];
+            for (int i = 0; i < assertionExecutors.size(); i++) {
+                testSpecs[i] =
+                        new CastTestSpec(
+                                inputTypes.get(i),
+                                targetType,
+                                assertionExecutors.get(i),
+                                descriptions.get(i),
+                                castContexts.get(i));
+            }
+            return Arrays.stream(testSpecs);
+        }
+    }
+
+    private static TimestampData timestampDataFromLocalDateTime(
+            int years, int months, int days, int hours, int minutes, int seconds, int nanos) {
+        return TimestampData.fromLocalDateTime(
+                LocalDateTime.of(years, months, days, hours, minutes, seconds, nanos));
+    }
+
+    /** A nanosecond timestamp, which {@link VariantBuilder} only builds for sub-micro digits. */
+    private static Variant timestampNanosVariant(LocalDateTime value) {
+        final BinaryVariantInternalBuilder builder = new BinaryVariantInternalBuilder(false);
+        builder.appendTimestampNanos(
+                ChronoUnit.NANOS.between(Instant.EPOCH, value.toInstant(ZoneOffset.UTC)));
+        return builder.build();
+    }
+
+    private static Variant timestampLtzNanosVariant(Instant value) {
+        final BinaryVariantInternalBuilder builder = new BinaryVariantInternalBuilder(false);
+        builder.appendTimestampLtzNanos(ChronoUnit.NANOS.between(Instant.EPOCH, value));
+        return builder.build();
+    }
+
+    private static TimestampData timestampDataFromInstant(
+            int years, int months, int days, int hours, int minutes, int seconds, int nanos) {
+        return TimestampData.fromInstant(
+                LocalDateTime.of(years, months, days, hours, minutes, seconds, nanos)
+                        .atZone(CET)
+                        .toInstant());
+    }
+}

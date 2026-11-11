@@ -15,51 +15,113 @@
 #  See the License for the specific language governing permissions and
 # limitations under the License.
 ################################################################################
+import atexit
 import os
 import sys
 import tempfile
-import warnings
-from abc import ABCMeta, abstractmethod
-from typing import Union, List, Tuple, Iterable
+from typing import Union, List, Tuple, Iterable, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pandas
 
 from py4j.java_gateway import get_java_class, get_method
 
+from pyflink.common.configuration import Configuration
 from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.table.sources import TableSource
 
 from pyflink.common.typeinfo import TypeInformation
 from pyflink.datastream.data_stream import DataStream
 
-from pyflink.common import JobExecutionResult
-from pyflink.dataset import ExecutionEnvironment
 from pyflink.java_gateway import get_gateway
 from pyflink.serializers import BatchedSerializer, PickleSerializer
-from pyflink.table import Table, EnvironmentSettings, Module, Expression, ExplainDetail, TableSink
-from pyflink.table.catalog import Catalog
-from pyflink.table.descriptors import StreamTableDescriptor, BatchTableDescriptor, \
-    ConnectorDescriptor, ConnectTableDescriptor
+from pyflink.table import Table, EnvironmentSettings, Expression, ExplainDetail, \
+    Module, ModuleEntry, Schema, ChangelogMode
+from pyflink.table.catalog import Catalog, CatalogDescriptor
+from pyflink.table.model import Model
+from pyflink.table.model_descriptor import ModelDescriptor
+from pyflink.table.compiled_plan import CompiledPlan
+from pyflink.table.plan_reference import PlanReference
 from pyflink.table.serializers import ArrowSerializer
 from pyflink.table.statement_set import StatementSet
 from pyflink.table.table_config import TableConfig
+from pyflink.table.table_descriptor import TableDescriptor
 from pyflink.table.table_result import TableResult
-from pyflink.table.types import _to_java_type, _create_type_verifier, RowType, DataType, \
+from pyflink.table.types import _create_type_verifier, RowType, DataType, TimestampType, \
     _infer_schema_from_data, _create_converter, from_arrow_type, RowField, create_arrow_schema, \
-    _to_java_data_type
+    to_arrow_type, _to_java_data_type
 from pyflink.table.udf import UserDefinedFunctionWrapper, AggregateFunction, udaf, \
-    UserDefinedAggregateFunctionWrapper, udtaf, TableAggregateFunction
+    udtaf, TableAggregateFunction
 from pyflink.table.utils import to_expression_jarray
-from pyflink.util import utils
-from pyflink.util.utils import get_j_env_configuration, is_local_deployment, load_java_class, \
-    to_j_explain_detail_arr
+from pyflink.util.api_stability_decorators import PublicEvolving, Deprecated
+from pyflink.util.java_utils import get_j_env_configuration, is_local_deployment, load_java_class, \
+    to_j_explain_detail_arr, to_jarray, get_field
 
 __all__ = [
-    'BatchTableEnvironment',
     'StreamTableEnvironment',
     'TableEnvironment'
 ]
 
 
-class TableEnvironment(object, metaclass=ABCMeta):
+_TIMESTAMP_UNITS_PER_SECOND = {
+    's': 1,
+    'ms': 1_000,
+    'us': 1_000_000,
+    'ns': 1_000_000_000,
+}
+
+
+def _cast_arrow_timestamp(array, target_type):
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if isinstance(array, pa.ChunkedArray):
+        chunks = [
+            _cast_arrow_timestamp(chunk, target_type) for chunk in array.chunks
+        ]
+        return pa.chunked_array(chunks, type=target_type)
+    if array.type == target_type:
+        return array
+
+    source_units = _TIMESTAMP_UNITS_PER_SECOND[array.type.unit]
+    target_units = _TIMESTAMP_UNITS_PER_SECOND[target_type.unit]
+    values = array.view(pa.int64())
+    if source_units > target_units:
+        divisor = source_units // target_units
+        quotient = pc.divide_checked(values, divisor)
+        remainder = pc.subtract_checked(
+            values, pc.multiply_checked(quotient, divisor))
+        # Arrow integer division truncates toward zero. Timestamp precision reduction
+        # needs floor division to preserve the local date and time before the epoch.
+        values = pc.subtract_checked(
+            quotient,
+            pc.cast(pc.less(remainder, 0), pa.int64()),
+        )
+    elif source_units < target_units:
+        values = pc.multiply_checked(values, target_units // source_units)
+    return values.view(target_type)
+
+
+def _contains_timezone_aware_timestamp(arrow_type):
+    import pyarrow as pa
+
+    if pa.types.is_timestamp(arrow_type):
+        return arrow_type.tz is not None
+    if pa.types.is_struct(arrow_type):
+        return any(
+            _contains_timezone_aware_timestamp(field.type) for field in arrow_type
+        )
+    if pa.types.is_list(arrow_type):
+        return _contains_timezone_aware_timestamp(arrow_type.value_type)
+    if pa.types.is_map(arrow_type):
+        return (
+            _contains_timezone_aware_timestamp(arrow_type.key_type)
+            or _contains_timezone_aware_timestamp(arrow_type.item_type)
+        )
+    return False
+
+
+@PublicEvolving()
+class TableEnvironment(object):
     """
     A table environment is the base class, entry point, and central context for creating Table
     and SQL API programs.
@@ -93,40 +155,51 @@ class TableEnvironment(object, metaclass=ABCMeta):
 
     def __init__(self, j_tenv, serializer=PickleSerializer()):
         self._j_tenv = j_tenv
-        self._is_blink_planner = TableEnvironment._judge_blink_planner(j_tenv)
         self._serializer = serializer
         # When running in MiniCluster, launch the Python UDF worker using the Python executable
         # specified by sys.executable if users have not specified it explicitly via configuration
         # python.executable.
         self._set_python_executable_for_local_executor()
+        self._config_chaining_optimization()
+        self._open()
 
     @staticmethod
-    def _judge_blink_planner(j_tenv):
-        if "getPlanner" not in dir(j_tenv):
-            return False
-        else:
-            j_planner_class = j_tenv.getPlanner().getClass()
-            j_blink_planner_class = get_java_class(
-                get_gateway().jvm.org.apache.flink.table.planner.delegation.PlannerBase)
-            return j_blink_planner_class.isAssignableFrom(j_planner_class)
-
-    def from_table_source(self, table_source: 'TableSource') -> 'Table':
+    def create(environment_settings: Union[EnvironmentSettings, Configuration]) \
+            -> 'TableEnvironment':
         """
-        Creates a table from a table source.
+        Creates a table environment that is the entry point and central context for creating Table
+        and SQL API programs.
 
-        Example:
-        ::
-
-            >>> csv_table_source = CsvTableSource(
-            ...     csv_file_path, ['a', 'b'], [DataTypes.STRING(), DataTypes.BIGINT()])
-            >>> table_env.from_table_source(csv_table_source)
-
-        :param table_source: The table source used as table.
-        :return: The result table.
+        :param environment_settings: The configuration or environment settings used to instantiate
+            the :class:`~pyflink.table.TableEnvironment`, the name is for backward compatibility.
+        :return: The :class:`~pyflink.table.TableEnvironment`.
         """
-        warnings.warn("Deprecated in 1.11.", DeprecationWarning)
-        return Table(self._j_tenv.fromTableSource(table_source._j_table_source), self)
+        gateway = get_gateway()
+        if isinstance(environment_settings, Configuration):
+            environment_settings = EnvironmentSettings.new_instance() \
+                .with_configuration(environment_settings).build()
+        elif not isinstance(environment_settings, EnvironmentSettings):
+            raise TypeError("argument should be EnvironmentSettings or Configuration")
 
+        j_tenv = gateway.jvm.TableEnvironment.create(environment_settings._j_environment_settings)
+        return TableEnvironment(j_tenv)
+
+    def create_catalog(self, catalog_name: str, catalog_descriptor: CatalogDescriptor):
+        """
+        Creates a :class:`~pyflink.table.catalog.Catalog` using the provided
+        :class:`~pyflink.table.catalog.CatalogDescriptor`. All table registered in the
+        :class:`~pyflink.table.catalog.Catalog` can be accessed.
+
+         :param catalog_name: The name under which the catalog will be created.
+         :param catalog_descriptor: The catalog descriptor for creating catalog.
+        """
+        self._j_tenv.createCatalog(catalog_name, catalog_descriptor._j_catalog_descriptor)
+
+    @Deprecated(since="2.1.0", detail="""
+    Use :func:`create_catalog` instead. The new method uses a
+    :class:`~pyflink.table.catalog.CatalogDescriptor` to initialize the catalog instance and store
+    the :class:`~pyflink.table.catalog.CatalogDescriptor` in the catalog store.
+    """)
     def register_catalog(self, catalog_name: str, catalog: Catalog):
         """
         Registers a :class:`~pyflink.table.catalog.Catalog` under a unique name.
@@ -174,6 +247,18 @@ class TableEnvironment(object, metaclass=ABCMeta):
         .. versionadded:: 1.12.0
         """
         self._j_tenv.unloadModule(module_name)
+
+    def use_modules(self, *module_names: str):
+        """
+        Use an array of :class:`~pyflink.table.Module` with given names.
+        ValidationException is thrown when there is duplicate name or no module with the given name.
+
+        :param module_names: Names of the modules to be used.
+
+        .. versionadded:: 1.13.0
+        """
+        j_module_names = to_jarray(get_gateway().jvm.String, module_names)
+        self._j_tenv.useModules(j_module_names)
 
     def create_java_temporary_system_function(self, name: str, function_class_name: str):
         """
@@ -403,103 +488,68 @@ class TableEnvironment(object, metaclass=ABCMeta):
         """
         return self._j_tenv.dropTemporaryFunction(path)
 
-    def register_table(self, name: str, table: Table):
+    def create_temporary_table(self, path: str, descriptor: TableDescriptor,
+                               ignoreIfExists: Optional[bool] = False):
         """
-        Registers a :class:`~pyflink.table.Table` under a unique name in the TableEnvironment's
-        catalog. Registered tables can be referenced in SQL queries.
+        Registers the given :class:`~pyflink.table.TableDescriptor` as a temporary catalog table.
 
-        Example:
-        ::
+        The TableDescriptor is converted into a CatalogTable and stored in the catalog.
 
-            >>> tab = table_env.from_elements([(1, 'Hi'), (2, 'Hello')], ['a', 'b'])
-            >>> table_env.register_table("source", tab)
-
-        :param name: The name under which the table will be registered.
-        :param table: The table to register.
-
-        .. note:: Deprecated in 1.10. Use :func:`create_temporary_view` instead.
-        """
-        warnings.warn("Deprecated in 1.10. Use create_temporary_view instead.", DeprecationWarning)
-        self._j_tenv.registerTable(name, table._j_table)
-
-    def register_table_source(self, name: str, table_source: TableSource):
-        """
-        Registers an external :class:`~pyflink.table.TableSource` in this
-        :class:`~pyflink.table.TableEnvironment`'s catalog. Registered tables can be referenced in
-        SQL queries.
-
-        Example:
-        ::
-
-            >>> table_env.register_table_source("source",
-            ...                                 CsvTableSource("./1.csv",
-            ...                                                ["a", "b"],
-            ...                                                [DataTypes.INT(),
-            ...                                                 DataTypes.STRING()]))
-
-        :param name: The name under which the table source is registered.
-        :param table_source: The table source to register.
-
-        .. note:: Deprecated in 1.10. Use :func:`execute_sql` instead.
-        """
-        warnings.warn("Deprecated in 1.10. Use connect instead.", DeprecationWarning)
-        self._j_tenv.registerTableSourceInternal(name, table_source._j_table_source)
-
-    def register_table_sink(self, name: str, table_sink: TableSink):
-        """
-        Registers an external :class:`~pyflink.table.TableSink` with given field names and types in
-        this :class:`~pyflink.table.TableEnvironment`'s catalog. Registered sink tables can be
-        referenced in SQL DML statements.
-
-        Example:
-        ::
-
-            >>> table_env.register_table_sink("sink",
-            ...                               CsvTableSink(["a", "b"],
-            ...                                            [DataTypes.INT(),
-            ...                                             DataTypes.STRING()],
-            ...                                            "./2.csv"))
-
-        :param name: The name under which the table sink is registered.
-        :param table_sink: The table sink to register.
-
-        .. note:: Deprecated in 1.10. Use :func:`execute_sql` instead.
-        """
-        warnings.warn("Deprecated in 1.10. Use connect instead.", DeprecationWarning)
-        self._j_tenv.registerTableSinkInternal(name, table_sink._j_table_sink)
-
-    def scan(self, *table_path: str) -> Table:
-        """
-        Scans a registered table and returns the resulting :class:`~pyflink.table.Table`.
-        A table to scan must be registered in the TableEnvironment. It can be either directly
-        registered or be an external member of a :class:`~pyflink.table.catalog.Catalog`.
-
-        See the documentation of :func:`~pyflink.table.TableEnvironment.use_database` or
-        :func:`~pyflink.table.TableEnvironment.use_catalog` for the rules on the path resolution.
+        Temporary objects can shadow permanent ones. If a permanent object in a given path exists,
+        it will be inaccessible in the current session. To make the permanent object available again
+        one can drop the corresponding temporary object.
 
         Examples:
-
-        Scanning a directly registered table
         ::
 
-            >>> tab = table_env.scan("tableName")
+            >>> table_env.create_temporary_table("MyTable", TableDescriptor.for_connector("datagen")
+            ...     .schema(Schema.new_builder()
+            ...         .column("f0", DataTypes.STRING())
+            ...         .build())
+            ...     .option("rows-per-second", 10)
+            ...     .option("fields.f0.kind", "random")
+            ...     .build(),
+            ...  True)
 
-        Scanning a table from a registered catalog
-        ::
+        :param path: The path under which the table will be registered.
+        :param descriptor: Template for creating a CatalogTable instance.
+        :param ignoreIfExists: If a table exists under the given path and this flag is set,
+                               no operation is executed. An exception is thrown otherwise.
 
-            >>> tab = table_env.scan("catalogName", "dbName", "tableName")
-
-        :param table_path: The path of the table to scan.
-        :throws: Exception if no table is found using the given table path.
-        :return: The resulting table.
-
-        .. note:: Deprecated in 1.10. Use :func:`from_path` instead.
+        .. versionadded:: 1.14.0
         """
-        warnings.warn("Deprecated in 1.10. Use from_path instead.", DeprecationWarning)
-        gateway = get_gateway()
-        j_table_paths = utils.to_jarray(gateway.jvm.String, table_path)
-        j_table = self._j_tenv.scan(j_table_paths)
-        return Table(j_table, self)
+        self._j_tenv.createTemporaryTable(path, descriptor._j_table_descriptor, ignoreIfExists)
+
+    def create_table(self, path: str, descriptor: TableDescriptor,
+                     ignoreIfExists: Optional[bool] = False):
+        """
+        Registers the given :class:`~pyflink.table.TableDescriptor` as a catalog table.
+
+        The TableDescriptor is converted into a CatalogTable and stored in the catalog.
+
+        If the table should not be permanently stored in a catalog, use
+        :func:`create_temporary_table` instead.
+
+        Examples:
+        ::
+
+            >>> table_env.create_table("MyTable", TableDescriptor.for_connector("datagen")
+            ...     .schema(Schema.new_builder()
+            ...                   .column("f0", DataTypes.STRING())
+            ...                   .build())
+            ...     .option("rows-per-second", 10)
+            ...     .option("fields.f0.kind", "random")
+            ...     .build(),
+            ...  True)
+
+        :param path: The path under which the table will be registered.
+        :param descriptor: Template for creating a CatalogTable instance.
+        :param ignoreIfExists: If a table exists under the given path and this flag is set,
+                               no operation is executed. An exception is thrown otherwise.
+
+        .. versionadded:: 1.14.0
+        """
+        self._j_tenv.createTable(path, descriptor._j_table_descriptor, ignoreIfExists)
 
     def from_path(self, path: str) -> Table:
         """
@@ -537,33 +587,34 @@ class TableEnvironment(object, metaclass=ABCMeta):
         """
         return Table(get_method(self._j_tenv, "from")(path), self)
 
-    def insert_into(self, target_path: str, table: Table):
+    def from_descriptor(self, descriptor: TableDescriptor) -> Table:
         """
-        Instructs to write the content of a :class:`~pyflink.table.Table` API object into a table.
+        Returns a Table backed by the given TableDescriptor.
 
-        See the documentation of :func:`use_database` or :func:`use_catalog` for the rules on the
-        path resolution.
+        The TableDescriptor is registered as an inline (i.e. anonymous) temporary table
+        (see :func:`create_temporary_table`) using a unique identifier and then read. Note that
+        calling this method multiple times, even with the same descriptor, results in multiple
+        temporary tables. In such cases, it is recommended to register it under a name using
+        :func:`create_temporary_table` and reference it via :func:`from_path`
 
-        Example:
+        Examples:
         ::
 
-            >>> tab = table_env.scan("tableName")
-            >>> table_env.insert_into("sink", tab)
+            >>> table_env.from_descriptor(TableDescriptor.for_connector("datagen")
+            ...     .schema(Schema.new_builder()
+            ...         .column("f0", DataTypes.STRING())
+            ...         .build())
+            ...     .build()
 
-        :param target_path: The path of the registered :class:`~pyflink.table.TableSink` to which
-                            the :class:`~pyflink.table.Table` is written.
-        :param table: The Table to write to the sink.
+        Note that the returned Table is an API object and only contains a pipeline description.
+        It actually corresponds to a <i>view</i> in SQL terms. Call :func:`execute` in Table to
+        trigger an execution.
 
-        .. versionchanged:: 1.10.0
-            The signature is changed, e.g. the parameter *table_path_continued* was removed and
-            the parameter *target_path* is moved before the parameter *table*.
+        :return: The Table object describing the pipeline for further transformations.
 
-        .. note:: Deprecated in 1.11. Use :func:`execute_insert` for single sink,
-                  use :func:`create_statement_set` for multiple sinks.
+        .. versionadded:: 1.14.0
         """
-        warnings.warn("Deprecated in 1.11. Use Table#execute_insert for single sink,"
-                      "use create_statement_set for multiple sinks.", DeprecationWarning)
-        self._j_tenv.insertInto(target_path, table._j_table)
+        return Table(get_method(self._j_tenv, "from")(descriptor._j_table_descriptor), self)
 
     def list_catalogs(self) -> List[str]:
         """
@@ -576,7 +627,7 @@ class TableEnvironment(object, metaclass=ABCMeta):
 
     def list_modules(self) -> List[str]:
         """
-        Gets the names of all modules registered in this environment.
+        Gets the names of all modules used in this environment.
 
         :return: List of module names.
 
@@ -584,6 +635,17 @@ class TableEnvironment(object, metaclass=ABCMeta):
         """
         j_module_name_array = self._j_tenv.listModules()
         return [item for item in j_module_name_array]
+
+    def list_full_modules(self) -> List[ModuleEntry]:
+        """
+        Gets the names and statuses of all modules loaded in this environment.
+
+        :return: List of module names and use statuses.
+
+        .. versionadded:: 1.13.0
+        """
+        j_module_entry_array = self._j_tenv.listFullModules()
+        return [ModuleEntry(entry.name(), entry.used()) for entry in j_module_entry_array]
 
     def list_databases(self) -> List[str]:
         """
@@ -615,6 +677,33 @@ class TableEnvironment(object, metaclass=ABCMeta):
         """
         j_view_name_array = self._j_tenv.listViews()
         return [item for item in j_view_name_array]
+
+    def list_materialized_tables(self, catalog_name: Optional[str] = None,
+                                 database_name: Optional[str] = None) -> List[str]:
+        """
+        Gets the names of all materialized tables available in the given namespace (the given
+        database of the given catalog), or in the current namespace (the current database of
+        the current catalog) if neither is given.
+
+        :param catalog_name: The name of the catalog. Must be given together with
+                             ``database_name``.
+        :param database_name: The name of the database. Must be given together with
+                              ``catalog_name``.
+        :return: A list of the names of all registered materialized tables in the namespace.
+
+        .. versionadded:: 2.2.0
+
+        .. versionchanged:: 2.5.0
+           Added the ``catalog_name`` and ``database_name`` parameters.
+        """
+        if catalog_name is None and database_name is None:
+            j_materialized_table_name_array = self._j_tenv.listMaterializedTables()
+        elif catalog_name is None or database_name is None:
+            raise ValueError("catalog_name and database_name must be given together.")
+        else:
+            j_materialized_table_name_array = self._j_tenv.listMaterializedTables(
+                catalog_name, database_name)
+        return [item for item in j_materialized_table_name_array]
 
     def list_user_defined_functions(self) -> List[str]:
         """
@@ -664,6 +753,32 @@ class TableEnvironment(object, metaclass=ABCMeta):
         j_view_name_array = self._j_tenv.listTemporaryViews()
         return [item for item in j_view_name_array]
 
+    def list_models(self) -> List[str]:
+        """
+        Gets the names of all model available in the current namespace (the current
+        database of the current catalog).
+
+        :return: A list of the names of all registered models in the current database
+                 of the current catalog.
+
+        .. versionadded:: 2.1.0
+        """
+        j_model_name_array = self._j_tenv.listModels()
+        return [item for item in j_model_name_array]
+
+    def list_temporary_models(self) -> List[str]:
+        """
+        Gets the names of all temporary models available in the current namespace (the current
+        database of the current catalog).
+
+        :return: A list of the names of all registered temporary models in the current database
+                 of the current catalog.
+
+        .. versionadded:: 2.1.0
+        """
+        j_model_name_array = self._j_tenv.listTemporaryModels()
+        return [item for item in j_model_name_array]
+
     def drop_temporary_table(self, table_path: str) -> bool:
         """
         Drops a temporary table registered in the given path.
@@ -678,6 +793,22 @@ class TableEnvironment(object, metaclass=ABCMeta):
         """
         return self._j_tenv.dropTemporaryTable(table_path)
 
+    def drop_table(self, table_path: str, ignore_if_not_exists: Optional[bool] = True) -> bool:
+        """
+        Drops a table registered in the given path.
+
+        This method can only drop permanent objects. Temporary objects can shadow permanent ones.
+        If a temporary object exists in a given path,
+        make sure to drop the temporary object first using :func:`drop_temporary_table`.
+
+        :param table_path: The path of the registered table.
+        :param ignore_if_not_exists: Ignore if table does not exist.
+        :return: True if a table existed in the given path and was removed.
+
+        .. versionadded:: 2.0.0
+        """
+        return self._j_tenv.dropTable(table_path, ignore_if_not_exists)
+
     def drop_temporary_view(self, view_path: str) -> bool:
         """
         Drops a temporary view registered in the given path.
@@ -685,30 +816,58 @@ class TableEnvironment(object, metaclass=ABCMeta):
         If a permanent table or view with a given path exists, it will be used
         from now on for any queries that reference this path.
 
+        :param view_path: The path of the registered temporary view.
         :return: True if a view existed in the given path and was removed.
 
         .. versionadded:: 1.10.0
         """
         return self._j_tenv.dropTemporaryView(view_path)
 
-    def explain(self, table: Table = None, extended: bool = False) -> str:
+    def drop_view(self, view_path: str, ignore_if_not_exists: Optional[bool] = True) -> bool:
         """
-        Returns the AST of the specified Table API and SQL queries and the execution plan to compute
-        the result of the given :class:`~pyflink.table.Table` or multi-sinks plan.
+        Drops a view registered in the given path.
 
-        :param table: The table to be explained. If table is None, explain for multi-sinks plan,
-                      else for given table.
-        :param extended: If the plan should contain additional properties.
-                         e.g. estimated cost, traits
-        :return: The table for which the AST and execution plan will be returned.
+        This method can only drop permanent objects. Temporary objects can shadow permanent ones.
+        If a temporary object exists in a given path,
+        make sure to drop the temporary object first using :func:`drop_temporary_view`.
 
-        .. note:: Deprecated in 1.11. Use :class:`Table`#:func:`explain` instead.
+        :param view_path: The path of the registered view.
+        :param ignore_if_not_exists: Ignore if view does not exist.
+        :return: True if a view existed in the given path and was removed
+
+        .. versionadded:: 2.0.0
         """
-        warnings.warn("Deprecated in 1.11. Use Table#explain instead.", DeprecationWarning)
-        if table is None:
-            return self._j_tenv.explain(extended)
-        else:
-            return self._j_tenv.explain(table._j_table, extended)
+        return self._j_tenv.dropView(view_path, ignore_if_not_exists)
+
+    def drop_temporary_model(self, model_path: str) -> bool:
+        """
+        Drops a temporary model registered in the given path.
+
+        If a permanent model with a given path exists, it will be used
+        from now on for any queries that reference this path.
+
+        :param model_path: The path of the registered temporary model.
+        :return: True if a model existed in the given path and was removed.
+
+        .. versionadded:: 2.1.0
+        """
+        return self._j_tenv.dropTemporaryModel(model_path)
+
+    def drop_model(self, model_path: str, ignore_if_not_exists: Optional[bool] = True) -> bool:
+        """
+        Drops a model registered in the given path.
+
+        This method can only drop permanent objects. Temporary objects can shadow permanent ones.
+        If a temporary object exists in a given path,
+        make sure to drop the temporary object first using :func:`drop_temporary_model`.
+
+        :param model_path: The path of the registered model.
+        :param ignore_if_not_exists: Ignore if model does not exist.
+        :return: True if a model existed in the given path and was removed.
+
+        .. versionadded:: 2.1.0
+        """
+        return self._j_tenv.dropModel(model_path, ignore_if_not_exists)
 
     def explain_sql(self, stmt: str, *extra_details: ExplainDetail) -> str:
         """
@@ -722,8 +881,9 @@ class TableEnvironment(object, metaclass=ABCMeta):
         .. versionadded:: 1.11.0
         """
 
+        JExplainFormat = get_gateway().jvm.org.apache.flink.table.api.ExplainFormat
         j_extra_details = to_j_explain_detail_arr(extra_details)
-        return self._j_tenv.explainSql(stmt, j_extra_details)
+        return self._j_tenv.explainSql(stmt, JExplainFormat.TEXT, j_extra_details)
 
     def sql_query(self, query: str) -> Table:
         """
@@ -777,83 +937,6 @@ class TableEnvironment(object, metaclass=ABCMeta):
         """
         _j_statement_set = self._j_tenv.createStatementSet()
         return StatementSet(_j_statement_set, self)
-
-    def sql_update(self, stmt: str):
-        """
-        Evaluates a SQL statement such as INSERT, UPDATE or DELETE or a DDL statement
-
-        .. note::
-
-            Currently only SQL INSERT statements and CREATE TABLE statements are supported.
-
-        All tables referenced by the query must be registered in the TableEnvironment.
-        A :class:`~pyflink.table.Table` is automatically registered when its
-        :func:`~Table.__str__` method is called, for example when it is embedded into a String.
-        Hence, SQL queries can directly reference a :class:`~pyflink.table.Table` as follows:
-        ::
-
-            # register the table sink into which the result is inserted.
-            >>> table_env.register_table_sink("sink_table", table_sink)
-            >>> source_table = ...
-            # source_table is not registered to the table environment
-            >>> table_env.sql_update("INSERT INTO sink_table SELECT * FROM %s" % source_table)
-
-        A DDL statement can also be executed to create/drop a table:
-        For example, the below DDL statement would create a CSV table named `tbl1`
-        into the current catalog::
-
-            create table tbl1(
-                a int,
-                b bigint,
-                c varchar
-            ) with (
-                'connector.type' = 'filesystem',
-                'format.type' = 'csv',
-                'connector.path' = 'xxx'
-            )
-
-        SQL queries can directly execute as follows:
-        ::
-
-            >>> source_ddl = \\
-            ... '''
-            ... create table sourceTable(
-            ...     a int,
-            ...     b varchar
-            ... ) with (
-            ...     'connector.type' = 'kafka',
-            ...     'update-mode' = 'append',
-            ...     'connector.topic' = 'xxx',
-            ...     'connector.properties.bootstrap.servers' = 'localhost:9092'
-            ... )
-            ... '''
-
-            >>> sink_ddl = \\
-            ... '''
-            ... create table sinkTable(
-            ...     a int,
-            ...     b varchar
-            ... ) with (
-            ...     'connector.type' = 'filesystem',
-            ...     'format.type' = 'csv',
-            ...     'connector.path' = 'xxx'
-            ... )
-            ... '''
-
-            >>> query = "INSERT INTO sinkTable SELECT FROM sourceTable"
-            >>> table_env.sql(source_ddl)
-            >>> table_env.sql(sink_ddl)
-            >>> table_env.sql(query)
-            >>> table_env.execute("MyJob")
-
-        :param stmt: The SQL statement to evaluate.
-
-        .. note:: Deprecated in 1.11. Use :func:`execute_sql` for single statement,
-                  use :func:`create_statement_set` for multiple DML statements.
-        """
-        warnings.warn("Deprecated in 1.11. Use execute_sql for single statement, "
-                      "use create_statement_set for multiple DML statements.", DeprecationWarning)
-        self._j_tenv.sqlUpdate(stmt)
 
     def get_current_catalog(self) -> str:
         """
@@ -985,138 +1068,283 @@ class TableEnvironment(object, metaclass=ABCMeta):
             setattr(self, "table_config", table_config)
         return getattr(self, "table_config")
 
-    @abstractmethod
-    def connect(self, connector_descriptor: ConnectorDescriptor) -> ConnectTableDescriptor:
+    def create_temporary_view(self,
+                              view_path: str,
+                              table_or_data_stream: Union[Table, DataStream],
+                              *fields_or_schema: Union[str, Expression, Schema]):
         """
-        Creates a temporary table from a descriptor.
+        1. When table_or_data_stream is a :class:`~pyflink.table.Table`:
 
-        Descriptors allow for declaring the communication to external systems in an
-        implementation-agnostic way. The classpath is scanned for suitable table factories that
-        match the desired configuration.
+            Registers a :class:`~pyflink.table.Table` API object as a temporary view similar to SQL
+            temporary views.
 
-        The following example shows how to read from a connector using a JSON format and
-        registering a temporary table as "MyTable":
+            Temporary objects can shadow permanent ones. If a permanent object in a given path
+            exists, it will be inaccessible in the current session. To make the permanent object
+            available again you can drop the corresponding temporary object.
 
-        Example:
-        ::
+        2. When table_or_data_stream is a :class:`~pyflink.datastream.DataStream`:
 
-            >>> table_env \\
-            ...     .connect(ExternalSystemXYZ()
-            ...              .version("0.11")) \\
-            ...     .with_format(Json()
-            ...                  .json_schema("{...}")
-            ...                  .fail_on_missing_field(False)) \\
-            ...     .with_schema(Schema()
-            ...                  .field("user-name", "VARCHAR")
-            ...                  .from_origin_field("u_name")
-            ...                  .field("count", "DECIMAL")) \\
-            ...     .create_temporary_table("MyTable")
+            2.1 When fields_or_schema is a str or a sequence of :class:`~pyflink.table.Expression`:
 
-        :param connector_descriptor: Connector descriptor describing the external system.
-        :return: A :class:`~pyflink.table.descriptors.ConnectTableDescriptor` used to build the
-                 temporary table.
+                Creates a view from the given {@link DataStream} in a given path with specified
+                field names. Registered views can be referenced in SQL queries.
 
-        .. note:: Deprecated in 1.11. Use :func:`execute_sql` to register a table instead.
-        """
-        pass
+                1. Reference input fields by name: All fields in the schema definition are
+                referenced by name (and possibly renamed using an alias (as). Moreover, we can
+                define proctime and rowtime attributes at arbitrary positions using arbitrary names
+                (except those that exist in the result schema). In this mode, fields can be
+                reordered and projected out. This mode can be used for any input type, including
+                POJOs.
 
-    def register_java_function(self, name: str, function_class_name: str):
-        """
-        Registers a java user defined function under a unique name. Replaces already existing
-        user-defined functions under this name. The acceptable function type contains
-        **ScalarFunction**, **TableFunction** and **AggregateFunction**.
+                Example:
+                ::
 
-        Example:
-        ::
+                    >>> stream = ...
+                    # reorder the fields, rename the original 'f0' field to 'name' and add
+                    # event-time attribute named 'rowtime'
 
-            >>> table_env.register_java_function("func1", "java.user.defined.function.class.name")
+                    # use str
+                    >>> table_env.create_temporary_view(
+                    ...     "cat.db.myTable",
+                    ...     stream,
+                    ...     "f1, rowtime.rowtime, f0 as 'name'")
 
-        :param name: The name under which the function is registered.
-        :param function_class_name: The java full qualified class name of the function to register.
-                                    The function must have a public no-argument constructor and can
-                                    be founded in current Java classloader.
+                    # or use a sequence of expression
+                    >>> table_env.create_temporary_view(
+                    ...     "cat.db.myTable",
+                    ...     stream,
+                    ...     col("f1"),
+                    ...     col("rowtime").rowtime,
+                    ...     col("f0").alias('name'))
 
-        .. note:: Deprecated in 1.12. Use :func:`create_java_temporary_system_function` instead.
-        """
-        warnings.warn("Deprecated in 1.12. Use :func:`create_java_temporary_system_function` "
-                      "instead.", DeprecationWarning)
-        gateway = get_gateway()
-        java_function = gateway.jvm.Thread.currentThread().getContextClassLoader()\
-            .loadClass(function_class_name).newInstance()
-        # this is a temporary solution and will be unified later when we use the new type
-        # system(DataType) to replace the old type system(TypeInformation).
-        if self._is_blink_planner and isinstance(self, BatchTableEnvironment):
-            if self._is_table_function(java_function):
-                self._register_table_function(name, java_function)
-            elif self._is_aggregate_function(java_function):
-                self._register_aggregate_function(name, java_function)
-            else:
-                self._j_tenv.registerFunction(name, java_function)
-        else:
-            self._j_tenv.registerFunction(name, java_function)
+                2. Reference input fields by position: In this mode, fields are simply renamed.
+                Event-time attributes can replace the field on their position in the input data
+                (if it is of correct type) or be appended at the end. Proctime attributes must be
+                appended at the end. This mode can only be used if the input type has a defined
+                field order (tuple, case class, Row) and none of the {@code fields} references a
+                field of the input type.
 
-    def register_function(self, name: str, function: UserDefinedFunctionWrapper):
-        """
-        Registers a python user-defined function under a unique name. Replaces already existing
-        user-defined function under this name.
+                Example:
+                ::
 
-        Example:
-        ::
+                    >>> stream = ...
+                    # rename the original fields to 'a' and 'b' and extract the internally attached
+                    # timestamp into an event-time attribute named 'rowtime'
 
-            >>> table_env.register_function(
-            ...     "add_one", udf(lambda i: i + 1, result_type=DataTypes.BIGINT()))
+                    # use str
+                    >>> table_env.create_temporary_view(
+                    ...     "cat.db.myTable", stream, "a, b, rowtime.rowtime")
 
-            >>> @udf(result_type=DataTypes.BIGINT())
-            ... def add(i, j):
-            ...     return i + j
-            >>> table_env.register_function("add", add)
+                    # or use a sequence of expressions
+                    >>> table_env.create_temporary_view(
+                    ...     "cat.db.myTable",
+                    ...     stream,
+                    ...     col("a"),
+                    ...     col("b"),
+                    ...     col("rowtime").rowtime)
 
-            >>> class SubtractOne(ScalarFunction):
-            ...     def eval(self, i):
-            ...         return i - 1
-            >>> table_env.register_function(
-            ...     "subtract_one", udf(SubtractOne(), result_type=DataTypes.BIGINT()))
+                Temporary objects can shadow permanent ones. If a permanent object in a given path
+                exists, it will be inaccessible in the current session. To make the permanent object
+                available again you can drop the corresponding temporary object.
 
-        :param name: The name under which the function is registered.
-        :param function: The python user-defined function to register.
+            2.2 When fields_or_schema is a :class:`~pyflink.table.Schema`:
 
-        .. versionadded:: 1.10.0
+                Creates a view from the given {@link DataStream} in a given path. Registered views
+                can be referenced in SQL queries.
 
-        .. note:: Deprecated in 1.12. Use :func:`create_temporary_system_function` instead.
-        """
-        warnings.warn("Deprecated in 1.12. Use :func:`create_temporary_system_function` "
-                      "instead.", DeprecationWarning)
-        function = self._wrap_aggregate_function_if_needed(function)
-        java_function = function._java_user_defined_function()
-        # this is a temporary solution and will be unified later when we use the new type
-        # system(DataType) to replace the old type system(TypeInformation).
-        if self._is_blink_planner and isinstance(self, BatchTableEnvironment):
-            if self._is_table_function(java_function):
-                self._register_table_function(name, java_function)
-            elif self._is_aggregate_function(java_function):
-                self._register_aggregate_function(name, java_function)
-            else:
-                self._j_tenv.registerFunction(name, java_function)
-        else:
-            self._j_tenv.registerFunction(name, java_function)
+                See :func:`from_data_stream` for more information on how a
+                :class:`~pyflink.datastream.DataStream` is translated into a table.
 
-    def create_temporary_view(self, view_path: str, table: Table):
-        """
-        Registers a :class:`~pyflink.table.Table` API object as a temporary view similar to SQL
-        temporary views.
+                Temporary objects can shadow permanent ones. If a permanent object in a given path
+                exists, it will be inaccessible in the current session. To make the permanent object
+                available again you can drop the corresponding temporary object.
 
-        Temporary objects can shadow permanent ones. If a permanent object in a given path exists,
-        it will be inaccessible in the current session. To make the permanent object available
-        again you can drop the corresponding temporary object.
+                .. note:: create_temporary_view by providing a Schema (case 2.) was added from flink
+                    1.14.0.
 
         :param view_path: The path under which the view will be registered. See also the
                           :class:`~pyflink.table.TableEnvironment` class description for the format
                           of the path.
-        :param table: The view to register.
+        :param table_or_data_stream: The Table or DataStream out of which to create the view.
+        :param fields_or_schema: The fields expressions(str) to map original fields of the
+                        DataStream to the fields of the View or the customized schema for the final
+                        table.
 
         .. versionadded:: 1.10.0
         """
-        self._j_tenv.createTemporaryView(view_path, table._j_table)
+        if isinstance(table_or_data_stream, Table):
+            self._j_tenv.createTemporaryView(view_path, table_or_data_stream._j_table)
+        else:
+            j_data_stream = table_or_data_stream._j_data_stream
+            JPythonConfigUtil = get_gateway().jvm.org.apache.flink.python.util.PythonConfigUtil
+            JPythonConfigUtil.configPythonOperator(j_data_stream.getExecutionEnvironment())
+
+            if len(fields_or_schema) == 0:
+                self._j_tenv.createTemporaryView(view_path, j_data_stream)
+            elif len(fields_or_schema) == 1 and isinstance(fields_or_schema[0], str):
+                self._j_tenv.createTemporaryView(
+                    view_path,
+                    j_data_stream,
+                    fields_or_schema[0])
+            elif len(fields_or_schema) == 1 and isinstance(fields_or_schema[0], Schema):
+                self._j_tenv.createTemporaryView(
+                    view_path,
+                    j_data_stream,
+                    fields_or_schema[0]._j_schema)
+            elif (len(fields_or_schema) > 0 and
+                  all(isinstance(elem, Expression) for elem in fields_or_schema)):
+                self._j_tenv.createTemporaryView(
+                    view_path,
+                    j_data_stream,
+                    to_expression_jarray(fields_or_schema))
+            else:
+                raise ValueError("Invalid arguments for 'fields': %r" %
+                                 ','.join([repr(item) for item in fields_or_schema]))
+
+    def create_view(self,
+                    view_path: str,
+                    table: Table,
+                    ignore_if_exists: Optional[bool] = False):
+        """
+        Registers a :class:`~pyflink.table.Table` API object as a view similar to SQL views.
+
+        This method can only create permanent objects. Temporary objects can shadow permanent ones.
+        If a temporary object exists in a given path,
+        make sure to drop the temporary object first using :func:`drop_temporary_view`.
+
+        :param view_path: The path under which the view will be registered.
+                          See also the :class:`~pyflink.table.TableEnvironment` class description
+                          for the format of the path.
+        :param table:     The view to register.
+        :param ignore_if_exists: If a view or a table exists and the given flag is set,
+                                 no operation is executed. An exception is thrown otherwise.
+
+        .. versionadded:: 2.0.0
+        """
+
+        self._j_tenv.createView(view_path, table, ignore_if_exists)
+
+    def create_model(self,
+                     model_path: str,
+                     model_descriptor: ModelDescriptor,
+                     ignore_if_exists: Optional[bool] = False):
+        """
+        Registers the given :class:`~pyflink.table.ModelDescriptor` as a catalog model
+        similar to SQL models.
+
+        The ModelDescriptor is converted into a CatalogModel and stored in the catalog.
+
+        If the model should not be permanently stored in a catalog, use
+        :func:`create_temporary_model` instead.
+
+        Examples:
+        ::
+
+            >>> table_env.create_model("MyModel", ModelDescriptor.for_provider("OPENAI")
+            ...     .input_schema(Schema.new_builder()
+            ...                   .column("f0", DataTypes.STRING())
+            ...                   .build())
+            ...     .output_schema(Schema.new_builder()
+            ...                   .column("label", DataTypes.STRING())
+            ...                   .build())
+            ...     .option("task", "regression")
+            ...     .option("type", "remote")
+            ...     .
+            ...     .
+            ...     .build(),
+            ...  True)
+
+        :param model_path: The path under which the model will be registered.
+        :param model_descriptor: Template for creating a CatalogModel instance.
+        :param ignore_if_exists: If a model exists under the given path and this flag is set,
+                               no operation is executed. An exception is thrown otherwise.
+
+        .. versionadded:: 2.1.0
+        """
+        self._j_tenv.createModel(model_path, model_descriptor._j_model_descriptor, ignore_if_exists)
+
+    @PublicEvolving()
+    def from_model(self, model_path: Union[str, ModelDescriptor]) -> 'Model':
+        """
+        Gets a registered model or creates an anonymous model from a descriptor.
+
+        A descriptor defines the provider options and input/output schemas directly,
+        without registering a model in the catalog.
+
+        Example:
+        ::
+
+            >>> from pyflink.table import ModelDescriptor, Schema
+            >>> model = t_env.from_model("my_model")
+            >>> input_table = t_env.from_path("src")
+            >>> result_table = model.predict(input_table, ["user_comment"])
+
+        Create an anonymous model:
+        ::
+
+            >>> from pyflink.table import DataTypes
+            >>> descriptor = (ModelDescriptor.for_provider("my-provider")
+            ...     .input_schema(Schema.new_builder()
+            ...                   .column("text", DataTypes.STRING()).build())
+            ...     .output_schema(Schema.new_builder()
+            ...                    .column("label", DataTypes.STRING()).build())
+            ...     .build())
+            >>> model = t_env.from_model(descriptor)
+
+        :param model_path: The path of the registered model, or a descriptor defining
+                           an anonymous model.
+        :return: The requested model instance.
+
+        .. versionadded:: 2.4.0
+        """
+        if isinstance(model_path, ModelDescriptor):
+            j_model = self._j_tenv.fromModel(model_path._j_model_descriptor)
+        else:
+            j_model = self._j_tenv.fromModel(model_path)
+        return Model(j_model)
+
+    def create_temporary_model(self,
+                               model_path: str,
+                               model_descriptor: ModelDescriptor,
+                               ignore_if_exists: Optional[bool] = False):
+        """
+           Registers the given :class:`~pyflink.table.ModelDescriptor` as a temporary catalog model
+           similar to SQL temporary models.
+
+           The ModelDescriptor is converted into a CatalogModel and stored in the catalog.
+
+           Temporary objects can shadow permanent ones. If a permanent object in a given path
+           exists, it will be inaccessible in the current session. To make the permanent object
+           available again one can drop the corresponding temporary object.
+
+           Examples:
+           ::
+
+               >>> table_env.create_temporary_model("MyModel", ModelDescriptor
+            ...     .for_provider("OPENAI")
+            ...     .input_schema(Schema.new_builder()
+            ...                   .column("f0", DataTypes.STRING())
+            ...                   .build())
+            ...     .output_schema(Schema.new_builder()
+            ...                   .column("label", DataTypes.STRING())
+            ...                   .build())
+            ...     .option("task", "regression")
+            ...     .option("type", "remote")
+            ...     .
+            ...     .
+            ...     .build(),
+            ...  True)
+
+           :param model_path: The path under which the model will be registered.
+           :param model_descriptor: Template for creating a CatalogModel instance.
+           :param ignore_if_exists: If a model exists under the given path and this flag is
+                                    set, no operation is executed. An exception is thrown
+                                    otherwise.
+
+           .. versionadded:: 2.1.0
+           """
+        self._j_tenv.createTemporaryModel(model_path, model_descriptor._j_model_descriptor,
+                                          ignore_if_exists)
 
     def add_python_file(self, file_path: str):
         """
@@ -1129,14 +1357,12 @@ class TableEnvironment(object, metaclass=ABCMeta):
         .. versionadded:: 1.10.0
         """
         jvm = get_gateway().jvm
-        python_files = self.get_config().get_configuration().get_string(
-            jvm.PythonOptions.PYTHON_FILES.key(), None)
+        python_files = self.get_config().get(jvm.PythonOptions.PYTHON_FILES.key(), None)
         if python_files is not None:
-            python_files = jvm.PythonDependencyUtils.FILE_DELIMITER.join([python_files, file_path])
+            python_files = jvm.PythonDependencyUtils.FILE_DELIMITER.join([file_path, python_files])
         else:
             python_files = file_path
-        self.get_config().get_configuration().set_string(
-            jvm.PythonOptions.PYTHON_FILES.key(), python_files)
+        self.get_config().set(jvm.PythonOptions.PYTHON_FILES.key(), python_files)
 
     def set_python_requirements(self,
                                 requirements_file_path: str,
@@ -1165,7 +1391,7 @@ class TableEnvironment(object, metaclass=ABCMeta):
 
             Please make sure the installation packages matches the platform of the cluster
             and the python version used. These packages will be installed using pip,
-            so also make sure the version of Pip (version >= 7.1.0) and the version of
+            so also make sure the version of Pip (version >= 20.3) and the version of
             SetupTools (version >= 37.0.0).
 
         :param requirements_file_path: The path of "requirements.txt" file.
@@ -1179,7 +1405,7 @@ class TableEnvironment(object, metaclass=ABCMeta):
         if requirements_cache_dir is not None:
             python_requirements = jvm.PythonDependencyUtils.PARAM_DELIMITER.join(
                 [python_requirements, requirements_cache_dir])
-        self.get_config().get_configuration().set_string(
+        self.get_config().set(
             jvm.PythonOptions.PYTHON_REQUIREMENTS.key(), python_requirements)
 
     def add_python_archive(self, archive_path: str, target_dir: str = None):
@@ -1237,43 +1463,13 @@ class TableEnvironment(object, metaclass=ABCMeta):
         if target_dir is not None:
             archive_path = jvm.PythonDependencyUtils.PARAM_DELIMITER.join(
                 [archive_path, target_dir])
-        python_archives = self.get_config().get_configuration().get_string(
-            jvm.PythonOptions.PYTHON_ARCHIVES.key(), None)
+        python_archives = self.get_config().get(jvm.PythonOptions.PYTHON_ARCHIVES.key(), None)
         if python_archives is not None:
             python_files = jvm.PythonDependencyUtils.FILE_DELIMITER.join(
                 [python_archives, archive_path])
         else:
             python_files = archive_path
-        self.get_config().get_configuration().set_string(
-            jvm.PythonOptions.PYTHON_ARCHIVES.key(), python_files)
-
-    def execute(self, job_name: str) -> JobExecutionResult:
-        """
-        Triggers the program execution. The environment will execute all parts of
-        the program.
-
-        The program execution will be logged and displayed with the provided name.
-
-        .. note::
-
-            It is highly advised to set all parameters in the :class:`~pyflink.table.TableConfig`
-            on the very beginning of the program. It is undefined what configurations values will
-            be used for the execution if queries are mixed with config changes. It depends on
-            the characteristic of the particular parameter. For some of them the value from the
-            point in time of query construction (e.g. the current catalog) will be used. On the
-            other hand some values might be evaluated according to the state from the time when
-            this method is called (e.g. timezone).
-
-        :param job_name: Desired name of the job.
-        :return: The result of the job execution, containing elapsed time and accumulators.
-
-        .. note:: Deprecated in 1.11. Use :func:`execute_sql` for single sink,
-                  use :func:`create_statement_set` for multiple sinks.
-        """
-        warnings.warn("Deprecated in 1.11. Use execute_sql for single sink, "
-                      "use create_statement_set for multiple sinks.", DeprecationWarning)
-        self._before_execute()
-        return JobExecutionResult(self._j_tenv.execute(job_name))
+        self.get_config().set(jvm.PythonOptions.PYTHON_ARCHIVES.key(), python_files)
 
     def from_elements(self, elements: Iterable, schema: Union[DataType, List[str]] = None,
                       verify_schema: bool = True) -> Table:
@@ -1318,7 +1514,7 @@ class TableEnvironment(object, metaclass=ABCMeta):
             >>> table_env.from_elements([(1, 'Hi'), (2, 'Hello')],
             ...                         DataTypes.ROW([DataTypes.FIELD("a", DataTypes.INT()),
             ...                                        DataTypes.FIELD("b", DataTypes.STRING())]))
-            # use the thrid parameter to switch whether to verify the elements against the schema
+            # use the third parameter to switch whether to verify the elements against the schema
             >>> table_env.from_elements([(1, 'Hi'), (2, 'Hello')],
             ...                         DataTypes.ROW([DataTypes.FIELD("a", DataTypes.INT()),
             ...                                        DataTypes.FIELD("b", DataTypes.STRING())]),
@@ -1386,11 +1582,17 @@ class TableEnvironment(object, metaclass=ABCMeta):
         elements = [schema.to_sql_type(element) for element in elements]
         return self._from_elements(elements, schema)
 
-    def _from_elements(self, elements: List, schema: Union[DataType, List[str]]) -> Table:
+    def _from_elements(
+            self,
+            elements: List,
+            schema: DataType,
+            table_schema: Schema = None) -> Table:
         """
         Creates a table from a collection of elements.
 
         :param elements: The elements to create a table from.
+        :param schema: Data type used to serialize the elements.
+        :param table_schema: Optional declarative schema for the resulting source table.
         :return: The result :class:`~pyflink.table.Table`.
         """
         # serializes to a file, and we read the file in java
@@ -1398,29 +1600,107 @@ class TableEnvironment(object, metaclass=ABCMeta):
         serializer = BatchedSerializer(self._serializer)
         try:
             with temp_file:
-                serializer.dump_to_stream(elements, temp_file)
-            row_type_info = _to_java_type(schema)
-            execution_config = self._get_j_env().getConfig()
+                serializer.serialize(elements, temp_file)
+            j_schema = (table_schema._j_schema if table_schema is not None
+                        else _to_java_data_type(schema))
             gateway = get_gateway()
-            j_objs = gateway.jvm.PythonBridgeUtils.readPythonObjects(temp_file.name, True)
-            if self._is_blink_planner:
-                PythonTableUtils = gateway.jvm \
-                    .org.apache.flink.table.planner.utils.python.PythonTableUtils
-                PythonInputFormatTableSource = gateway.jvm \
-                    .org.apache.flink.table.planner.utils.python.PythonInputFormatTableSource
-            else:
-                PythonTableUtils = gateway.jvm.PythonTableUtils
-                PythonInputFormatTableSource = gateway.jvm.PythonInputFormatTableSource
-            j_input_format = PythonTableUtils.getInputFormat(
-                j_objs, row_type_info, execution_config)
-            j_table_source = PythonInputFormatTableSource(
-                j_input_format, row_type_info)
-
-            return Table(self._j_tenv.fromTableSource(j_table_source), self)
+            PythonTableUtils = gateway.jvm \
+                .org.apache.flink.table.utils.python.PythonTableUtils
+            j_table = PythonTableUtils.createTableFromElement(
+                self._j_tenv, temp_file.name, j_schema, True)
+            return Table(j_table, self)
         finally:
-            os.unlink(temp_file.name)
+            atexit.register(lambda: os.unlink(temp_file.name))
 
-    def from_pandas(self, pdf,
+    def _from_arrow(
+            self,
+            table,
+            row_type: RowType,
+            table_schema: Schema = None,
+            splits_num: int = 1) -> Table:
+        """Creates a table from a PyArrow Table through the Arrow table source."""
+        import pyarrow as pa
+
+        if not isinstance(table, pa.Table):
+            raise TypeError(f"table must be a pyarrow.Table, but was {type(table).__name__}")
+        if isinstance(splits_num, bool) or not isinstance(splits_num, int):
+            raise TypeError("splits_num must be an integer")
+        if splits_num <= 0:
+            raise ValueError("splits_num must be greater than 0")
+
+        field_names = row_type.field_names()
+        field_types = row_type.field_types()
+        try:
+            compatible_table = table.rename_columns(field_names)
+            for index, (field, data_type) in enumerate(zip(table.schema, field_types)):
+                source_column = compatible_table.column(index)
+                column = source_column
+                target_type = column.type
+                if isinstance(data_type, TimestampType):
+                    target_type = to_arrow_type(data_type)
+                    if column.type.tz is not None:
+                        target_type = pa.timestamp(
+                            target_type.unit, tz=column.type.tz)
+                if column.type != target_type:
+                    if pa.types.is_timestamp(column.type):
+                        column = _cast_arrow_timestamp(column, target_type)
+                    else:
+                        column = column.cast(target_type, safe=False)
+                if column is source_column:
+                    continue
+                target_field = pa.field(
+                    field_names[index],
+                    target_type,
+                    field.nullable,
+                    field.metadata,
+                )
+                compatible_table = compatible_table.set_column(
+                    index,
+                    target_field,
+                    column,
+                )
+        except (
+            pa.ArrowInvalid,
+            pa.ArrowNotImplementedError,
+            pa.ArrowTypeError,
+            TypeError,
+            ValueError,
+        ) as e:
+            raise TypeError(
+                f"Could not convert pyarrow.Table to the inferred Flink schema: {row_type}"
+            ) from e
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with tempfile.NamedTemporaryFile(delete=False, dir=temp_dir) as temp_file:
+                with pa.ipc.new_stream(temp_file, compatible_table.schema) as writer:
+                    if compatible_table.num_rows > 0:
+                        max_chunksize = -(-compatible_table.num_rows // splits_num)
+                        writer.write_table(
+                            compatible_table, max_chunksize=max_chunksize)
+
+            jvm = get_gateway().jvm
+            if table_schema is None:
+                source_schema = _to_java_data_type(row_type).notNull()
+                source_schema = source_schema.bridgedTo(
+                    load_java_class('org.apache.flink.table.data.RowData'))
+            else:
+                source_schema = table_schema._j_schema
+            create_descriptor = jvm.org.apache.flink.table.runtime.arrow.ArrowUtils \
+                .createArrowTableSourceDesc
+            if any(
+                _contains_timezone_aware_timestamp(field.type)
+                for field in compatible_table.schema
+            ):
+                descriptor = create_descriptor(
+                    source_schema,
+                    temp_file.name,
+                    self.get_config().get_local_timezone(),
+                )
+            else:
+                descriptor = create_descriptor(source_schema, temp_file.name)
+            return Table(getattr(self._j_tenv, "from")(descriptor), self)
+
+    def from_pandas(self, pdf: 'pandas.DataFrame',
                     schema: Union[RowType, List[str], Tuple[str], List[DataType],
                                   Tuple[DataType]] = None,
                     splits_num: int = 1) -> Table:
@@ -1449,10 +1729,6 @@ class TableEnvironment(object, metaclass=ABCMeta):
 
         .. versionadded:: 1.11.0
         """
-
-        if not self._is_blink_planner and isinstance(self, BatchTableEnvironment):
-            raise TypeError("It doesn't support to convert from Pandas DataFrame in the batch "
-                            "mode of old planner")
 
         import pandas as pd
         if not isinstance(pdf, pd.DataFrame):
@@ -1488,47 +1764,121 @@ class TableEnvironment(object, metaclass=ABCMeta):
             pytz.timezone(self.get_config().get_local_timezone()))
         step = -(-len(pdf) // splits_num)
         pdf_slices = [pdf.iloc[start:start + step] for start in range(0, len(pdf), step)]
-        data = [[c for (_, c) in pdf_slice.iteritems()] for pdf_slice in pdf_slices]
+        data = [[c for (_, c) in pdf_slice.items()] for pdf_slice in pdf_slices]
         try:
             with temp_file:
-                serializer.dump_to_stream(data, temp_file)
+                serializer.serialize(data, temp_file)
             jvm = get_gateway().jvm
 
-            data_type = jvm.org.apache.flink.table.types.utils.TypeConversions\
-                .fromLegacyInfoToDataType(_to_java_type(result_type)).notNull()
-            if self._is_blink_planner:
-                data_type = data_type.bridgedTo(
-                    load_java_class('org.apache.flink.table.data.RowData'))
+            data_type = _to_java_data_type(result_type).notNull()
+            data_type = data_type.bridgedTo(
+                load_java_class('org.apache.flink.table.data.RowData'))
 
-            j_arrow_table_source = \
-                jvm.org.apache.flink.table.runtime.arrow.ArrowUtils.createArrowTableSource(
+            j_arrow_table_source_descriptor = \
+                jvm.org.apache.flink.table.runtime.arrow.ArrowUtils.createArrowTableSourceDesc(
                     data_type, temp_file.name)
-            return Table(self._j_tenv.fromTableSource(j_arrow_table_source), self)
+            return Table(getattr(self._j_tenv, "from")(j_arrow_table_source_descriptor), self)
         finally:
             os.unlink(temp_file.name)
 
+    def load_plan(self, plan_reference: PlanReference) -> CompiledPlan:
+        """
+        Loads a plan from a :class:`~pyflink.table.PlanReference` into a
+        :class:`~pyflink.table.CompiledPlan`.
+
+        Compiled plans can be persisted and reloaded across Flink versions. They describe static
+        pipelines to ensure backwards compatibility and enable stateful streaming job upgrades. See
+        :class:`~pyflink.table.CompiledPlan` and the website documentation for more information.
+
+        This method will parse the input reference and will validate the plan. The returned
+        instance can be executed via :func:`~pyflink.table.CompiledPlan.execute`.
+
+        .. note::
+            The compiled plan feature is experimental in batch mode.
+
+        :raises TableException: if the plan cannot be loaded from the filesystem, or if the plan
+            is invalid.
+
+        .. versionadded:: 2.1.0
+        """
+        return CompiledPlan(
+            j_compiled_plan=self._j_tenv.loadPlan(plan_reference._j_plan_reference),
+            t_env=self
+        )
+
+    def compile_plan_sql(self, stmt: str) -> CompiledPlan:
+        """
+        Compiles a SQL DML statement into a :class:`~pyflink.table.CompiledPlan`.
+
+        Compiled plans can be persisted and reloaded across Flink versions. They describe static
+        pipelines to ensure backwards compatibility and enable stateful streaming job upgrades. See
+        :class:`~pyflink.table.CompiledPlan` and the website documentation for more information.
+
+        .. note::
+            Only ``INSERT INTO`` is supported at the moment.
+
+        .. note::
+            The compiled plan feature is experimental in batch mode.
+
+        .. seealso::
+            :func:`~pyflink.table.TableEnvironment.load_plan`
+            :func:`~pyflink.table.CompiledPlan.execute`
+
+        :raises TableException: if the SQL statement is invalid or if the plan cannot be
+            persisted.
+
+        .. versionadded:: 2.1.0
+        """
+        return CompiledPlan(j_compiled_plan=self._j_tenv.compilePlanSql(stmt), t_env=self)
+
+    def execute_plan(self, plan_reference: PlanReference) -> TableResult:
+        """
+        Shorthand for ``tEnv.load_plan(plan_reference).execute()``.
+
+        .. seealso::
+            :func:`~pyflink.table.TableEnvironment.load_plan`
+            :func:`~pyflink.table.CompiledPlan.execute`
+
+        .. versionadded:: 2.1.0
+        """
+        return self.load_plan(plan_reference).execute()
+
     def _set_python_executable_for_local_executor(self):
         jvm = get_gateway().jvm
-        j_config = get_j_env_configuration(self)
+        j_config = get_j_env_configuration(self._get_j_env())
         if not j_config.containsKey(jvm.PythonOptions.PYTHON_EXECUTABLE.key()) \
                 and is_local_deployment(j_config):
             j_config.setString(jvm.PythonOptions.PYTHON_EXECUTABLE.key(), sys.executable)
 
     def _add_jars_to_j_env_config(self, config_key):
-        jvm = get_gateway().jvm
-        jar_urls = self.get_config().get_configuration().get_string(config_key, None)
-        if jar_urls is not None:
-            # normalize and remove duplicates
-            jar_urls_set = set([jvm.java.net.URL(url).toString() for url in jar_urls.split(";")])
-            j_configuration = get_j_env_configuration(self)
-            if j_configuration.containsKey(config_key):
-                for url in j_configuration.getString(config_key, "").split(";"):
-                    jar_urls_set.add(url)
-            j_configuration.setString(config_key, ";".join(jar_urls_set))
+        jar_urls = self.get_config().get(config_key, None)
 
-    @abstractmethod
+        if jar_urls:
+            jvm = get_gateway().jvm
+            jar_urls_list = []
+            parsed_jar_urls = Configuration.parse_list_value(jar_urls)
+            url_strings = [
+                jvm.java.net.URL(url).toString() if url else ""
+                for url in parsed_jar_urls
+            ]
+            self._parse_urls(url_strings, jar_urls_list)
+
+            j_configuration = get_j_env_configuration(self._get_j_env())
+            parsed_jar_urls = Configuration.parse_list_value(
+                j_configuration.getString(config_key, "")
+            )
+            self._parse_urls(parsed_jar_urls, jar_urls_list)
+
+            j_configuration.setString(config_key, ";".join(jar_urls_list))
+
+    def _parse_urls(self, jar_urls, jar_urls_list):
+        for url in jar_urls:
+            url = url.strip()
+            if url != "" and url not in jar_urls_list:
+                jar_urls_list.append(url)
+
     def _get_j_env(self):
-        pass
+        return self._j_tenv.getPlanner().getExecEnv()
 
     @staticmethod
     def _is_table_function(java_function):
@@ -1574,10 +1924,6 @@ class TableEnvironment(object, metaclass=ABCMeta):
         self._add_jars_to_j_env_config(classpaths_key)
 
     def _wrap_aggregate_function_if_needed(self, function) -> UserDefinedFunctionWrapper:
-        if isinstance(function, (AggregateFunction, TableAggregateFunction,
-                                 UserDefinedAggregateFunctionWrapper)):
-            if not self._is_blink_planner:
-                raise Exception("Python UDAF and UDTAF are only supported in blink planner")
         if isinstance(function, AggregateFunction):
             function = udaf(function,
                             result_type=function.get_result_type(),
@@ -1590,56 +1936,48 @@ class TableEnvironment(object, metaclass=ABCMeta):
                              name=str(function.__class__.__name__))
         return function
 
+    def _config_chaining_optimization(self):
+        JChainingOptimizingExecutor = get_gateway().jvm.org.apache.flink.table.executor.python.\
+            ChainingOptimizingExecutor
+        exec_env_field = get_field(self._j_tenv.getClass(), "execEnv")
+        exec_env_field.set(self._j_tenv,
+                           JChainingOptimizingExecutor(exec_env_field.get(self._j_tenv)))
+
+    def _open(self):
+        # start BeamFnLoopbackWorkerPoolServicer when executed in MiniCluster
+        def startup_loopback_server():
+            from pyflink.fn_execution.beam.beam_worker_pool_service import \
+                BeamFnLoopbackWorkerPoolServicer
+
+            self.get_config().set("python.loopback-server.address",
+                                  BeamFnLoopbackWorkerPoolServicer()
+                                  .configure(
+                                      Configuration.from_dict(self.get_config().to_map())).start())
+
+        python_worker_execution_mode = os.environ.get('_python_worker_execution_mode')
+
+        if python_worker_execution_mode is None:
+            if is_local_deployment(get_j_env_configuration(self._get_j_env())):
+                startup_loopback_server()
+        elif python_worker_execution_mode == 'loopback':
+            if is_local_deployment(get_j_env_configuration(self._get_j_env())):
+                startup_loopback_server()
+            else:
+                raise ValueError("Loopback mode is enabled, however the job wasn't configured to "
+                                 "run in local deployment mode")
+        elif python_worker_execution_mode != 'process':
+            raise ValueError(
+                "It only supports to execute the Python worker in 'loopback' mode and 'process' "
+                "mode, unknown mode '%s' is configured" % python_worker_execution_mode)
+
 
 class StreamTableEnvironment(TableEnvironment):
 
     def __init__(self, j_tenv):
-        self._j_tenv = j_tenv
         super(StreamTableEnvironment, self).__init__(j_tenv)
 
-    def _get_j_env(self):
-        if self._is_blink_planner:
-            return self._j_tenv.getPlanner().getExecEnv()
-        else:
-            return self._j_tenv.getPlanner().getExecutionEnvironment()
-
-    def connect(self, connector_descriptor: ConnectorDescriptor) -> StreamTableDescriptor:
-        """
-        Creates a temporary table from a descriptor.
-
-        Descriptors allow for declaring the communication to external systems in an
-        implementation-agnostic way. The classpath is scanned for suitable table factories that
-        match the desired configuration.
-
-        The following example shows how to read from a connector using a JSON format and
-        registering a temporary table as "MyTable":
-        ::
-
-            >>> table_env \\
-            ...     .connect(ExternalSystemXYZ()
-            ...              .version("0.11")) \\
-            ...     .with_format(Json()
-            ...                  .json_schema("{...}")
-            ...                  .fail_on_missing_field(False)) \\
-            ...     .with_schema(Schema()
-            ...                  .field("user-name", "VARCHAR")
-            ...                  .from_origin_field("u_name")
-            ...                  .field("count", "DECIMAL")) \\
-            ...     .create_temporary_table("MyTable")
-
-        :param connector_descriptor: Connector descriptor describing the external system.
-        :return: A :class:`~pyflink.table.descriptors.StreamTableDescriptor` used to build the
-                 temporary table.
-
-        .. note:: Deprecated in 1.11. Use :func:`execute_sql` to register a table instead.
-        """
-        warnings.warn("Deprecated in 1.11. Use execute_sql instead.", DeprecationWarning)
-        return StreamTableDescriptor(
-            self._j_tenv.connect(connector_descriptor._j_connector_descriptor))
-
     @staticmethod
-    def create(stream_execution_environment: StreamExecutionEnvironment = None,
-               table_config: TableConfig = None,
+    def create(stream_execution_environment: StreamExecutionEnvironment = None,  # type: ignore
                environment_settings: EnvironmentSettings = None) -> 'StreamTableEnvironment':
         """
         Creates a :class:`~pyflink.table.StreamTableEnvironment`.
@@ -1650,12 +1988,13 @@ class StreamTableEnvironment(TableEnvironment):
             # create with StreamExecutionEnvironment.
             >>> env = StreamExecutionEnvironment.get_execution_environment()
             >>> table_env = StreamTableEnvironment.create(env)
-            # create with StreamExecutionEnvironment and TableConfig.
-            >>> table_config = TableConfig()
-            >>> table_config.set_null_check(False)
-            >>> table_env = StreamTableEnvironment.create(env, table_config)
             # create with StreamExecutionEnvironment and EnvironmentSettings.
-            >>> environment_settings = EnvironmentSettings.new_instance().use_blink_planner() \\
+            >>> configuration = Configuration()
+            >>> configuration.set_string('execution.buffer-timeout', '1 min')
+            >>> environment_settings = EnvironmentSettings \\
+            ...     .new_instance() \\
+            ...     .in_streaming_mode() \\
+            ...     .with_configuration(configuration) \\
             ...     .build()
             >>> table_env = StreamTableEnvironment.create(
             ...     env, environment_settings=environment_settings)
@@ -1666,33 +2005,17 @@ class StreamTableEnvironment(TableEnvironment):
         :param stream_execution_environment: The
                                              :class:`~pyflink.datastream.StreamExecutionEnvironment`
                                              of the TableEnvironment.
-        :param table_config: The configuration of the TableEnvironment, optional.
         :param environment_settings: The environment settings used to instantiate the
-                                     TableEnvironment. It provides the interfaces about planner
-                                     selection(flink or blink), optional.
+                                     TableEnvironment.
         :return: The StreamTableEnvironment created from given StreamExecutionEnvironment and
                  configuration.
         """
         if stream_execution_environment is None and \
-                table_config is None and \
                 environment_settings is None:
             raise ValueError("No argument found, the param 'stream_execution_environment' "
                              "or 'environment_settings' is required.")
-        elif stream_execution_environment is None and \
-                table_config is not None and \
-                environment_settings is None:
-            raise ValueError("Only the param 'table_config' is found, "
-                             "the param 'stream_execution_environment' is also required.")
-        if table_config is not None and \
-                environment_settings is not None:
-            raise ValueError("The param 'table_config' and "
-                             "'environment_settings' cannot be used at the same time")
-
         gateway = get_gateway()
         if environment_settings is not None:
-            if not environment_settings.is_streaming_mode():
-                raise ValueError("The environment settings for StreamTableEnvironment must be "
-                                 "set to streaming mode.")
             if stream_execution_environment is None:
                 j_tenv = gateway.jvm.TableEnvironment.create(
                     environment_settings._j_environment_settings)
@@ -1701,52 +2024,306 @@ class StreamTableEnvironment(TableEnvironment):
                     stream_execution_environment._j_stream_execution_environment,
                     environment_settings._j_environment_settings)
         else:
-            if table_config is not None:
-                j_tenv = gateway.jvm.StreamTableEnvironment.create(
-                    stream_execution_environment._j_stream_execution_environment,
-                    table_config._j_table_config)
-            else:
-                j_tenv = gateway.jvm.StreamTableEnvironment.create(
-                    stream_execution_environment._j_stream_execution_environment)
+            j_tenv = gateway.jvm.StreamTableEnvironment.create(
+                stream_execution_environment._j_stream_execution_environment)
+
         return StreamTableEnvironment(j_tenv)
 
-    def from_data_stream(self, data_stream: DataStream, *fields: Union[str, Expression]) -> Table:
+    def from_data_stream(self,
+                         data_stream: DataStream,
+                         *fields_or_schema: Union[Expression, Schema]) -> Table:
         """
-        Converts the given DataStream into a Table with specified field names.
+        1. When fields_or_schema is a sequence of Expression:
 
-        There are two modes for mapping original fields to the fields of the Table:
-            1. Reference input fields by name:
-            All fields in the schema definition are referenced by name (and possibly renamed using
-            and alias (as). Moreover, we can define proctime and rowtime attributes at arbitrary
-            positions using arbitrary names (except those that exist in the result schema). In this
-            mode, fields can be reordered and projected out. This mode can be used for any input
-            type.
-            2. Reference input fields by position:
-            In this mode, fields are simply renamed. Event-time attributes can replace the field on
-            their position in the input data (if it is of correct type) or be appended at the end.
-            Proctime attributes must be appended at the end. This mode can only be used if the input
-            type has a defined field order (tuple, case class, Row) and none of the fields
-            references a field of the input type.
+            Converts the given DataStream into a Table with specified field names.
+
+            There are two modes for mapping original fields to the fields of the Table:
+
+                1. Reference input fields by name:
+
+                All fields in the schema definition are referenced by name (and possibly renamed
+                using and alias (as). Moreover, we can define proctime and rowtime attributes at
+                arbitrary positions using arbitrary names (except those that exist in the result
+                schema). In this mode, fields can be reordered and projected out. This mode can be
+                used for any input type.
+
+                2. Reference input fields by position:
+
+                In this mode, fields are simply renamed. Event-time attributes can replace the field
+                on their position in the input data (if it is of correct type) or be appended at the
+                end. Proctime attributes must be appended at the end. This mode can only be used if
+                the input type has a defined field order (tuple, case class, Row) and none of the
+                fields references a field of the input type.
+
+        2. When fields_or_schema is a Schema:
+
+            Converts the given DataStream into a Table.
+
+            Column names and types of the Table are automatically derived from the TypeInformation
+            of the DataStream. If the outermost record's TypeInformation is a CompositeType, it will
+            be flattened in the first level. Composite nested fields will not be accessible.
+
+            Since the DataStream API does not support changelog processing natively, this method
+            assumes append-only/insert-only semantics during the stream-to-table conversion. Records
+            of class Row must describe RowKind.INSERT changes.
+
+            By default, the stream record's timestamp and watermarks are not propagated unless
+            explicitly declared.
+
+            This method allows to declare a Schema for the resulting table. The declaration is
+            similar to a {@code CREATE TABLE} DDL in SQL and allows to:
+
+                1. enrich or overwrite automatically derived columns with a custom DataType
+                2. reorder columns
+                3. add computed or metadata columns next to the physical columns
+                4. access a stream record's timestamp
+                5. declare a watermark strategy or propagate the DataStream watermarks
+
+            It is possible to declare a schema without physical/regular columns. In this case, those
+            columns will be automatically derived and implicitly put at the beginning of the schema
+            declaration.
+
+            The following examples illustrate common schema declarations and their semantics:
+
+            Example:
+            ::
+
+                === EXAMPLE 1 ===
+
+                no physical columns defined, they will be derived automatically,
+                e.g. BigDecimal becomes DECIMAL(38, 18)
+
+                >>> Schema.new_builder() \
+                ...     .column_by_expression("c1", "f1 + 42") \
+                ...     .column_by_expression("c2", "f1 - 1") \
+                ...     .build()
+
+                equal to: CREATE TABLE (f0 STRING, f1 DECIMAL(38, 18), c1 AS f1 + 42, c2 AS f1 - 1)
+
+                === EXAMPLE 2 ===
+
+                physical columns defined, input fields and columns will be mapped by name,
+                columns are reordered and their data type overwritten,
+                all columns must be defined to show up in the final table's schema
+
+                >>> Schema.new_builder() \
+                ...     .column("f1", "DECIMAL(10, 2)") \
+                ...     .column_by_expression("c", "f1 - 1") \
+                ...     .column("f0", "STRING") \
+                ...     .build()
+
+                equal to: CREATE TABLE (f1 DECIMAL(10, 2), c AS f1 - 1, f0 STRING)
+
+                === EXAMPLE 3 ===
+
+                timestamp and watermarks can be added from the DataStream API,
+                physical columns will be derived automatically
+
+                >>> Schema.new_builder() \
+                ...     .column_by_metadata("rowtime", "TIMESTAMP_LTZ(3)") \
+                ...     .watermark("rowtime", "SOURCE_WATERMARK()") \
+                ...     .build()
+
+                equal to:
+                    CREATE TABLE (
+                        f0 STRING,
+                        f1 DECIMAL(38, 18),
+                        rowtime TIMESTAMP(3) METADATA,
+                        WATERMARK FOR rowtime AS SOURCE_WATERMARK()
+                    )
+
+            .. note:: create_temporary_view by providing a Schema (case 2.) was added from flink
+                    1.14.0.
 
         :param data_stream: The datastream to be converted.
-        :param fields: The fields expressions to map original fields of the DataStream to the fields
-                       of the Table
+        :param fields_or_schema: The fields expressions to map original fields of the DataStream to
+            the fields of the Table or the customized schema for the final table.
         :return: The converted Table.
 
         .. versionadded:: 1.12.0
         """
         j_data_stream = data_stream._j_data_stream
-        if len(fields) == 0:
+        JPythonConfigUtil = get_gateway().jvm.org.apache.flink.python.util.PythonConfigUtil
+        JPythonConfigUtil.configPythonOperator(j_data_stream.getExecutionEnvironment())
+        if len(fields_or_schema) == 0:
             return Table(j_table=self._j_tenv.fromDataStream(j_data_stream), t_env=self)
-        elif all(isinstance(f, Expression) for f in fields):
+        elif all(isinstance(f, Expression) for f in fields_or_schema):
             return Table(j_table=self._j_tenv.fromDataStream(
-                j_data_stream, to_expression_jarray(fields)), t_env=self)
-        elif len(fields) == 1 and isinstance(fields[0], str):
-            warnings.warn(
-                "Deprecated in 1.12. Use from_data_stream(DataStream, *Expression) instead.",
-                DeprecationWarning)
-            return Table(j_table=self._j_tenv.fromDataStream(j_data_stream, fields[0]), t_env=self)
-        raise ValueError("Invalid arguments for 'fields': %r" % fields)
+                j_data_stream, to_expression_jarray(fields_or_schema)), t_env=self)
+        elif len(fields_or_schema) == 1 and isinstance(fields_or_schema[0], Schema):
+            return Table(j_table=self._j_tenv.fromDataStream(
+                j_data_stream, fields_or_schema[0]._j_schema), t_env=self)
+        raise ValueError("Invalid arguments for 'fields': %r" % fields_or_schema)
+
+    def from_changelog_stream(self,
+                              data_stream: DataStream,
+                              schema: Schema = None,
+                              changelog_mode: ChangelogMode = None) -> Table:
+        """
+        Converts the given DataStream of changelog entries into a Table.
+
+        Compared to :func:`from_data_stream`, this method consumes instances of Row and evaluates
+        the RowKind flag that is contained in every record during runtime. The runtime behavior is
+        similar to that of a DynamicTableSource.
+
+        If you don't specify the changelog_mode, the changelog containing all kinds of changes
+        (enumerated in RowKind) as the default ChangelogMode.
+
+        Column names and types of the Table are automatically derived from the TypeInformation of
+        the DataStream. If the outermost record's TypeInformation is a CompositeType, it will be
+        flattened in the first level. Composite nested fields will not be accessible.
+
+        By default, the stream record's timestamp and watermarks are not propagated unless
+        explicitly declared.
+
+        This method allows to declare a Schema for the resulting table. The declaration is similar
+        to a {@code CREATE TABLE} DDL in SQL and allows to:
+
+            1. enrich or overwrite automatically derived columns with a custom DataType
+            2. reorder columns
+            3. add computed or metadata columns next to the physical columns
+            4. access a stream record's timestamp
+            5. declare a watermark strategy or propagate the DataStream watermarks
+            6. declare a primary key
+
+        See :func:`from_data_stream` for more information and examples of how to declare a Schema.
+
+        :param data_stream: The changelog stream of Row.
+        :param schema: The customized schema for the final table.
+        :param changelog_mode: The expected kinds of changes in the incoming changelog.
+        :return: The converted Table.
+        """
+        j_data_stream = data_stream._j_data_stream
+        JPythonConfigUtil = get_gateway().jvm.org.apache.flink.python.util.PythonConfigUtil
+        JPythonConfigUtil.configPythonOperator(j_data_stream.getExecutionEnvironment())
+        if schema is None:
+            return Table(self._j_tenv.fromChangelogStream(j_data_stream), t_env=self)
+        elif changelog_mode is None:
+            return Table(
+                self._j_tenv.fromChangelogStream(j_data_stream, schema._j_schema), t_env=self)
+        else:
+            return Table(
+                self._j_tenv.fromChangelogStream(
+                    j_data_stream,
+                    schema._j_schema,
+                    changelog_mode._j_changelog_mode),
+                t_env=self)
+
+    def to_data_stream(self, table: Table) -> DataStream:
+        """
+        Converts the given Table into a DataStream.
+
+        Since the DataStream API does not support changelog processing natively, this method
+        assumes append-only/insert-only semantics during the table-to-stream conversion. The records
+        of class Row will always describe RowKind#INSERT changes. Updating tables are
+        not supported by this method and will produce an exception.
+
+        Note that the type system of the table ecosystem is richer than the one of the DataStream
+        API. The table runtime will make sure to properly serialize the output records to the first
+        operator of the DataStream API. Afterwards, the Types semantics of the DataStream API
+        need to be considered.
+
+        If the input table contains a single rowtime column, it will be propagated into a stream
+        record's timestamp. Watermarks will be propagated as well.
+
+        :param table: The Table to convert.
+        :return: The converted DataStream.
+        """
+        return DataStream(self._j_tenv.toDataStream(table._j_table))
+
+    def to_changelog_stream(self,
+                            table: Table,
+                            target_schema: Schema = None,
+                            changelog_mode: ChangelogMode = None) -> DataStream:
+        """
+        Converts the given Table into a DataStream of changelog entries.
+
+        Compared to :func:`to_data_stream`, this method produces instances of Row and sets the
+        RowKind flag that is contained in every record during runtime. The runtime behavior is
+        similar to that of a DynamicTableSink.
+
+        If you don't specify the changelog_mode, the changelog containing all kinds of changes
+        (enumerated in RowKind) as the default ChangelogMode.
+
+        The given Schema is used to configure the table runtime to convert columns and internal data
+        structures to the desired representation. The following example shows how to
+        convert a table column into a Row type.
+
+        Example:
+        ::
+
+            >>> table_env.to_changelog_stream(
+            ...     table,
+            ...     Schema.new_builder() \
+            ...         .column("id", DataTypes.BIGINT())
+            ...         .column("payload", DataTypes.ROW(
+            ...                                     [DataTypes.FIELD("name", DataTypes.STRING()),
+            ...                                      DataTypes.FIELD("age", DataTypes.INT())]))
+            ...         .build())
+
+        Note that the type system of the table ecosystem is richer than the one of the DataStream
+        API. The table runtime will make sure to properly serialize the output records to the first
+        operator of the DataStream API. Afterwards, the Types semantics of the DataStream API need
+        to be considered.
+
+        If the input table contains a single rowtime column, it will be propagated into a stream
+        record's timestamp. Watermarks will be propagated as well.
+
+        If the rowtime should not be a concrete field in the final Row anymore, or the schema should
+        be symmetrical for both :func:`from_changelog_stream` and :func:`to_changelog_stream`, the
+        rowtime can also be declared as a metadata column that will be propagated into a stream
+        record's timestamp. It is possible to declare a schema without physical/regular columns.
+        In this case, those columns will be automatically derived and implicitly put at the
+        beginning of the schema declaration.
+
+        The following examples illustrate common schema declarations and their semantics:
+
+        Example:
+        ::
+
+            given a Table of (id INT, name STRING, my_rowtime TIMESTAMP_LTZ(3))
+
+            === EXAMPLE 1 ===
+
+            no physical columns defined, they will be derived automatically,
+            the last derived physical column will be skipped in favor of the metadata column
+
+            >>> Schema.new_builder() \
+            ...     .column_by_metadata("rowtime", "TIMESTAMP_LTZ(3)") \
+            ...     .build()
+
+            equal to: CREATE TABLE (id INT, name STRING, rowtime TIMESTAMP_LTZ(3) METADATA)
+
+            === EXAMPLE 2 ===
+
+            physical columns defined, all columns must be defined
+
+            >>> Schema.new_builder() \
+            ...     .column("id", "INT") \
+            ...     .column("name", "STRING") \
+            ...     .column_by_metadata("rowtime", "TIMESTAMP_LTZ(3)") \
+            ...     .build()
+
+            equal to: CREATE TABLE (id INT, name STRING, rowtime TIMESTAMP_LTZ(3) METADATA)
+
+        :param table: The Table to convert. It can be updating or insert-only.
+        :param target_schema: The Schema that decides about the final external representation in
+            DataStream records.
+        :param changelog_mode: The required kinds of changes in the result changelog. An exception
+            will be thrown if the given updating table cannot be represented in this changelog mode.
+        :return: The converted changelog stream of Row.
+        """
+        if target_schema is None:
+            return DataStream(self._j_tenv.toChangelogStream(table._j_table))
+        elif changelog_mode is None:
+            return DataStream(
+                self._j_tenv.toChangelogStream(table._j_table, target_schema._j_schema))
+        else:
+            return DataStream(
+                self._j_tenv.toChangelogStream(
+                    table._j_table,
+                    target_schema._j_schema,
+                    changelog_mode._j_changelog_mode))
 
     def to_append_stream(self, table: Table, type_info: TypeInformation) -> DataStream:
         """
@@ -1785,139 +2362,3 @@ class StreamTableEnvironment(TableEnvironment):
         """
         j_data_stream = self._j_tenv.toRetractStream(table._j_table, type_info.get_java_type_info())
         return DataStream(j_data_stream=j_data_stream)
-
-
-class BatchTableEnvironment(TableEnvironment):
-
-    def __init__(self, j_tenv):
-        self._j_tenv = j_tenv
-        super(BatchTableEnvironment, self).__init__(j_tenv)
-
-    def _get_j_env(self):
-        if self._is_blink_planner:
-            return self._j_tenv.getPlanner().getExecEnv()
-        else:
-            return self._j_tenv.execEnv()
-
-    def connect(self, connector_descriptor: ConnectorDescriptor) -> \
-            Union[BatchTableDescriptor, StreamTableDescriptor]:
-        """
-        Creates a temporary table from a descriptor.
-
-        Descriptors allow for declaring the communication to external systems in an
-        implementation-agnostic way. The classpath is scanned for suitable table factories that
-        match the desired configuration.
-
-        The following example shows how to read from a connector using a JSON format and
-        registering a temporary table as "MyTable":
-        ::
-
-            >>> table_env \\
-            ...     .connect(ExternalSystemXYZ()
-            ...              .version("0.11")) \\
-            ...     .with_format(Json()
-            ...                  .json_schema("{...}")
-            ...                  .fail_on_missing_field(False)) \\
-            ...     .with_schema(Schema()
-            ...                  .field("user-name", "VARCHAR")
-            ...                  .from_origin_field("u_name")
-            ...                  .field("count", "DECIMAL")) \\
-            ...     .create_temporary_table("MyTable")
-
-        :param connector_descriptor: Connector descriptor describing the external system.
-        :return: A :class:`~pyflink.table.descriptors.BatchTableDescriptor` or a
-                 :class:`~pyflink.table.descriptors.StreamTableDescriptor` (for blink planner) used
-                 to build the temporary table.
-
-        .. note:: Deprecated in 1.11. Use :func:`execute_sql` to register a table instead.
-        """
-        warnings.warn("Deprecated in 1.11. Use execute_sql instead.", DeprecationWarning)
-        gateway = get_gateway()
-        blink_t_env_class = get_java_class(
-            gateway.jvm.org.apache.flink.table.api.internal.TableEnvironmentImpl)
-        if blink_t_env_class == self._j_tenv.getClass():
-            return StreamTableDescriptor(
-                self._j_tenv.connect(connector_descriptor._j_connector_descriptor))
-        else:
-            return BatchTableDescriptor(
-                self._j_tenv.connect(connector_descriptor._j_connector_descriptor))
-
-    @staticmethod
-    def create(execution_environment: ExecutionEnvironment = None,
-               table_config: TableConfig = None,
-               environment_settings: EnvironmentSettings = None) -> 'BatchTableEnvironment':
-        """
-        Creates a :class:`~pyflink.table.BatchTableEnvironment`.
-
-        Example:
-        ::
-
-            # create with ExecutionEnvironment.
-            >>> env = ExecutionEnvironment.get_execution_environment()
-            >>> table_env = BatchTableEnvironment.create(env)
-            # create with ExecutionEnvironment and TableConfig.
-            >>> table_config = TableConfig()
-            >>> table_config.set_null_check(False)
-            >>> table_env = BatchTableEnvironment.create(env, table_config)
-            # create with EnvironmentSettings.
-            >>> environment_settings = EnvironmentSettings.new_instance().in_batch_mode() \\
-            ...     .use_blink_planner().build()
-            >>> table_env = BatchTableEnvironment.create(environment_settings=environment_settings)
-
-        :param execution_environment: The batch :class:`~pyflink.dataset.ExecutionEnvironment` of
-                                      the TableEnvironment.
-        :param table_config: The configuration of the TableEnvironment, optional.
-        :param environment_settings: The environment settings used to instantiate the
-                                     TableEnvironment. It provides the interfaces about planner
-                                     selection(flink or blink), optional.
-        :return: The BatchTableEnvironment created from given ExecutionEnvironment and
-                 configuration.
-        """
-        if execution_environment is None and \
-                table_config is None and \
-                environment_settings is None:
-            raise ValueError("No argument found, the param 'execution_environment' "
-                             "or 'environment_settings' is required.")
-        elif execution_environment is None and \
-                table_config is not None and \
-                environment_settings is None:
-            raise ValueError("Only the param 'table_config' is found, "
-                             "the param 'execution_environment' is also required.")
-        elif execution_environment is not None and \
-                environment_settings is not None:
-            raise ValueError("The param 'execution_environment' and "
-                             "'environment_settings' cannot be used at the same time")
-        elif table_config is not None and \
-                environment_settings is not None:
-            raise ValueError("The param 'table_config' and "
-                             "'environment_settings' cannot be used at the same time")
-
-        gateway = get_gateway()
-        if environment_settings is not None:
-            if environment_settings.is_streaming_mode():
-                raise ValueError("The environment settings for BatchTableEnvironment must be "
-                                 "set to batch mode.")
-            JEnvironmentSettings = get_gateway().jvm.org.apache.flink.table.api.EnvironmentSettings
-
-            old_planner_class_name = EnvironmentSettings.new_instance().in_batch_mode() \
-                .use_old_planner().build()._j_environment_settings \
-                .toPlannerProperties()[JEnvironmentSettings.CLASS_NAME]
-            planner_properties = environment_settings._j_environment_settings.toPlannerProperties()
-            if JEnvironmentSettings.CLASS_NAME in planner_properties and \
-                    planner_properties[JEnvironmentSettings.CLASS_NAME] == old_planner_class_name:
-                # The Java EnvironmentSettings API does not support creating table environment with
-                # old planner. Create it from other API.
-                j_tenv = gateway.jvm.BatchTableEnvironment.create(
-                    ExecutionEnvironment.get_execution_environment()._j_execution_environment)
-            else:
-                j_tenv = gateway.jvm.TableEnvironment.create(
-                    environment_settings._j_environment_settings)
-        else:
-            if table_config is None:
-                j_tenv = gateway.jvm.BatchTableEnvironment.create(
-                    execution_environment._j_execution_environment)
-            else:
-                j_tenv = gateway.jvm.BatchTableEnvironment.create(
-                    execution_environment._j_execution_environment,
-                    table_config._j_table_config)
-        return BatchTableEnvironment(j_tenv)

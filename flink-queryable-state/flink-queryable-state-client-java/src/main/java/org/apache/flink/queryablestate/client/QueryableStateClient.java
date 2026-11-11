@@ -21,18 +21,13 @@ package org.apache.flink.queryablestate.client;
 import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.api.common.state.AggregatingStateDescriptor;
-import org.apache.flink.api.common.state.ListStateDescriptor;
-import org.apache.flink.api.common.state.MapStateDescriptor;
-import org.apache.flink.api.common.state.ReducingStateDescriptor;
+import org.apache.flink.api.common.serialization.SerializerConfig;
 import org.apache.flink.api.common.state.State;
 import org.apache.flink.api.common.state.StateDescriptor;
-import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.queryablestate.FutureUtils;
 import org.apache.flink.queryablestate.client.state.ImmutableAggregatingState;
 import org.apache.flink.queryablestate.client.state.ImmutableListState;
 import org.apache.flink.queryablestate.client.state.ImmutableMapState;
@@ -45,8 +40,10 @@ import org.apache.flink.queryablestate.network.Client;
 import org.apache.flink.queryablestate.network.messages.MessageSerializer;
 import org.apache.flink.queryablestate.network.stats.DisabledKvStateRequestStats;
 import org.apache.flink.util.FlinkRuntimeException;
+import org.apache.flink.util.LambdaUtil;
 import org.apache.flink.util.NetUtils;
 import org.apache.flink.util.Preconditions;
+import org.apache.flink.util.concurrent.FutureUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,28 +72,32 @@ import java.util.stream.Stream;
  * Resolved locations are cached. When the server address of the requested KvState instance is
  * determined, the client sends out a request to the server. The returned final answer is then
  * forwarded to the Client.
+ *
+ * @deprecated The Queryable State feature is deprecated since Flink 1.18, and will be removed in a
+ *     future Flink major version.
  */
 @PublicEvolving
+@Deprecated
 public class QueryableStateClient {
 
     private static final Logger LOG = LoggerFactory.getLogger(QueryableStateClient.class);
 
-    private static final Map<Class<? extends StateDescriptor>, StateFactory> STATE_FACTORIES =
+    private static final Map<StateDescriptor.Type, StateFactory> STATE_FACTORIES =
             Stream.of(
                             Tuple2.of(
-                                    ValueStateDescriptor.class,
+                                    StateDescriptor.Type.VALUE,
                                     (StateFactory) ImmutableValueState::createState),
                             Tuple2.of(
-                                    ListStateDescriptor.class,
+                                    StateDescriptor.Type.LIST,
                                     (StateFactory) ImmutableListState::createState),
                             Tuple2.of(
-                                    MapStateDescriptor.class,
+                                    StateDescriptor.Type.MAP,
                                     (StateFactory) ImmutableMapState::createState),
                             Tuple2.of(
-                                    AggregatingStateDescriptor.class,
+                                    StateDescriptor.Type.AGGREGATING,
                                     (StateFactory) ImmutableAggregatingState::createState),
                             Tuple2.of(
-                                    ReducingStateDescriptor.class,
+                                    StateDescriptor.Type.REDUCING,
                                     (StateFactory) ImmutableReducingState::createState))
                     .collect(Collectors.toMap(t -> t.f0, t -> t.f1));
 
@@ -113,6 +114,9 @@ public class QueryableStateClient {
 
     /** The execution configuration used to instantiate the different (de-)serializers. */
     private ExecutionConfig executionConfig;
+
+    /** The user code classloader, used in loading serializers. */
+    private ClassLoader userClassLoader;
 
     /**
      * Create the Queryable State Client.
@@ -193,6 +197,18 @@ public class QueryableStateClient {
     public ExecutionConfig setExecutionConfig(ExecutionConfig config) {
         ExecutionConfig prev = executionConfig;
         this.executionConfig = config;
+        return prev;
+    }
+
+    /**
+     * * Replaces the existing {@link ClassLoader} (possibly {@code null}), with the provided one.
+     *
+     * @param userClassLoader The new {@code userClassLoader}.
+     * @return The old classloader, or {@code null} if none was specified.
+     */
+    public ClassLoader setUserClassLoader(ClassLoader userClassLoader) {
+        ClassLoader prev = this.userClassLoader;
+        this.userClassLoader = userClassLoader;
         return prev;
     }
 
@@ -278,8 +294,9 @@ public class QueryableStateClient {
         Preconditions.checkNotNull(namespaceTypeInfo);
         Preconditions.checkNotNull(stateDescriptor);
 
-        TypeSerializer<K> keySerializer = keyTypeInfo.createSerializer(executionConfig);
-        TypeSerializer<N> namespaceSerializer = namespaceTypeInfo.createSerializer(executionConfig);
+        TypeSerializer<K> keySerializer = keyTypeInfo.createSerializer(getSerializerConfig());
+        TypeSerializer<N> namespaceSerializer =
+                namespaceTypeInfo.createSerializer(getSerializerConfig());
 
         stateDescriptor.initializeSerializerUnlessSet(executionConfig);
 
@@ -289,16 +306,24 @@ public class QueryableStateClient {
                     KvStateSerializer.serializeKeyAndNamespace(
                             key, keySerializer, namespace, namespaceSerializer);
         } catch (IOException e) {
-            return FutureUtils.getFailedFuture(e);
+            return FutureUtils.completedExceptionally(e);
         }
 
+        ClassLoader classLoaderToUse =
+                userClassLoader != null
+                        ? userClassLoader
+                        : Thread.currentThread().getContextClassLoader();
         return getKvState(jobId, queryableStateName, key.hashCode(), serializedKeyAndNamespace)
-                .thenApply(stateResponse -> createState(stateResponse, stateDescriptor));
+                .thenApply(
+                        stateResponse ->
+                                LambdaUtil.withContextClassLoader(
+                                        classLoaderToUse,
+                                        () -> createState(stateResponse, stateDescriptor)));
     }
 
     private <T, S extends State> S createState(
             KvStateResponse stateResponse, StateDescriptor<S, T> stateDescriptor) {
-        StateFactory stateFactory = STATE_FACTORIES.get(stateDescriptor.getClass());
+        StateFactory stateFactory = STATE_FACTORIES.get(stateDescriptor.getType());
         if (stateFactory == null) {
             String message =
                     String.format(
@@ -336,7 +361,11 @@ public class QueryableStateClient {
             return client.sendRequest(remoteAddress, request);
         } catch (Exception e) {
             LOG.error("Unable to send KVStateRequest: ", e);
-            return FutureUtils.getFailedFuture(e);
+            return FutureUtils.completedExceptionally(e);
         }
+    }
+
+    private SerializerConfig getSerializerConfig() {
+        return executionConfig == null ? null : executionConfig.getSerializerConfig();
     }
 }

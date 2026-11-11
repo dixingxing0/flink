@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,38 +18,22 @@
 
 package org.apache.flink.runtime.leaderelection;
 
-import org.apache.flink.runtime.rpc.FatalErrorHandler;
+import org.apache.flink.util.Preconditions;
 
-import org.apache.flink.shaded.curator4.org.apache.curator.framework.CuratorFramework;
+import org.apache.flink.shaded.curator5.org.apache.curator.framework.CuratorFramework;
 
-/** {@link LeaderElectionDriverFactory} implementation for Zookeeper. */
+/** Factory for {@link ZooKeeperLeaderElectionDriver}. */
 public class ZooKeeperLeaderElectionDriverFactory implements LeaderElectionDriverFactory {
 
-    private final CuratorFramework client;
+    private final CuratorFramework curatorFramework;
 
-    private final String latchPath;
-
-    private final String leaderPath;
-
-    public ZooKeeperLeaderElectionDriverFactory(
-            CuratorFramework client, String latchPath, String leaderPath) {
-        this.client = client;
-        this.latchPath = latchPath;
-        this.leaderPath = leaderPath;
+    public ZooKeeperLeaderElectionDriverFactory(CuratorFramework curatorFramework) {
+        this.curatorFramework = Preconditions.checkNotNull(curatorFramework);
     }
 
     @Override
-    public ZooKeeperLeaderElectionDriver createLeaderElectionDriver(
-            LeaderElectionEventHandler leaderEventHandler,
-            FatalErrorHandler fatalErrorHandler,
-            String leaderContenderDescription)
-            throws Exception {
-        return new ZooKeeperLeaderElectionDriver(
-                client,
-                latchPath,
-                leaderPath,
-                leaderEventHandler,
-                fatalErrorHandler,
-                leaderContenderDescription);
+    public ZooKeeperLeaderElectionDriver create(
+            LeaderElectionDriver.Listener leaderElectionListener) throws Exception {
+        return new ZooKeeperLeaderElectionDriver(curatorFramework, leaderElectionListener);
     }
 }

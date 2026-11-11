@@ -18,51 +18,52 @@
 
 package org.apache.flink.test.runtime;
 
-import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.client.program.MiniClusterClient;
-import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
 import org.apache.flink.configuration.MemorySize;
-import org.apache.flink.configuration.RestOptions;
+import org.apache.flink.configuration.StateRecoveryOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
 import org.apache.flink.runtime.jobgraph.DistributionPattern;
 import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobgraph.JobGraphBuilder;
 import org.apache.flink.runtime.jobgraph.JobVertex;
-import org.apache.flink.runtime.jobgraph.ScheduleMode;
 import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
 import org.apache.flink.runtime.jobmanager.scheduler.SlotSharingGroup;
 import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.minicluster.MiniCluster;
 import org.apache.flink.runtime.minicluster.MiniClusterConfiguration;
 import org.apache.flink.runtime.testtasks.NoOpInvokable;
+import org.apache.flink.streaming.util.RestartStrategyUtils;
 import org.apache.flink.util.FlinkException;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.util.TestLoggerExtension;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 
 import javax.annotation.Nonnull;
 
-import java.io.IOException;
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.apache.flink.configuration.JobManagerOptions.EXECUTION_FAILOVER_STRATEGY;
-import static org.hamcrest.Matchers.is;
-import static org.junit.Assert.assertThat;
+import static org.apache.flink.runtime.util.JobVertexConnectionUtils.connectNewDataSetAsInput;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** IT case for testing Flink's scheduling strategies. */
-public class SchedulingITCase extends TestLogger {
+@ExtendWith(TestLoggerExtension.class)
+class SchedulingITCase {
 
     /** Tests that if local recovery is disabled we won't spread out tasks when recovering. */
     @Test
-    public void testDisablingLocalRecovery() throws Exception {
+    void testDisablingLocalRecovery() throws Exception {
         final Configuration configuration = new Configuration();
-        configuration.setBoolean(CheckpointingOptions.LOCAL_RECOVERY, false);
+        configuration.set(StateRecoveryOptions.LOCAL_RECOVERY, false);
 
         executeSchedulingTest(configuration);
     }
@@ -72,7 +73,7 @@ public class SchedulingITCase extends TestLogger {
      * failover.
      */
     @Test
-    public void testLocalRecoveryFull() throws Exception {
+    void testLocalRecoveryFull() throws Exception {
         testLocalRecoveryInternal("full");
     }
 
@@ -81,29 +82,28 @@ public class SchedulingITCase extends TestLogger {
      * regional failover.
      */
     @Test
-    public void testLocalRecoveryRegion() throws Exception {
+    void testLocalRecoveryRegion() throws Exception {
         testLocalRecoveryInternal("region");
     }
 
     private void testLocalRecoveryInternal(String failoverStrategyValue) throws Exception {
         final Configuration configuration = new Configuration();
-        configuration.setBoolean(CheckpointingOptions.LOCAL_RECOVERY, true);
+        configuration.set(StateRecoveryOptions.LOCAL_RECOVERY, true);
         configuration.setString(EXECUTION_FAILOVER_STRATEGY.key(), failoverStrategyValue);
 
         executeSchedulingTest(configuration);
     }
 
     private void executeSchedulingTest(Configuration configuration) throws Exception {
-        configuration.setString(RestOptions.BIND_PORT, "0");
-
         final long slotIdleTimeout = 50L;
-        configuration.setLong(JobManagerOptions.SLOT_IDLE_TIMEOUT, slotIdleTimeout);
+        configuration.set(JobManagerOptions.SLOT_IDLE_TIMEOUT, Duration.ofMillis(slotIdleTimeout));
 
         configuration.set(TaskManagerOptions.TOTAL_FLINK_MEMORY, MemorySize.parse("1g"));
 
         final int parallelism = 4;
         final MiniClusterConfiguration miniClusterConfiguration =
                 new MiniClusterConfiguration.Builder()
+                        .withRandomPorts()
                         .setConfiguration(configuration)
                         .setNumTaskManagers(parallelism)
                         .setNumSlotsPerTaskManager(1)
@@ -123,12 +123,12 @@ public class SchedulingITCase extends TestLogger {
 
             JobResult jobResult = resultFuture.get();
 
-            assertThat(jobResult.getSerializedThrowable().isPresent(), is(false));
+            assertThat(jobResult.getSerializedThrowable()).isEmpty();
         }
     }
 
     @Nonnull
-    private JobGraph createJobGraph(long delay, int parallelism) throws IOException {
+    private JobGraph createJobGraph(long delay, int parallelism) {
         SlotSharingGroup slotSharingGroup = new SlotSharingGroup();
 
         final JobVertex source = new JobVertex("source");
@@ -141,15 +141,14 @@ public class SchedulingITCase extends TestLogger {
         sink.setParallelism(parallelism);
         sink.setSlotSharingGroup(slotSharingGroup);
 
-        sink.connectNewDataSetAsInput(
-                source, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-        JobGraph jobGraph = new JobGraph(source, sink);
+        connectNewDataSetAsInput(
+                sink, source, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-        jobGraph.setScheduleMode(ScheduleMode.EAGER);
-
-        ExecutionConfig executionConfig = new ExecutionConfig();
-        executionConfig.setRestartStrategy(RestartStrategies.fixedDelayRestart(1, delay));
-        jobGraph.setExecutionConfig(executionConfig);
+        JobGraph jobGraph =
+                JobGraphBuilder.newStreamingJobGraphBuilder()
+                        .addJobVertices(Arrays.asList(source, sink))
+                        .build();
+        RestartStrategyUtils.configureFixedDelayRestartStrategy(jobGraph, 1, delay);
 
         return jobGraph;
     }

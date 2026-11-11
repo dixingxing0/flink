@@ -43,6 +43,8 @@ interface ChannelStateSerializer {
 
     void writeData(DataOutputStream stream, Buffer... flinkBuffers) throws IOException;
 
+    void writeData(DataOutputStream stream, InputStream input, int length) throws IOException;
+
     void readHeader(InputStream stream) throws IOException;
 
     int readLength(InputStream stream) throws IOException;
@@ -57,11 +59,12 @@ interface ChannelStateSerializer {
 /** Wrapper around various buffers to receive channel state data. */
 @Internal
 @NotThreadSafe
-interface ChannelStateByteBuffer {
+interface ChannelStateByteBuffer extends AutoCloseable {
 
     boolean isWritable();
 
-    void recycle();
+    @Override
+    void close();
 
     /**
      * Read up to <code>bytesToRead</code> bytes into this buffer from the given {@link
@@ -82,7 +85,7 @@ interface ChannelStateByteBuffer {
             }
 
             @Override
-            public void recycle() {
+            public void close() {
                 buffer.recycleBuffer();
             }
 
@@ -102,8 +105,8 @@ interface ChannelStateByteBuffer {
             }
 
             @Override
-            public void recycle() {
-                bufferBuilder.recycle();
+            public void close() {
+                bufferBuilder.close();
             }
 
             @Override
@@ -135,7 +138,7 @@ interface ChannelStateByteBuffer {
             }
 
             @Override
-            public void recycle() {}
+            public void close() {}
 
             @Override
             public int writeBytes(InputStream input, int bytesToRead) throws IOException {
@@ -161,6 +164,18 @@ class ChannelStateSerializerImpl implements ChannelStateSerializer {
         for (Buffer buffer : flinkBuffers) {
             ByteBuf nettyByteBuf = buffer.asByteBuf();
             nettyByteBuf.getBytes(nettyByteBuf.readerIndex(), stream, nettyByteBuf.readableBytes());
+        }
+    }
+
+    @Override
+    public void writeData(DataOutputStream stream, InputStream input, int length)
+            throws IOException {
+        Preconditions.checkArgument(length >= 0, "negative state size");
+        stream.writeInt(length);
+        long copied = input.transferTo(stream);
+        if (copied != length) {
+            throw new java.io.EOFException(
+                    "Unexpected EOF: expected " + length + " bytes of segment body, got " + copied);
         }
     }
 

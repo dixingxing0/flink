@@ -20,14 +20,15 @@ package org.apache.flink.table.types.extraction;
 
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
+import org.apache.flink.api.java.tuple.Tuple12;
 import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.api.java.typeutils.GenericTypeInfo;
 import org.apache.flink.table.annotation.DataTypeHint;
 import org.apache.flink.table.annotation.HintFlag;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.dataview.ListView;
 import org.apache.flink.table.api.dataview.MapView;
+import org.apache.flink.table.api.dataview.ValueView;
 import org.apache.flink.table.catalog.DataTypeFactory;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.functions.TableFunction;
@@ -40,19 +41,13 @@ import org.apache.flink.table.types.logical.IntType;
 import org.apache.flink.table.types.logical.MapType;
 import org.apache.flink.table.types.logical.StructuredType;
 import org.apache.flink.table.types.logical.StructuredType.StructuredAttribute;
-import org.apache.flink.table.types.logical.TypeInformationRawType;
 import org.apache.flink.table.types.logical.VarCharType;
 import org.apache.flink.table.types.utils.DataTypeFactoryMock;
+import org.apache.flink.types.ColumnList;
 import org.apache.flink.types.Row;
 
-import org.hamcrest.Matcher;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.ExpectedException;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameter;
-import org.junit.runners.Parameterized.Parameters;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import javax.annotation.Nullable;
 
@@ -65,26 +60,30 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
+import java.util.stream.Stream;
 
-import static org.apache.flink.core.testutils.FlinkMatchers.containsCause;
-import static org.hamcrest.CoreMatchers.equalTo;
-import static org.junit.Assert.assertThat;
+import static org.apache.flink.core.testutils.FlinkAssertions.anyCauseMatches;
+import static org.apache.flink.table.test.TableAssertions.assertThat;
+import static org.apache.flink.table.types.utils.DataTypeFactoryMock.dummyRaw;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link DataTypeExtractor}. */
-@RunWith(Parameterized.class)
 @SuppressWarnings("unused")
-public class DataTypeExtractorTest {
+class DataTypeExtractorTest {
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    @Parameters(name = "{index}: {0}")
-    public static List<TestSpec> testData() {
-        return Arrays.asList(
+    private static Stream<TestSpec> testData() {
+        return Stream.of(
                 // simple extraction of INT
                 TestSpec.forType(Integer.class).expectDataType(DataTypes.INT()),
 
                 // simple extraction of BYTES
                 TestSpec.forType(byte[].class).expectDataType(DataTypes.BYTES()),
+
+                // automatic extraction of UUID for Table/SQL
+                TestSpec.forType(java.util.UUID.class).expectDataType(DataTypes.UUID()),
 
                 // extraction from hint conversion class
                 TestSpec.forType(
@@ -217,11 +216,7 @@ public class DataTypeExtractorTest {
                                 },
                                 Object[][].class)
                         .lookupExpects(Object.class)
-                        .expectDataType(
-                                DataTypes.ARRAY(
-                                        DataTypes.ARRAY(
-                                                DataTypes.RAW(
-                                                        new GenericTypeInfo<>(Object.class))))),
+                        .expectDataType(DataTypes.ARRAY(DataTypes.ARRAY(dummyRaw(Object.class)))),
                 TestSpec.forType(
                                 "RAW with custom serializer",
                                 new DataTypeHintMock() {
@@ -254,7 +249,7 @@ public class DataTypeExtractorTest {
                                 },
                                 Object.class)
                         .lookupExpects(Integer.class)
-                        .expectDataType(DataTypes.RAW(new GenericTypeInfo<>(Integer.class))),
+                        .expectDataType(dummyRaw(Integer.class)),
                 TestSpec.forType(
                                 "RAW with more specific conversion class",
                                 new DataTypeHintMock() {
@@ -271,8 +266,7 @@ public class DataTypeExtractorTest {
                                 RawTypeSpecific.class)
                         .lookupExpects(RawTypeGeneric.class)
                         .expectDataType(
-                                DataTypes.RAW(new GenericTypeInfo<>(RawTypeGeneric.class))
-                                        .bridgedTo(RawTypeSpecific.class)),
+                                dummyRaw(RawTypeGeneric.class).bridgedTo(RawTypeSpecific.class)),
 
                 // MAP type with type variable magic
                 TestSpec.forGeneric(TableFunction.class, 0, TableFunctionWithMapLevel2.class)
@@ -388,6 +382,12 @@ public class DataTypeExtractorTest {
 
                 // method with generic return type
                 TestSpec.forMethodOutput(IntegerVarArg.class).expectDataType(DataTypes.INT()),
+                // method with parameter with a generic itself
+                TestSpec.forGenericMethodParameter(CompletableFutureVarArg.class, 0, 0)
+                        .expectDataType(DataTypes.BIGINT()),
+                // method with the future return type as a generic
+                TestSpec.forGenericMethodParameter(CompletableFutureGeneric.class, 0, 0)
+                        .expectDataType(DataTypes.BIGINT()),
                 TestSpec.forType(
                                 "Structured type with invalid constructor",
                                 SimplePojoWithInvalidConstructor.class)
@@ -429,9 +429,7 @@ public class DataTypeExtractorTest {
                                         DataTypes.FIELD(
                                                 "listView",
                                                 ListView.newListViewDataType(
-                                                        DataTypes.RAW(
-                                                                new GenericTypeInfo<>(
-                                                                        Object.class)))))),
+                                                        dummyRaw(Object.class))))),
                 TestSpec.forType(
                                 "Data view with custom extraction for list view",
                                 AccumulatorWithCustomListView.class)
@@ -453,20 +451,80 @@ public class DataTypeExtractorTest {
                                                         DataTypes.INT(), DataTypes.STRING())))),
                 TestSpec.forType("Invalid data view", AccumulatorWithInvalidView.class)
                         .expectErrorMessage(
-                                "Annotated list views should have a logical type of ARRAY."));
+                                "Annotated list views should have a logical type of ARRAY."),
+                TestSpec.forType(
+                                "Value view with default extraction",
+                                AccumulatorWithDefaultValueView.class)
+                        .expectDataType(
+                                DataTypes.STRUCTURED(
+                                        AccumulatorWithDefaultValueView.class,
+                                        DataTypes.FIELD(
+                                                "valueView",
+                                                ValueView.newValueViewDataType(DataTypes.INT())))),
+                TestSpec.forType(
+                                "Value view with custom extraction for atomic type",
+                                AccumulatorWithCustomValueView.class)
+                        .expectDataType(
+                                DataTypes.STRUCTURED(
+                                        AccumulatorWithCustomValueView.class,
+                                        DataTypes.FIELD(
+                                                "valueView",
+                                                ValueView.newValueViewDataType(DataTypes.INT())))),
+                TestSpec.forType(
+                                "Value view with custom extraction for composite type",
+                                AccumulatorWithRowValueView.class)
+                        .expectDataType(
+                                DataTypes.STRUCTURED(
+                                        AccumulatorWithRowValueView.class,
+                                        DataTypes.FIELD(
+                                                "valueView",
+                                                ValueView.newValueViewDataType(
+                                                        DataTypes.ROW(
+                                                                DataTypes.FIELD(
+                                                                        "s", DataTypes.STRING()),
+                                                                DataTypes.FIELD(
+                                                                        "i", DataTypes.INT())))))),
+                TestSpec.forGeneric(
+                                "Assigning constructor for tuples",
+                                TableFunction.class,
+                                0,
+                                Tuple12TableFunction.class)
+                        .expectDataType(
+                                DataTypes.STRUCTURED(
+                                        Tuple12.class,
+                                        DataTypes.FIELD("f0", DataTypes.STRING()),
+                                        DataTypes.FIELD("f1", DataTypes.STRING()),
+                                        DataTypes.FIELD("f2", DataTypes.STRING()),
+                                        DataTypes.FIELD("f3", DataTypes.STRING()),
+                                        DataTypes.FIELD("f4", DataTypes.STRING()),
+                                        DataTypes.FIELD("f5", DataTypes.STRING()),
+                                        DataTypes.FIELD("f6", DataTypes.STRING()),
+                                        DataTypes.FIELD("f7", DataTypes.STRING()),
+                                        DataTypes.FIELD("f8", DataTypes.STRING()),
+                                        DataTypes.FIELD("f9", DataTypes.STRING()),
+                                        DataTypes.FIELD("f10", DataTypes.STRING()),
+                                        DataTypes.FIELD("f11", DataTypes.INT()))),
+                TestSpec.forType(PojoWithUnderscore.class)
+                        .expectDataType(
+                                DataTypes.STRUCTURED(
+                                        PojoWithUnderscore.class,
+                                        DataTypes.FIELD("int_field", DataTypes.INT()),
+                                        DataTypes.FIELD("string_field", DataTypes.STRING()))),
+                TestSpec.forType(ColumnList.class).expectDataType(DataTypes.DESCRIPTOR()));
     }
 
-    @Parameter public TestSpec testSpec;
-
-    @Rule public ExpectedException thrown = ExpectedException.none();
-
-    @Test
-    public void testExtraction() {
+    @ParameterizedTest(name = "{index}: {0}")
+    @MethodSource("testData")
+    void testExtraction(TestSpec testSpec) {
         if (testSpec.expectedErrorMessage != null) {
-            thrown.expect(ValidationException.class);
-            thrown.expectCause(errorMatcher(testSpec));
+            assertThatThrownBy(() -> runExtraction(testSpec))
+                    .isInstanceOf(ValidationException.class)
+                    .satisfies(
+                            anyCauseMatches(
+                                    ValidationException.class, testSpec.expectedErrorMessage));
+        } else {
+            runExtraction(testSpec);
         }
-        runExtraction(testSpec);
     }
 
     // --------------------------------------------------------------------------------------------
@@ -484,7 +542,7 @@ public class DataTypeExtractorTest {
 
         private @Nullable DataType expectedDataType;
 
-        private @Nullable String expectedErrorMessage;
+        @Nullable String expectedErrorMessage;
 
         private TestSpec(
                 @Nullable String description, Function<DataTypeFactory, DataType> extractor) {
@@ -539,11 +597,26 @@ public class DataTypeExtractorTest {
             return forMethodParameter(null, clazz, paramPos);
         }
 
+        static TestSpec forGenericMethodParameter(
+                String description, Class<?> clazz, int paramPos, int genericPos) {
+            final Method method = clazz.getMethods()[0];
+            return new TestSpec(
+                    description,
+                    (lookup) ->
+                            DataTypeExtractor.extractFromGenericMethodParameter(
+                                    lookup, clazz, method, paramPos, genericPos));
+        }
+
+        static TestSpec forGenericMethodParameter(Class<?> clazz, int paramPos, int genericPos) {
+            return forGenericMethodParameter(null, clazz, paramPos, genericPos);
+        }
+
         static TestSpec forMethodOutput(String description, Class<?> clazz) {
             final Method method = clazz.getMethods()[0];
             return new TestSpec(
                     description,
-                    (lookup) -> DataTypeExtractor.extractFromMethodOutput(lookup, clazz, method));
+                    (lookup) ->
+                            DataTypeExtractor.extractFromMethodReturnType(lookup, clazz, method));
         }
 
         static TestSpec forMethodOutput(Class<?> clazz) {
@@ -555,7 +628,7 @@ public class DataTypeExtractorTest {
         }
 
         TestSpec lookupExpects(Class<?> lookupClass) {
-            typeFactory.dataType = Optional.of(DataTypes.RAW(new GenericTypeInfo<>(lookupClass)));
+            typeFactory.dataType = Optional.of(dummyRaw(lookupClass));
             typeFactory.expectedClass = Optional.of(lookupClass);
             return this;
         }
@@ -585,12 +658,8 @@ public class DataTypeExtractorTest {
     static void runExtraction(TestSpec testSpec) {
         final DataType dataType = testSpec.extractor.apply(testSpec.typeFactory);
         if (testSpec.expectedDataType != null) {
-            assertThat(dataType, equalTo(testSpec.expectedDataType));
+            assertThat(dataType).isEqualTo(testSpec.expectedDataType);
         }
-    }
-
-    static Matcher<Throwable> errorMatcher(TestSpec testSpec) {
-        return containsCause(new ValidationException(testSpec.expectedErrorMessage));
     }
 
     /** Testing data type shared with the Scala tests. */
@@ -601,8 +670,7 @@ public class DataTypeExtractorTest {
                         new StructuredAttribute("intField", new IntType(true)),
                         new StructuredAttribute("primitiveBooleanField", new BooleanType(false)),
                         new StructuredAttribute("primitiveIntField", new IntType(false)),
-                        new StructuredAttribute(
-                                "stringField", new VarCharType(VarCharType.MAX_LENGTH))));
+                        new StructuredAttribute("stringField", VarCharType.STRING_TYPE)));
         builder.setFinal(true);
         builder.setInstantiable(true);
         final StructuredType structuredType = builder.build();
@@ -623,16 +691,12 @@ public class DataTypeExtractorTest {
         builder.attributes(
                 Arrays.asList(
                         new StructuredAttribute(
-                                "mapField",
-                                new MapType(
-                                        new VarCharType(VarCharType.MAX_LENGTH), new IntType())),
+                                "mapField", new MapType(VarCharType.STRING_TYPE, new IntType())),
                         new StructuredAttribute(
                                 "simplePojoField",
                                 getSimplePojoDataType(simplePojoClass).getLogicalType()),
                         new StructuredAttribute(
-                                "someObject",
-                                new TypeInformationRawType<>(
-                                        new GenericTypeInfo<>(Object.class)))));
+                                "someObject", dummyRaw(Object.class).getLogicalType())));
         builder.setFinal(true);
         builder.setInstantiable(true);
         final StructuredType structuredType = builder.build();
@@ -641,7 +705,7 @@ public class DataTypeExtractorTest {
                 Arrays.asList(
                         DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()),
                         getSimplePojoDataType(simplePojoClass),
-                        DataTypes.RAW(new GenericTypeInfo<>(Object.class)));
+                        dummyRaw(Object.class));
 
         return new FieldsDataType(structuredType, complexPojoClass, fieldDataTypes);
     }
@@ -684,7 +748,7 @@ public class DataTypeExtractorTest {
         final StructuredType.Builder builder = StructuredType.newBuilder(Tuple2.class);
         builder.attributes(
                 Arrays.asList(
-                        new StructuredAttribute("f0", new VarCharType(VarCharType.MAX_LENGTH)),
+                        new StructuredAttribute("f0", VarCharType.STRING_TYPE),
                         new StructuredAttribute("f1", new BooleanType())));
         builder.setFinal(true);
         builder.setInstantiable(true);
@@ -704,16 +768,13 @@ public class DataTypeExtractorTest {
                         new StructuredAttribute("integer", new IntType()),
                         new StructuredAttribute(
                                 "reference",
-                                new TypeInformationRawType<>(
-                                        new GenericTypeInfo<>(PojoWithRawSelfReference.class)))));
+                                dummyRaw(PojoWithRawSelfReference.class).getLogicalType())));
         builder.setFinal(true);
         builder.setInstantiable(true);
         final StructuredType structuredType = builder.build();
 
         final List<DataType> fieldDataTypes =
-                Arrays.asList(
-                        DataTypes.INT(),
-                        DataTypes.RAW(new GenericTypeInfo<>(PojoWithRawSelfReference.class)));
+                Arrays.asList(DataTypes.INT(), dummyRaw(PojoWithRawSelfReference.class));
 
         return new FieldsDataType(structuredType, PojoWithRawSelfReference.class, fieldDataTypes);
     }
@@ -960,6 +1021,16 @@ public class DataTypeExtractorTest {
         // nothing to do
     }
 
+    public static class CompletableFutureVarArg extends VarArgMethod<CompletableFuture<Long>> {
+        // nothing to do
+    }
+
+    public static class CompletableFutureBase<T> {
+        public void eval(CompletableFuture<T> i, int arg) {}
+    }
+
+    public static class CompletableFutureGeneric extends CompletableFutureBase<Long> {}
+
     // --------------------------------------------------------------------------------------------
 
     private static class RawTypeGeneric {
@@ -1036,5 +1107,69 @@ public class DataTypeExtractorTest {
     public static class AccumulatorWithInvalidView {
         @DataTypeHint("INT")
         public ListView<?> listView;
+    }
+
+    /** Accumulator with default extraction for value view. */
+    public static class AccumulatorWithDefaultValueView {
+        public ValueView<Integer> valueView;
+    }
+
+    /** Accumulator with custom extraction for value view of an atomic type. */
+    public static class AccumulatorWithCustomValueView {
+        @DataTypeHint("INT")
+        public ValueView<?> valueView;
+    }
+
+    /** Accumulator with custom extraction for value view of a composite type. */
+    public static class AccumulatorWithRowValueView {
+        @DataTypeHint("ROW<s STRING, i INT>")
+        public ValueView<Row> valueView;
+    }
+
+    // --------------------------------------------------------------------------------------------
+
+    /** Table function that uses a big tuple with constructor defined field order. */
+    public static class Tuple12TableFunction
+            extends TableFunction<
+                    Tuple12<
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            Integer>> {
+        public void eval() {
+            // nothing to do
+        }
+    }
+
+    // --------------------------------------------------------------------------------------------
+
+    /** Lenient POJO detection for fields with underscores. */
+    public static class PojoWithUnderscore {
+        // CHECKSTYLE.OFF: MemberName
+        private final String string_field;
+        private final Integer int_field;
+
+        // CHECKSTYLE.ON: MemberName
+
+        public PojoWithUnderscore(Integer intField, String stringField) {
+            this.int_field = intField;
+            this.string_field = stringField;
+        }
+
+        public String getStringField() {
+            return string_field;
+        }
+
+        public Integer getIntField() {
+            return int_field;
+        }
     }
 }

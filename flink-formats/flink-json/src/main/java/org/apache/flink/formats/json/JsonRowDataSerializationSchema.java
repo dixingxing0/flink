@@ -20,10 +20,15 @@ package org.apache.flink.formats.json;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.serialization.SerializationSchema;
+import org.apache.flink.formats.common.TimestampFormat;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.util.jackson.JacksonMapperFactory;
 
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.DeserializationFeature;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.cfg.JsonNodeFeature;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.util.Objects;
@@ -35,7 +40,7 @@ import java.util.Objects;
  * <p>Serializes the input Flink object into a JSON string and converts it into <code>byte[]</code>.
  *
  * <p>Result <code>byte[]</code> messages can be deserialized using {@link
- * JsonRowDataDeserializationSchema}.
+ * JsonRowDataDeserializationSchema} or {@link JsonParserRowDataDeserializationSchema}.
  */
 @Internal
 public class JsonRowDataSerializationSchema implements SerializationSchema<RowData> {
@@ -48,7 +53,7 @@ public class JsonRowDataSerializationSchema implements SerializationSchema<RowDa
     private final RowDataToJsonConverters.RowDataToJsonConverter runtimeConverter;
 
     /** Object mapper that is used to create output JSON objects. */
-    private final ObjectMapper mapper = new ObjectMapper();
+    private transient ObjectMapper mapper;
 
     /** Reusable object node. */
     private transient ObjectNode node;
@@ -57,28 +62,53 @@ public class JsonRowDataSerializationSchema implements SerializationSchema<RowDa
     private final TimestampFormat timestampFormat;
 
     /** The handling mode when serializing null keys for map data. */
-    private final JsonOptions.MapNullKeyMode mapNullKeyMode;
+    private final JsonFormatOptions.MapNullKeyMode mapNullKeyMode;
 
-    /** The string literal when handling mode for map null key LITERAL. is */
+    /** The string literal when handling mode for map null key LITERAL. */
     private final String mapNullKeyLiteral;
+
+    /** Flag indicating whether to serialize all decimals as plain numbers. */
+    private final boolean encodeDecimalAsPlainNumber;
+
+    /** Flag indicating whether to ignore null fields. */
+    private final boolean ignoreNullFields;
 
     public JsonRowDataSerializationSchema(
             RowType rowType,
             TimestampFormat timestampFormat,
-            JsonOptions.MapNullKeyMode mapNullKeyMode,
-            String mapNullKeyLiteral) {
+            JsonFormatOptions.MapNullKeyMode mapNullKeyMode,
+            String mapNullKeyLiteral,
+            boolean encodeDecimalAsPlainNumber,
+            boolean ignoreNullFields) {
         this.rowType = rowType;
         this.timestampFormat = timestampFormat;
         this.mapNullKeyMode = mapNullKeyMode;
         this.mapNullKeyLiteral = mapNullKeyLiteral;
+        this.encodeDecimalAsPlainNumber = encodeDecimalAsPlainNumber;
+        this.ignoreNullFields = ignoreNullFields;
         this.runtimeConverter =
-                new RowDataToJsonConverters(timestampFormat, mapNullKeyMode, mapNullKeyLiteral)
+                new RowDataToJsonConverters(
+                                timestampFormat,
+                                mapNullKeyMode,
+                                mapNullKeyLiteral,
+                                ignoreNullFields)
                         .createConverter(rowType);
     }
 
     @Override
+    public void open(InitializationContext context) throws Exception {
+        mapper =
+                JacksonMapperFactory.createObjectMapper()
+                        .configure(
+                                JsonGenerator.Feature.WRITE_BIGDECIMAL_AS_PLAIN,
+                                encodeDecimalAsPlainNumber)
+                        .configure(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS, true)
+                        .configure(JsonNodeFeature.STRIP_TRAILING_BIGDECIMAL_ZEROES, false);
+    }
+
+    @Override
     public byte[] serialize(RowData row) {
-        if (node == null) {
+        if (node == null || ignoreNullFields) {
             node = mapper.createObjectNode();
         }
 
@@ -86,7 +116,7 @@ public class JsonRowDataSerializationSchema implements SerializationSchema<RowDa
             runtimeConverter.convert(mapper, node, row);
             return mapper.writeValueAsBytes(node);
         } catch (Throwable t) {
-            throw new RuntimeException("Could not serialize row '" + row + "'. ", t);
+            throw new RuntimeException(String.format("Could not serialize row '%s'.", row), t);
         }
     }
 
@@ -102,11 +132,19 @@ public class JsonRowDataSerializationSchema implements SerializationSchema<RowDa
         return rowType.equals(that.rowType)
                 && timestampFormat.equals(that.timestampFormat)
                 && mapNullKeyMode.equals(that.mapNullKeyMode)
-                && mapNullKeyLiteral.equals(that.mapNullKeyLiteral);
+                && mapNullKeyLiteral.equals(that.mapNullKeyLiteral)
+                && encodeDecimalAsPlainNumber == that.encodeDecimalAsPlainNumber
+                && ignoreNullFields == that.ignoreNullFields;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(rowType, timestampFormat, mapNullKeyMode, mapNullKeyLiteral);
+        return Objects.hash(
+                rowType,
+                timestampFormat,
+                mapNullKeyMode,
+                mapNullKeyLiteral,
+                encodeDecimalAsPlainNumber,
+                ignoreNullFields);
     }
 }

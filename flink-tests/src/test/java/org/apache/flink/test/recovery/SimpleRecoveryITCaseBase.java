@@ -18,82 +18,101 @@
 
 package org.apache.flink.test.recovery;
 
-import org.apache.flink.api.common.JobExecutionResult;
+import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.functions.RichMapFunction;
-import org.apache.flink.api.common.restartstrategy.RestartStrategies;
-import org.apache.flink.api.java.ExecutionEnvironment;
-import org.apache.flink.api.java.io.LocalCollectionOutputFormat;
-import org.apache.flink.runtime.client.JobExecutionException;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.RestartStrategyOptions;
+import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.test.junit5.MiniClusterExtension;
+import org.apache.flink.util.CloseableIterator;
+import org.apache.flink.util.CollectionUtil;
+import org.apache.flink.util.TestLoggerExtension;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
-import java.util.ArrayList;
 import java.util.List;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * A series of tests (reusing one MiniCluster) where tasks fail (one or more time) and the recovery
  * should restart them to verify job completion.
  */
-@SuppressWarnings("serial")
-public abstract class SimpleRecoveryITCaseBase {
+@ExtendWith(TestLoggerExtension.class)
+abstract class SimpleRecoveryITCaseBase {
+
+    private static final int PARALLELISM = 4;
+    private static final int DATA_FROM = 1;
+    private static final int DATA_TO = PARALLELISM * PARALLELISM;
+    private static final int EXPECTED_SUM = (DATA_FROM + DATA_TO) * (DATA_TO - DATA_FROM + 1) / 2;
+
+    @RegisterExtension
+    private static final MiniClusterExtension MINI_CLUSTER_EXTENSION =
+            new MiniClusterExtension(
+                    new MiniClusterResourceConfiguration.Builder()
+                            .setNumberTaskManagers(4)
+                            .setNumberSlotsPerTaskManager(1)
+                            .build());
 
     @Test
-    public void testFailedRunThenSuccessfulRun() throws Exception {
-
+    void testFailedRunThenSuccessfulRun() throws Exception {
         try {
-            List<Long> resultCollection = new ArrayList<>();
-
             // attempt 1
             {
-                ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
+                StreamExecutionEnvironment env =
+                        StreamExecutionEnvironment.getExecutionEnvironment();
+                env.setRuntimeMode(RuntimeExecutionMode.BATCH);
 
-                env.setParallelism(4);
-                env.setRestartStrategy(RestartStrategies.noRestart());
-
-                env.generateSequence(1, 10)
-                        .rebalance()
-                        .map(new FailingMapper1<>())
-                        .reduce(Long::sum)
-                        .output(new LocalCollectionOutputFormat<>(resultCollection));
+                env.setParallelism(PARALLELISM);
+                Configuration configuration = new Configuration();
+                configuration.set(RestartStrategyOptions.RESTART_STRATEGY, "none");
+                env.configure(configuration, Thread.currentThread().getContextClassLoader());
 
                 try {
-                    JobExecutionResult res = env.execute();
-                    String msg =
-                            res == null
-                                    ? "null result"
-                                    : "result in " + res.getNetRuntime() + " ms";
-                    fail("The program should have failed, but returned " + msg);
-                } catch (JobExecutionException e) {
+                    CloseableIterator<Long> iterator =
+                            env.fromSequence(DATA_FROM, DATA_TO)
+                                    .rebalance()
+                                    .map(new FailingMapper1<>())
+                                    .fullWindowPartition()
+                                    .reduce(Long::sum)
+                                    .executeAndCollect();
+                    CollectionUtil.iteratorToList(iterator);
+                    fail("The program should have failed, but run successfully");
+                } catch (RuntimeException e) {
                     // expected
                 }
             }
 
             // attempt 2
             {
-                ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
+                StreamExecutionEnvironment env =
+                        StreamExecutionEnvironment.getExecutionEnvironment();
+                env.setRuntimeMode(RuntimeExecutionMode.BATCH);
 
-                env.setParallelism(4);
-                env.setRestartStrategy(RestartStrategies.noRestart());
+                env.setParallelism(PARALLELISM);
+                Configuration configuration = new Configuration();
+                configuration.set(RestartStrategyOptions.RESTART_STRATEGY, "none");
+                env.configure(configuration, Thread.currentThread().getContextClassLoader());
 
-                env.generateSequence(1, 10)
-                        .rebalance()
-                        .map(new FailingMapper1<>())
-                        .reduce((ReduceFunction<Long>) Long::sum)
-                        .output(new LocalCollectionOutputFormat<>(resultCollection));
-
-                executeAndRunAssertions(env);
+                List<Long> resultCollection =
+                        CollectionUtil.iteratorToList(
+                                env.fromSequence(DATA_FROM, DATA_TO)
+                                        .rebalance()
+                                        .map(new FailingMapper1<>())
+                                        .fullWindowPartition()
+                                        .reduce((ReduceFunction<Long>) Long::sum)
+                                        .executeAndCollect());
 
                 long sum = 0;
                 for (long l : resultCollection) {
                     sum += l;
                 }
-                assertEquals(55, sum);
+                assertThat(sum).isEqualTo(EXPECTED_SUM);
             }
 
         } finally {
@@ -101,68 +120,56 @@ public abstract class SimpleRecoveryITCaseBase {
         }
     }
 
-    private void executeAndRunAssertions(ExecutionEnvironment env) throws Exception {
-        try {
-            JobExecutionResult result = env.execute();
-            assertTrue(result.getNetRuntime() >= 0);
-            assertNotNull(result.getAllAccumulatorResults());
-            assertTrue(result.getAllAccumulatorResults().isEmpty());
-        } catch (JobExecutionException e) {
-            throw new AssertionError("The program should have succeeded on the second run", e);
-        }
-    }
-
     @Test
-    public void testRestart() throws Exception {
+    void testRestart() throws Exception {
         try {
-            List<Long> resultCollection = new ArrayList<>();
+            StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+            env.setRuntimeMode(RuntimeExecutionMode.BATCH);
 
-            ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
-
-            env.setParallelism(4);
+            env.setParallelism(PARALLELISM);
             // the default restart strategy should be taken
 
-            env.generateSequence(1, 10)
-                    .rebalance()
-                    .map(new FailingMapper2<>())
-                    .reduce(Long::sum)
-                    .output(new LocalCollectionOutputFormat<>(resultCollection));
-
-            executeAndRunAssertions(env);
+            List<Long> resultCollection =
+                    CollectionUtil.iteratorToList(
+                            env.fromSequence(DATA_FROM, DATA_TO)
+                                    .rebalance()
+                                    .map(new FailingMapper2<>())
+                                    .fullWindowPartition()
+                                    .reduce(Long::sum)
+                                    .executeAndCollect());
 
             long sum = 0;
             for (long l : resultCollection) {
                 sum += l;
             }
-            assertEquals(55, sum);
+            assertThat(sum).isEqualTo(EXPECTED_SUM);
         } finally {
             FailingMapper2.failuresBeforeSuccess = 1;
         }
     }
 
     @Test
-    public void testRestartMultipleTimes() throws Exception {
+    void testRestartMultipleTimes() throws Exception {
         try {
-            List<Long> resultCollection = new ArrayList<>();
+            StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+            env.setRuntimeMode(RuntimeExecutionMode.BATCH);
 
-            ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
+            env.setParallelism(PARALLELISM);
 
-            env.setParallelism(4);
-            env.setRestartStrategy(RestartStrategies.fixedDelayRestart(5, 100));
-
-            env.generateSequence(1, 10)
-                    .rebalance()
-                    .map(new FailingMapper3<>())
-                    .reduce(Long::sum)
-                    .output(new LocalCollectionOutputFormat<>(resultCollection));
-
-            executeAndRunAssertions(env);
+            List<Long> resultCollection =
+                    CollectionUtil.iteratorToList(
+                            env.fromSequence(DATA_FROM, DATA_TO)
+                                    .rebalance()
+                                    .map(new FailingMapper3<>())
+                                    .fullWindowPartition()
+                                    .reduce(Long::sum)
+                                    .executeAndCollect());
 
             long sum = 0;
             for (long l : resultCollection) {
                 sum += l;
             }
-            assertEquals(55, sum);
+            assertThat(sum).isEqualTo(EXPECTED_SUM);
         } finally {
             FailingMapper3.failuresBeforeSuccess = 3;
         }
@@ -176,7 +183,8 @@ public abstract class SimpleRecoveryITCaseBase {
 
         @Override
         public T map(T value) throws Exception {
-            if (failuresBeforeSuccess > 0 && getRuntimeContext().getIndexOfThisSubtask() == 1) {
+            if (failuresBeforeSuccess > 0
+                    && getRuntimeContext().getTaskInfo().getIndexOfThisSubtask() == 0) {
                 failuresBeforeSuccess--;
                 throw new Exception("Test Failure");
             }
@@ -191,7 +199,8 @@ public abstract class SimpleRecoveryITCaseBase {
 
         @Override
         public T map(T value) throws Exception {
-            if (failuresBeforeSuccess > 0 && getRuntimeContext().getIndexOfThisSubtask() == 1) {
+            if (failuresBeforeSuccess > 0
+                    && getRuntimeContext().getTaskInfo().getIndexOfThisSubtask() == 1) {
                 failuresBeforeSuccess--;
                 throw new Exception("Test Failure");
             }
@@ -206,7 +215,8 @@ public abstract class SimpleRecoveryITCaseBase {
 
         @Override
         public T map(T value) throws Exception {
-            if (failuresBeforeSuccess > 0 && getRuntimeContext().getIndexOfThisSubtask() == 1) {
+            if (failuresBeforeSuccess > 0
+                    && getRuntimeContext().getTaskInfo().getIndexOfThisSubtask() == 1) {
                 failuresBeforeSuccess--;
                 throw new Exception("Test Failure");
             }

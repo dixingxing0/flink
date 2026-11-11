@@ -19,15 +19,25 @@
 package org.apache.flink.runtime.state;
 
 import org.apache.flink.api.common.state.CheckpointListener;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.checkpoint.CheckpointMetaData;
 import org.apache.flink.runtime.checkpoint.CheckpointMetrics;
+import org.apache.flink.runtime.checkpoint.InflightDataRescalingDescriptor;
+import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.runtime.checkpoint.PrioritizedOperatorSubtaskState;
+import org.apache.flink.runtime.checkpoint.SubTaskInitializationMetrics;
 import org.apache.flink.runtime.checkpoint.TaskStateSnapshot;
 import org.apache.flink.runtime.checkpoint.channel.SequentialChannelStateReader;
+import org.apache.flink.runtime.checkpoint.filemerging.FileMergingSnapshotManager;
 import org.apache.flink.runtime.jobgraph.OperatorID;
+import org.apache.flink.runtime.state.changelog.ChangelogStateHandle;
+import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
+import org.apache.flink.runtime.state.changelog.StateChangelogStorageView;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
+
+import java.util.Optional;
 
 /**
  * This interface provides methods to report and retrieve state for a task.
@@ -41,6 +51,8 @@ import javax.annotation.Nullable;
  * state of operator instances in the task for restore purposes.
  */
 public interface TaskStateManager extends CheckpointListener, AutoCloseable {
+
+    void reportInitializationMetrics(SubTaskInitializationMetrics subTaskInitializationMetrics);
 
     /**
      * Report the state snapshots for the operator instances running in the owning task.
@@ -56,6 +68,25 @@ public interface TaskStateManager extends CheckpointListener, AutoCloseable {
             @Nullable TaskStateSnapshot acknowledgedState,
             @Nullable TaskStateSnapshot localState);
 
+    InflightDataRescalingDescriptor getInputRescalingDescriptor();
+
+    InflightDataRescalingDescriptor getOutputRescalingDescriptor();
+
+    /**
+     * Report the stats for state snapshots for an aborted checkpoint.
+     *
+     * @param checkpointMetaData meta data from the checkpoint request.
+     * @param checkpointMetrics task level metrics for the checkpoint.
+     */
+    void reportIncompleteTaskStateSnapshots(
+            CheckpointMetaData checkpointMetaData, CheckpointMetrics checkpointMetrics);
+
+    /** Whether all the operators of the task are finished on restore. */
+    boolean isTaskDeployedAsFinished();
+
+    /** Acquires the checkpoint id to restore from. */
+    Optional<Long> getRestoreCheckpointId();
+
     /**
      * Returns means to restore previously reported state of an operator running in the owning task.
      *
@@ -67,6 +98,15 @@ public interface TaskStateManager extends CheckpointListener, AutoCloseable {
     PrioritizedOperatorSubtaskState prioritizedOperatorState(OperatorID operatorID);
 
     /**
+     * Get the restored state from jobManager which belongs to an operator running in the owning
+     * task.
+     *
+     * @param operatorID the id of the operator for which we request state.
+     * @return the subtask restored state from jobManager.
+     */
+    Optional<OperatorSubtaskState> getSubtaskJobManagerRestoredState(OperatorID operatorID);
+
+    /**
      * Returns the configuration for local recovery, i.e. the base directories for all file-based
      * local state of the owning subtask and the general mode for local recovery.
      */
@@ -74,4 +114,18 @@ public interface TaskStateManager extends CheckpointListener, AutoCloseable {
     LocalRecoveryConfig createLocalRecoveryConfig();
 
     SequentialChannelStateReader getSequentialChannelStateReader();
+
+    /** Returns the configured state changelog storage for this task. */
+    @Nullable
+    StateChangelogStorage<?> getStateChangelogStorage();
+
+    /**
+     * Returns the state changelog storage view of given {@link ChangelogStateHandle} for this task.
+     */
+    @Nullable
+    StateChangelogStorageView<?> getStateChangelogStorageView(
+            Configuration configuration, ChangelogStateHandle changelogStateHandle);
+
+    @Nullable
+    FileMergingSnapshotManager getFileMergingSnapshotManager();
 }

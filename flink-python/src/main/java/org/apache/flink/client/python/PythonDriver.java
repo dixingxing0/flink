@@ -18,10 +18,10 @@
 
 package org.apache.flink.client.python;
 
-import org.apache.flink.api.java.ExecutionEnvironment;
 import org.apache.flink.client.program.ProgramAbortException;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.entrypoint.parser.CommandLineParser;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,6 +30,7 @@ import py4j.GatewayServer;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -68,11 +69,19 @@ public final class PythonDriver {
         // streaming and batch environments are always set at the same time, for streaming jobs we
         // can
         // also get its configuration from batch environments.
-        Configuration config = ExecutionEnvironment.getExecutionEnvironment().getConfiguration();
+        Configuration config =
+                Configuration.fromMap(
+                        StreamExecutionEnvironment.getExecutionEnvironment()
+                                .getConfiguration()
+                                .toMap());
+
+        config.addAll(pythonDriverOptions.getPythonDependencyConfig());
 
         // start gateway server
         GatewayServer gatewayServer = PythonEnvUtils.startGatewayServer();
         PythonEnvUtils.setGatewayServer(gatewayServer);
+
+        PythonEnvUtils.PythonProcessShutdownHook shutdownHook = null;
 
         // commands which will be exec in python progress.
         final List<String> commands = constructPythonCommands(pythonDriverOptions);
@@ -93,8 +102,15 @@ public final class PythonDriver {
                             pythonDriverOptions.getEntryPointScript().orElse(null),
                             tmpDir,
                             true);
+            shutdownHook =
+                    new PythonEnvUtils.PythonProcessShutdownHook(
+                            pythonProcess, gatewayServer, tmpDir);
+            Runtime.getRuntime().addShutdownHook(shutdownHook);
+
             BufferedReader in =
-                    new BufferedReader(new InputStreamReader(pythonProcess.getInputStream()));
+                    new BufferedReader(
+                            new InputStreamReader(
+                                    pythonProcess.getInputStream(), StandardCharsets.UTF_8));
             LOG.info(
                     "--------------------------- Python Process Started --------------------------");
             // print the python process output to stdout and log file
@@ -121,11 +137,13 @@ public final class PythonDriver {
             } else {
                 // throw ProgramAbortException if the caller is interested in the program plan,
                 // there is no harm to throw ProgramAbortException even if it is not the case.
-                throw new ProgramAbortException();
+                throw new ProgramAbortException(e);
             }
         } finally {
             PythonEnvUtils.setGatewayServer(null);
-            gatewayServer.shutdown();
+            if (shutdownHook != null && Runtime.getRuntime().removeShutdownHook(shutdownHook)) {
+                shutdownHook.run();
+            }
         }
     }
 
@@ -136,6 +154,8 @@ public final class PythonDriver {
      */
     static List<String> constructPythonCommands(final PythonDriverOptions pythonDriverOptions) {
         final List<String> commands = new ArrayList<>();
+        // disable output buffer
+        commands.add("-u");
         if (pythonDriverOptions.getEntryPointScript().isPresent()) {
             commands.add(pythonDriverOptions.getEntryPointScript().get());
         } else {

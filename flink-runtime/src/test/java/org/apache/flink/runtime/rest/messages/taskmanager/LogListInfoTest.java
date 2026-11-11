@@ -23,11 +23,15 @@ import org.apache.flink.runtime.rest.messages.LogInfo;
 import org.apache.flink.runtime.rest.messages.LogListInfo;
 import org.apache.flink.runtime.rest.messages.ResponseBody;
 import org.apache.flink.runtime.rest.messages.RestResponseMarshallingTestBase;
+import org.apache.flink.testutils.junit.extensions.parameterized.NoOpTestExtension;
+
+import org.junit.jupiter.api.extension.ExtendWith;
 
 import java.util.Arrays;
 
 /** Tests for (un)marshalling of {@link LogListInfo}. */
-public class LogListInfoTest extends RestResponseMarshallingTestBase {
+@ExtendWith(NoOpTestExtension.class)
+class LogListInfoTest extends RestResponseMarshallingTestBase {
 
     @Override
     protected Class getTestResponseClass() {
@@ -38,7 +42,7 @@ public class LogListInfoTest extends RestResponseMarshallingTestBase {
     protected ResponseBody getTestResponseInstance() throws Exception {
         return new LogListInfo(
                 Arrays.asList(
-                        new LogInfo("taskmanager.log", 0),
-                        new LogInfo("taskmanager.out", Integer.MAX_VALUE)));
+                        new LogInfo("taskmanager.log", 0, 1632844800000L),
+                        new LogInfo("taskmanager.out", Integer.MAX_VALUE, 1632844800000L)));
     }
 }

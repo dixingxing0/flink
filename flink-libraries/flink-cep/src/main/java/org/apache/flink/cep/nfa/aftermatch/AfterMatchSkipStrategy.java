@@ -103,6 +103,9 @@ public abstract class AfterMatchSkipStrategy implements Serializable {
             Collection<Map<String, List<EventId>>> matchedResult,
             SharedBufferAccessor<?> sharedBufferAccessor)
             throws Exception {
+        if (!isSkipStrategy()) {
+            return;
+        }
 
         EventId pruningId = getPruningId(matchedResult);
         if (pruningId != null) {
@@ -110,7 +113,9 @@ public abstract class AfterMatchSkipStrategy implements Serializable {
             for (ComputationState computationState : matchesToPrune) {
                 if (computationState.getStartEventID() != null
                         && shouldPrune(computationState.getStartEventID(), pruningId)) {
-                    sharedBufferAccessor.releaseNode(computationState.getPreviousBufferEntry());
+                    sharedBufferAccessor.releaseNode(
+                            computationState.getPreviousBufferEntry(),
+                            computationState.getVersion());
                     discardStates.add(computationState);
                 }
             }

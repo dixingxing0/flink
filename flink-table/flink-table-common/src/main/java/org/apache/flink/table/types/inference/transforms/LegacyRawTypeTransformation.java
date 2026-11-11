@@ -18,8 +18,10 @@
 
 package org.apache.flink.table.types.inference.transforms;
 
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.legacy.types.logical.TypeInformationRawType;
+import org.apache.flink.table.types.AtomicDataType;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.inference.TypeTransformation;
 import org.apache.flink.table.types.logical.LegacyTypeInformationType;
@@ -27,6 +29,7 @@ import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
 
 /** This type transformation transforms the LEGACY('RAW', ...) type to the RAW(..., ?) type. */
+@Internal
 public class LegacyRawTypeTransformation implements TypeTransformation {
 
     public static final TypeTransformation INSTANCE = new LegacyRawTypeTransformation();
@@ -38,8 +41,8 @@ public class LegacyRawTypeTransformation implements TypeTransformation {
                 && logicalType.getTypeRoot() == LogicalTypeRoot.RAW) {
             TypeInformation<?> typeInfo =
                     ((LegacyTypeInformationType<?>) logicalType).getTypeInformation();
-            DataType rawType = DataTypes.RAW(typeInfo).bridgedTo(typeInfo.getTypeClass());
-            return logicalType.isNullable() ? rawType : rawType.notNull();
+            DataType rawDataType = new AtomicDataType(new TypeInformationRawType<>(typeInfo));
+            return logicalType.isNullable() ? rawDataType : rawDataType.notNull();
         }
         return typeToTransform;
     }

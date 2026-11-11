@@ -26,6 +26,9 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 
+import static org.apache.flink.runtime.state.SnapshotExecutionType.ASYNCHRONOUS;
+import static org.apache.flink.runtime.state.SnapshotExecutionType.SYNCHRONOUS;
+
 /**
  * Builder class for {@link DefaultOperatorStateBackend} which handles all necessary initializations
  * and clean ups.
@@ -34,10 +37,13 @@ public class DefaultOperatorStateBackendBuilder
         implements StateBackendBuilder<DefaultOperatorStateBackend, BackendBuildingException> {
     /** The user code classloader. */
     @VisibleForTesting protected final ClassLoader userClassloader;
+
     /** The execution configuration. */
     @VisibleForTesting protected final ExecutionConfig executionConfig;
+
     /** Flag to de/activate asynchronous snapshots. */
     @VisibleForTesting protected final boolean asynchronousSnapshots;
+
     /** State handles for restore. */
     @VisibleForTesting protected final Collection<OperatorStateHandle> restoreStateHandles;
 
@@ -62,13 +68,15 @@ public class DefaultOperatorStateBackendBuilder
         Map<String, BackendWritableBroadcastState<?, ?>> registeredBroadcastStates =
                 new HashMap<>();
         CloseableRegistry cancelStreamRegistryForBackend = new CloseableRegistry();
-        AbstractSnapshotStrategy<OperatorStateHandle> snapshotStrategy =
+
+        final StreamCompressionDecorator compressionDecorator =
+                AbstractStateBackend.getCompressionDecorator(executionConfig);
+        DefaultOperatorStateBackendSnapshotStrategy snapshotStrategy =
                 new DefaultOperatorStateBackendSnapshotStrategy(
                         userClassloader,
-                        asynchronousSnapshots,
                         registeredOperatorStates,
                         registeredBroadcastStates,
-                        cancelStreamRegistryForBackend);
+                        compressionDecorator);
         OperatorStateRestoreOperation restoreOperation =
                 new OperatorStateRestoreOperation(
                         cancelStreamRegistry,
@@ -90,6 +98,10 @@ public class DefaultOperatorStateBackendBuilder
                 registeredBroadcastStates,
                 new HashMap<>(),
                 new HashMap<>(),
-                snapshotStrategy);
+                new SnapshotStrategyRunner<>(
+                        "DefaultOperatorStateBackend snapshot",
+                        snapshotStrategy,
+                        cancelStreamRegistryForBackend,
+                        asynchronousSnapshots ? ASYNCHRONOUS : SYNCHRONOUS));
     }
 }

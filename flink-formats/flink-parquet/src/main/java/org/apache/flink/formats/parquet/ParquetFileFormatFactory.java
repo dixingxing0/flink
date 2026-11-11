@@ -18,30 +18,36 @@
 
 package org.apache.flink.formats.parquet;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.serialization.BulkWriter;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.connector.file.src.FileSourceSplit;
 import org.apache.flink.connector.file.src.reader.BulkFormat;
+import org.apache.flink.connector.file.table.factories.BulkReaderFormatFactory;
+import org.apache.flink.connector.file.table.factories.BulkWriterFormatFactory;
+import org.apache.flink.connector.file.table.format.BulkDecodingFormat;
+import org.apache.flink.core.fs.Path;
 import org.apache.flink.formats.parquet.row.ParquetRowDataBuilder;
+import org.apache.flink.formats.parquet.utils.ParquetFormatStatisticsReportUtil;
 import org.apache.flink.table.connector.ChangelogMode;
-import org.apache.flink.table.connector.format.BulkDecodingFormat;
+import org.apache.flink.table.connector.Projection;
 import org.apache.flink.table.connector.format.EncodingFormat;
+import org.apache.flink.table.connector.format.FileBasedStatisticsReportableInputFormat;
+import org.apache.flink.table.connector.format.ProjectableDecodingFormat;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.data.RowData;
-import org.apache.flink.table.data.vector.VectorizedColumnBatch;
-import org.apache.flink.table.factories.BulkReaderFormatFactory;
-import org.apache.flink.table.factories.BulkWriterFormatFactory;
 import org.apache.flink.table.factories.DynamicTableFactory;
-import org.apache.flink.table.filesystem.FileSystemOptions;
-import org.apache.flink.table.filesystem.PartitionFieldExtractor;
+import org.apache.flink.table.plan.stats.TableStats;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
 
 import org.apache.hadoop.conf.Configuration;
 
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 
@@ -61,34 +67,31 @@ public class ParquetFileFormatFactory implements BulkReaderFormatFactory, BulkWr
                                     + " time and LocalDateTime. Hive 0.x/1.x/2.x use local timezone. But Hive 3.x"
                                     + " use UTC timezone");
 
+    public static final ConfigOption<String> TIMESTAMP_TIME_UNIT =
+            key("timestamp.time.unit")
+                    .stringType()
+                    .defaultValue("micros")
+                    .withDescription(
+                            "Store parquet int64/LogicalTypes timestamps in this time unit, value is nanos/micros/millis");
+
+    public static final ConfigOption<Boolean> WRITE_INT64_TIMESTAMP =
+            key("write.int64.timestamp")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Write parquet timestamp as int64/LogicalTypes instead of int96/OriginalTypes. "
+                                    + "Note: Timestamp will be time zone agnostic (NEVER converted to a different time zone).");
+
+    public static final ConfigOption<Integer> BATCH_SIZE =
+            key("batch-size")
+                    .intType()
+                    .defaultValue(2048)
+                    .withDescription("Determine the batch size when reading parquet files.");
+
     @Override
     public BulkDecodingFormat<RowData> createDecodingFormat(
             DynamicTableFactory.Context context, ReadableConfig formatOptions) {
-        return new BulkDecodingFormat<RowData>() {
-            @Override
-            public BulkFormat<RowData, FileSourceSplit> createRuntimeDecoder(
-                    DynamicTableSource.Context sourceContext, DataType producedDataType) {
-                String defaultPartName =
-                        context.getCatalogTable()
-                                .getOptions()
-                                .getOrDefault(
-                                        FileSystemOptions.PARTITION_DEFAULT_NAME.key(),
-                                        FileSystemOptions.PARTITION_DEFAULT_NAME.defaultValue());
-                return ParquetColumnarRowInputFormat.createPartitionedFormat(
-                        getParquetConfiguration(formatOptions),
-                        (RowType) producedDataType.getLogicalType(),
-                        context.getCatalogTable().getPartitionKeys(),
-                        PartitionFieldExtractor.forFileSystem(defaultPartName),
-                        VectorizedColumnBatch.DEFAULT_SIZE,
-                        formatOptions.get(UTC_TIMEZONE),
-                        true);
-            }
-
-            @Override
-            public ChangelogMode getChangelogMode() {
-                return ChangelogMode.insertOnly();
-            }
-        };
+        return new ParquetBulkDecodingFormat(formatOptions);
     }
 
     @Override
@@ -132,5 +135,52 @@ public class ParquetFileFormatFactory implements BulkReaderFormatFactory, BulkWr
     @Override
     public Set<ConfigOption<?>> optionalOptions() {
         return new HashSet<>();
+    }
+
+    /**
+     * ParquetBulkDecodingFormat which implements {@link FileBasedStatisticsReportableInputFormat}.
+     */
+    @VisibleForTesting
+    public static class ParquetBulkDecodingFormat
+            implements ProjectableDecodingFormat<BulkFormat<RowData, FileSourceSplit>>,
+                    BulkDecodingFormat<RowData>,
+                    FileBasedStatisticsReportableInputFormat {
+
+        private final ReadableConfig formatOptions;
+
+        public ParquetBulkDecodingFormat(ReadableConfig formatOptions) {
+            this.formatOptions = formatOptions;
+        }
+
+        @Override
+        public BulkFormat<RowData, FileSourceSplit> createRuntimeDecoder(
+                DynamicTableSource.Context sourceContext,
+                DataType producedDataType,
+                int[][] projections) {
+
+            return ParquetColumnarRowInputFormat.createPartitionedFormat(
+                    getParquetConfiguration(formatOptions),
+                    (RowType) Projection.of(projections).project(producedDataType).getLogicalType(),
+                    sourceContext.createTypeInformation(producedDataType),
+                    Collections.emptyList(),
+                    null,
+                    formatOptions.get(BATCH_SIZE),
+                    formatOptions.get(UTC_TIMEZONE),
+                    true);
+        }
+
+        @Override
+        public ChangelogMode getChangelogMode() {
+            return ChangelogMode.insertOnly();
+        }
+
+        @Override
+        public TableStats reportStatistics(List<Path> files, DataType producedDataType) {
+            return ParquetFormatStatisticsReportUtil.getTableStatistics(
+                    files,
+                    producedDataType,
+                    getParquetConfiguration(formatOptions),
+                    formatOptions.get(UTC_TIMEZONE));
+        }
     }
 }

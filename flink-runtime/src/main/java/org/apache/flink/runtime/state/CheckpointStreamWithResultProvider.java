@@ -48,7 +48,7 @@ public interface CheckpointStreamWithResultProvider extends Closeable {
 
     /** Returns the encapsulated output stream. */
     @Nonnull
-    CheckpointStreamFactory.CheckpointStateOutputStream getCheckpointOutputStream();
+    CheckpointStateOutputStream getCheckpointOutputStream();
 
     @Override
     default void close() throws IOException {
@@ -61,10 +61,9 @@ public interface CheckpointStreamWithResultProvider extends Closeable {
      */
     class PrimaryStreamOnly implements CheckpointStreamWithResultProvider {
 
-        @Nonnull private final CheckpointStreamFactory.CheckpointStateOutputStream outputStream;
+        @Nonnull private final CheckpointStateOutputStream outputStream;
 
-        public PrimaryStreamOnly(
-                @Nonnull CheckpointStreamFactory.CheckpointStateOutputStream outputStream) {
+        public PrimaryStreamOnly(@Nonnull CheckpointStateOutputStream outputStream) {
             this.outputStream = outputStream;
         }
 
@@ -77,7 +76,7 @@ public interface CheckpointStreamWithResultProvider extends Closeable {
 
         @Nonnull
         @Override
-        public CheckpointStreamFactory.CheckpointStateOutputStream getCheckpointOutputStream() {
+        public CheckpointStateOutputStream getCheckpointOutputStream() {
             return outputStream;
         }
     }
@@ -93,8 +92,8 @@ public interface CheckpointStreamWithResultProvider extends Closeable {
         @Nonnull private final DuplicatingCheckpointOutputStream outputStream;
 
         public PrimaryAndSecondaryStream(
-                @Nonnull CheckpointStreamFactory.CheckpointStateOutputStream primaryOut,
-                CheckpointStreamFactory.CheckpointStateOutputStream secondaryOut)
+                @Nonnull CheckpointStateOutputStream primaryOut,
+                CheckpointStateOutputStream secondaryOut)
                 throws IOException {
             this(new DuplicatingCheckpointOutputStream(primaryOut, secondaryOut));
         }
@@ -154,7 +153,7 @@ public interface CheckpointStreamWithResultProvider extends Closeable {
             @Nonnull CheckpointStreamFactory primaryStreamFactory)
             throws IOException {
 
-        CheckpointStreamFactory.CheckpointStateOutputStream primaryOut =
+        CheckpointStateOutputStream primaryOut =
                 primaryStreamFactory.createCheckpointStateOutputStream(checkpointedStateScope);
 
         return new CheckpointStreamWithResultProvider.PrimaryStreamOnly(primaryOut);
@@ -165,10 +164,10 @@ public interface CheckpointStreamWithResultProvider extends Closeable {
             @Nonnegative long checkpointId,
             @Nonnull CheckpointedStateScope checkpointedStateScope,
             @Nonnull CheckpointStreamFactory primaryStreamFactory,
-            @Nonnull LocalRecoveryDirectoryProvider secondaryStreamDirProvider)
+            @Nonnull LocalSnapshotDirectoryProvider secondaryStreamDirProvider)
             throws IOException {
 
-        CheckpointStreamFactory.CheckpointStateOutputStream primaryOut =
+        CheckpointStateOutputStream primaryOut =
                 primaryStreamFactory.createCheckpointStateOutputStream(checkpointedStateScope);
 
         try {
@@ -179,7 +178,7 @@ public interface CheckpointStreamWithResultProvider extends Closeable {
                             String.valueOf(UUID.randomUUID()));
             Path outPath = new Path(outFile.toURI());
 
-            CheckpointStreamFactory.CheckpointStateOutputStream secondaryOut =
+            CheckpointStateOutputStream secondaryOut =
                     new FileBasedStateOutputStream(outPath.getFileSystem(), outPath);
 
             return new CheckpointStreamWithResultProvider.PrimaryAndSecondaryStream(
@@ -195,27 +194,39 @@ public interface CheckpointStreamWithResultProvider extends Closeable {
     }
 
     /**
+     * Factory method for a {@link KeyedStateHandle} to be used in {@link
+     * #toKeyedStateHandleSnapshotResult(SnapshotResult, KeyGroupRangeOffsets,
+     * KeyedStateHandleFactory)}.
+     */
+    @FunctionalInterface
+    interface KeyedStateHandleFactory {
+        KeyedStateHandle create(
+                KeyGroupRangeOffsets keyGroupRangeOffsets, StreamStateHandle streamStateHandle);
+    }
+
+    /**
      * Helper method that takes a {@link SnapshotResult<StreamStateHandle>} and a {@link
-     * KeyGroupRangeOffsets} and creates a {@link SnapshotResult<KeyGroupsStateHandle>} by combining
-     * the key groups offsets with all the present stream state handles.
+     * KeyGroupRangeOffsets} and creates a {@link SnapshotResult<KeyedStateHandle>} by combining the
+     * key groups offsets with all the present stream state handles.
      */
     @Nonnull
     static SnapshotResult<KeyedStateHandle> toKeyedStateHandleSnapshotResult(
             @Nonnull SnapshotResult<StreamStateHandle> snapshotResult,
-            @Nonnull KeyGroupRangeOffsets keyGroupRangeOffsets) {
+            @Nonnull KeyGroupRangeOffsets keyGroupRangeOffsets,
+            @Nonnull KeyedStateHandleFactory stateHandleFactory) {
 
         StreamStateHandle jobManagerOwnedSnapshot = snapshotResult.getJobManagerOwnedSnapshot();
 
         if (jobManagerOwnedSnapshot != null) {
 
             KeyedStateHandle jmKeyedState =
-                    new KeyGroupsStateHandle(keyGroupRangeOffsets, jobManagerOwnedSnapshot);
+                    stateHandleFactory.create(keyGroupRangeOffsets, jobManagerOwnedSnapshot);
             StreamStateHandle taskLocalSnapshot = snapshotResult.getTaskLocalSnapshot();
 
             if (taskLocalSnapshot != null) {
 
                 KeyedStateHandle localKeyedState =
-                        new KeyGroupsStateHandle(keyGroupRangeOffsets, taskLocalSnapshot);
+                        stateHandleFactory.create(keyGroupRangeOffsets, taskLocalSnapshot);
                 return SnapshotResult.withLocalState(jmKeyedState, localKeyedState);
             } else {
 

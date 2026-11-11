@@ -17,12 +17,13 @@
  */
 @import "theme";
 
-flink-monaco-editor {
-  height: calc(~"100vh - 310px");
-}
-
 :host {
   position: relative;
-  display: block;
+  flex: 1;
   border: 1px solid @border-color-split;
+
+  nz-code-editor {
+    position: absolute;
+    inset: 0;
+  }
 }

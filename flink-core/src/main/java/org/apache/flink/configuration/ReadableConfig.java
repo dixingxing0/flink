@@ -18,8 +18,10 @@
 
 package org.apache.flink.configuration;
 
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.PublicEvolving;
 
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -30,7 +32,7 @@ import java.util.Optional;
 public interface ReadableConfig {
 
     /**
-     * Reads a value using the metada included in {@link ConfigOption}. Returns the {@link
+     * Reads a value using the metadata included in {@link ConfigOption}. Returns the {@link
      * ConfigOption#defaultValue()} if value key not present in the configuration.
      *
      * @param option metadata of the option to read
@@ -41,7 +43,7 @@ public interface ReadableConfig {
     <T> T get(ConfigOption<T> option);
 
     /**
-     * Reads a value using the metada included in {@link ConfigOption}. In contrast to {@link
+     * Reads a value using the metadata included in {@link ConfigOption}. In contrast to {@link
      * #get(ConfigOption)} returns {@link Optional#empty()} if value not present.
      *
      * @param option metadata of the option to read
@@ -50,4 +52,13 @@ public interface ReadableConfig {
      * @see #get(ConfigOption)
      */
     <T> Optional<T> getOptional(ConfigOption<T> option);
+
+    /**
+     * Converts the configuration items into a map of string key-value pairs.
+     *
+     * @return a map containing the configuration properties, where the keys are strings and the
+     *     values are the corresponding configuration values in string format.
+     */
+    @Internal
+    Map<String, String> toMap();
 }

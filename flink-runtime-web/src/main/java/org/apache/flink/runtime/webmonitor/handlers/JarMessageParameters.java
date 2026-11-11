@@ -18,6 +18,7 @@
 
 package org.apache.flink.runtime.webmonitor.handlers;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.runtime.rest.messages.MessageParameters;
 import org.apache.flink.runtime.rest.messages.MessagePathParameter;
 import org.apache.flink.runtime.rest.messages.MessageQueryParameter;
@@ -29,13 +30,12 @@ import java.util.Collections;
 /** Base class of {@link MessageParameters} for {@link JarRunHandler} and {@link JarPlanHandler}. */
 abstract class JarMessageParameters extends MessageParameters {
 
-    final JarIdPathParameter jarIdPathParameter = new JarIdPathParameter();
+    @VisibleForTesting
+    public final JarIdPathParameter jarIdPathParameter = new JarIdPathParameter();
 
     final EntryClassQueryParameter entryClassQueryParameter = new EntryClassQueryParameter();
 
     final ParallelismQueryParameter parallelismQueryParameter = new ParallelismQueryParameter();
-
-    final ProgramArgsQueryParameter programArgsQueryParameter = new ProgramArgsQueryParameter();
 
     final ProgramArgQueryParameter programArgQueryParameter = new ProgramArgQueryParameter();
 
@@ -48,7 +48,6 @@ abstract class JarMessageParameters extends MessageParameters {
     public Collection<MessageQueryParameter<?>> getQueryParameters() {
         return Collections.unmodifiableList(
                 Arrays.asList(
-                        programArgsQueryParameter,
                         programArgQueryParameter,
                         entryClassQueryParameter,
                         parallelismQueryParameter));

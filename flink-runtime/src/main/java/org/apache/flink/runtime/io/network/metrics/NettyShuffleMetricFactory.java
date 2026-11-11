@@ -18,29 +18,18 @@
 
 package org.apache.flink.runtime.io.network.metrics;
 
+import org.apache.flink.metrics.Gauge;
 import org.apache.flink.metrics.MetricGroup;
-import org.apache.flink.runtime.io.network.api.writer.ResultPartitionWriter;
+import org.apache.flink.metrics.View;
 import org.apache.flink.runtime.io.network.buffer.NetworkBufferPool;
 import org.apache.flink.runtime.io.network.partition.ResultPartition;
-import org.apache.flink.runtime.io.network.partition.consumer.InputGate;
 import org.apache.flink.runtime.io.network.partition.consumer.SingleInputGate;
-
-import java.util.Arrays;
+import org.apache.flink.runtime.metrics.MetricNames;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /** Factory for netty shuffle service metrics. */
 public class NettyShuffleMetricFactory {
-
-    // deprecated metric groups
-
-    @SuppressWarnings("DeprecatedIsStillUsed")
-    @Deprecated
-    private static final String METRIC_GROUP_NETWORK_DEPRECATED = "Network";
-
-    @SuppressWarnings("DeprecatedIsStillUsed")
-    @Deprecated
-    private static final String METRIC_GROUP_BUFFERS_DEPRECATED = "buffers";
 
     // shuffle environment level metrics: Shuffle.Netty.*
 
@@ -53,6 +42,8 @@ public class NettyShuffleMetricFactory {
     private static final String METRIC_USED_MEMORY_SEGMENT = "UsedMemorySegments";
     private static final String METRIC_USED_MEMORY = "UsedMemory";
 
+    private static final String METRIC_REQUESTED_MEMORY_USAGE = "RequestedMemoryUsage";
+
     // task level metric group structure: Shuffle.Netty.<Input|Output>.Buffers
 
     private static final String METRIC_GROUP_SHUFFLE = "Shuffle";
@@ -64,11 +55,13 @@ public class NettyShuffleMetricFactory {
     // task level output metrics: Shuffle.Netty.Output.*
 
     private static final String METRIC_OUTPUT_QUEUE_LENGTH = "outputQueueLength";
+    private static final String METRIC_OUTPUT_QUEUE_SIZE = "outputQueueSize";
     private static final String METRIC_OUTPUT_POOL_USAGE = "outPoolUsage";
 
     // task level input metrics: Shuffle.Netty.Input.*
 
     private static final String METRIC_INPUT_QUEUE_LENGTH = "inputQueueLength";
+    private static final String METRIC_INPUT_QUEUE_SIZE = "inputQueueSize";
     private static final String METRIC_INPUT_POOL_USAGE = "inPoolUsage";
     private static final String METRIC_INPUT_FLOATING_BUFFERS_USAGE = "inputFloatingBuffersUsage";
     private static final String METRIC_INPUT_EXCLUSIVE_BUFFERS_USAGE = "inputExclusiveBuffersUsage";
@@ -80,21 +73,7 @@ public class NettyShuffleMetricFactory {
         checkNotNull(metricGroup);
         checkNotNull(networkBufferPool);
 
-        //noinspection deprecation
-        internalRegisterDeprecatedNetworkMetrics(metricGroup, networkBufferPool);
         internalRegisterShuffleMetrics(metricGroup, networkBufferPool);
-    }
-
-    @Deprecated
-    private static void internalRegisterDeprecatedNetworkMetrics(
-            MetricGroup parentMetricGroup, NetworkBufferPool networkBufferPool) {
-        MetricGroup networkGroup = parentMetricGroup.addGroup(METRIC_GROUP_NETWORK_DEPRECATED);
-
-        networkGroup.gauge(
-                METRIC_TOTAL_MEMORY_SEGMENT, networkBufferPool::getTotalNumberOfMemorySegments);
-        networkGroup.gauge(
-                METRIC_AVAILABLE_MEMORY_SEGMENT,
-                networkBufferPool::getNumberOfAvailableMemorySegments);
     }
 
     private static void internalRegisterShuffleMetrics(
@@ -114,47 +93,13 @@ public class NettyShuffleMetricFactory {
         networkGroup.gauge(
                 METRIC_USED_MEMORY_SEGMENT, networkBufferPool::getNumberOfUsedMemorySegments);
         networkGroup.gauge(METRIC_USED_MEMORY, networkBufferPool::getUsedMemory);
+
+        networkGroup.gauge(
+                METRIC_REQUESTED_MEMORY_USAGE, new RequestedMemoryUsageMetric(networkBufferPool));
     }
 
     public static MetricGroup createShuffleIOOwnerMetricGroup(MetricGroup parentGroup) {
         return parentGroup.addGroup(METRIC_GROUP_SHUFFLE).addGroup(METRIC_GROUP_NETTY);
-    }
-
-    /**
-     * Registers legacy network metric groups before shuffle service refactoring.
-     *
-     * <p>Registers legacy metric groups if shuffle service implementation is original default one.
-     *
-     * @deprecated should be removed in future
-     */
-    @SuppressWarnings("DeprecatedIsStillUsed")
-    @Deprecated
-    public static void registerLegacyNetworkMetrics(
-            boolean isDetailedMetrics,
-            MetricGroup metricGroup,
-            ResultPartitionWriter[] producedPartitions,
-            InputGate[] inputGates) {
-        checkNotNull(metricGroup);
-        checkNotNull(producedPartitions);
-        checkNotNull(inputGates);
-
-        // add metrics for buffers
-        final MetricGroup buffersGroup = metricGroup.addGroup(METRIC_GROUP_BUFFERS_DEPRECATED);
-
-        // similar to MetricUtils.instantiateNetworkMetrics() but inside this IOMetricGroup
-        // (metricGroup)
-        final MetricGroup networkGroup = metricGroup.addGroup(METRIC_GROUP_NETWORK_DEPRECATED);
-        final MetricGroup outputGroup = networkGroup.addGroup(METRIC_GROUP_OUTPUT);
-        final MetricGroup inputGroup = networkGroup.addGroup(METRIC_GROUP_INPUT);
-
-        ResultPartition[] resultPartitions =
-                Arrays.copyOf(
-                        producedPartitions, producedPartitions.length, ResultPartition[].class);
-        registerOutputMetrics(isDetailedMetrics, outputGroup, buffersGroup, resultPartitions);
-
-        SingleInputGate[] singleInputGates =
-                Arrays.copyOf(inputGates, inputGates.length, SingleInputGate[].class);
-        registerInputMetrics(isDetailedMetrics, inputGroup, buffersGroup, singleInputGates);
     }
 
     public static void registerOutputMetrics(
@@ -177,6 +122,7 @@ public class NettyShuffleMetricFactory {
             ResultPartitionMetrics.registerQueueLengthMetrics(outputGroup, resultPartitions);
         }
         buffersGroup.gauge(METRIC_OUTPUT_QUEUE_LENGTH, new OutputBuffersGauge(resultPartitions));
+        buffersGroup.gauge(METRIC_OUTPUT_QUEUE_SIZE, new OutputBuffersSizeGauge(resultPartitions));
         buffersGroup.gauge(
                 METRIC_OUTPUT_POOL_USAGE, new OutputBufferPoolUsageGauge(resultPartitions));
     }
@@ -200,6 +146,7 @@ public class NettyShuffleMetricFactory {
         }
 
         buffersGroup.gauge(METRIC_INPUT_QUEUE_LENGTH, new InputBuffersGauge(inputGates));
+        buffersGroup.gauge(METRIC_INPUT_QUEUE_SIZE, new InputBuffersSizeGauge(inputGates));
 
         FloatingBuffersUsageGauge floatingBuffersUsageGauge =
                 new FloatingBuffersUsageGauge(inputGates);
@@ -211,5 +158,33 @@ public class NettyShuffleMetricFactory {
         buffersGroup.gauge(METRIC_INPUT_EXCLUSIVE_BUFFERS_USAGE, exclusiveBuffersUsageGauge);
         buffersGroup.gauge(METRIC_INPUT_FLOATING_BUFFERS_USAGE, floatingBuffersUsageGauge);
         buffersGroup.gauge(METRIC_INPUT_POOL_USAGE, creditBasedInputBuffersUsageGauge);
+    }
+
+    public static void registerDebloatingTaskMetrics(
+            SingleInputGate[] inputGates, MetricGroup taskGroup) {
+        taskGroup.gauge(
+                MetricNames.ESTIMATED_TIME_TO_CONSUME_BUFFERS, new TimeToConsumeGauge(inputGates));
+    }
+
+    /**
+     * This is a small hack. Instead of spawning a custom thread to monitor {@link
+     * NetworkBufferPool} usage, we are re-using {@link View#update()} method for this purpose.
+     */
+    private static class RequestedMemoryUsageMetric implements Gauge<Integer>, View {
+        private final NetworkBufferPool networkBufferPool;
+
+        public RequestedMemoryUsageMetric(NetworkBufferPool networkBufferPool) {
+            this.networkBufferPool = networkBufferPool;
+        }
+
+        @Override
+        public Integer getValue() {
+            return networkBufferPool.getEstimatedRequestedSegmentsUsage();
+        }
+
+        @Override
+        public void update() {
+            networkBufferPool.maybeLogUsageWarning();
+        }
     }
 }

@@ -18,7 +18,8 @@
 
 package org.apache.flink.table.catalog;
 
-import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.annotation.Internal;
+import org.apache.flink.table.legacy.api.TableSchema;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -28,6 +29,7 @@ import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /** An abstract catalog table. */
+@Internal
 public abstract class AbstractCatalogTable implements CatalogTable {
     // Schema of the table (column names and types)
     private final TableSchema tableSchema;
@@ -35,26 +37,26 @@ public abstract class AbstractCatalogTable implements CatalogTable {
     // partitioned
     private final List<String> partitionKeys;
     // Properties of the table
-    private final Map<String, String> properties;
+    private final Map<String, String> options;
     // Comment of the table
     private final String comment;
 
     public AbstractCatalogTable(
-            TableSchema tableSchema, Map<String, String> properties, String comment) {
-        this(tableSchema, new ArrayList<>(), properties, comment);
+            TableSchema tableSchema, Map<String, String> options, String comment) {
+        this(tableSchema, new ArrayList<>(), options, comment);
     }
 
     public AbstractCatalogTable(
             TableSchema tableSchema,
             List<String> partitionKeys,
-            Map<String, String> properties,
+            Map<String, String> options,
             String comment) {
         this.tableSchema = checkNotNull(tableSchema, "tableSchema cannot be null");
         this.partitionKeys = checkNotNull(partitionKeys, "partitionKeys cannot be null");
-        this.properties = checkNotNull(properties, "properties cannot be null");
+        this.options = checkNotNull(options, "options cannot be null");
 
         checkArgument(
-                properties.entrySet().stream()
+                options.entrySet().stream()
                         .allMatch(e -> e.getKey() != null && e.getValue() != null),
                 "properties cannot have null keys or values");
 
@@ -72,8 +74,8 @@ public abstract class AbstractCatalogTable implements CatalogTable {
     }
 
     @Override
-    public Map<String, String> getProperties() {
-        return properties;
+    public Map<String, String> getOptions() {
+        return options;
     }
 
     @Override
@@ -83,6 +85,6 @@ public abstract class AbstractCatalogTable implements CatalogTable {
 
     @Override
     public String getComment() {
-        return comment;
+        return comment != null ? comment : "";
     }
 }

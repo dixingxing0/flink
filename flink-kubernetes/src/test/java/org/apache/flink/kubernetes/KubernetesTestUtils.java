@@ -19,14 +19,19 @@
 package org.apache.flink.kubernetes;
 
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.YamlParserUtils;
+import org.apache.flink.kubernetes.kubeclient.parameters.KubernetesTaskManagerParameters;
+import org.apache.flink.runtime.clusterframework.ContaineredTaskManagerParameters;
+import org.apache.flink.runtime.clusterframework.TaskExecutorProcessUtils;
 
-import org.apache.flink.shaded.guava18.com.google.common.io.Files;
-
-import org.apache.commons.lang3.StringUtils;
+import org.apache.flink.shaded.guava33.com.google.common.io.Files;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 
 /** Utilities for the Kubernetes tests. */
 public class KubernetesTestUtils {
@@ -37,14 +42,39 @@ public class KubernetesTestUtils {
     }
 
     public static Configuration loadConfigurationFromString(String content) {
-        final Configuration configuration = new Configuration();
-        for (String line : content.split(System.lineSeparator())) {
-            final String[] splits = line.split(":");
-            if (splits.length >= 2) {
-                configuration.setString(
-                        splits[0].trim(), StringUtils.substringAfter(line, ":").trim());
-            }
-        }
-        return configuration;
+        Map<String, Object> map = YamlParserUtils.convertToObject(content, Map.class);
+        return Configuration.fromMap(flatten(map, ""));
+    }
+
+    private static Map<String, String> flatten(Map<String, Object> config, String keyPrefix) {
+        final Map<String, String> flattenedMap = new HashMap<>();
+
+        config.forEach(
+                (key, value) -> {
+                    String flattenedKey = keyPrefix + key;
+                    if (value instanceof Map) {
+                        Map<String, Object> e = (Map<String, Object>) value;
+                        flattenedMap.putAll(flatten(e, flattenedKey + "."));
+                    } else {
+                        flattenedMap.put(flattenedKey, YamlParserUtils.toYAMLString(value));
+                    }
+                });
+
+        return flattenedMap;
+    }
+
+    public static KubernetesTaskManagerParameters createTaskManagerParameters(
+            Configuration flinkConfig, String podName) {
+        final ContaineredTaskManagerParameters containeredTaskManagerParameters =
+                ContaineredTaskManagerParameters.create(
+                        flinkConfig, TaskExecutorProcessUtils.processSpecFromConfig(flinkConfig));
+        return new KubernetesTaskManagerParameters(
+                flinkConfig,
+                podName,
+                "",
+                "",
+                containeredTaskManagerParameters,
+                Collections.emptyMap(),
+                Collections.emptySet());
     }
 }

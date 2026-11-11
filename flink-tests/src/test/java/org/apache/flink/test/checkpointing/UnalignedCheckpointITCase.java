@@ -19,14 +19,17 @@
 
 package org.apache.flink.test.checkpointing;
 
-import org.apache.flink.api.common.functions.Partitioner;
+import org.apache.flink.api.common.JobExecutionResult;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.functions.RichFlatMapFunction;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
-import org.apache.flink.configuration.Configuration;
+import org.apache.flink.api.common.typeinfo.TypeHint;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
@@ -35,18 +38,29 @@ import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
-import org.apache.flink.streaming.api.functions.co.RichCoFlatMapFunction;
+import org.apache.flink.testutils.junit.extensions.parameterized.Parameter;
+import org.apache.flink.testutils.junit.extensions.parameterized.ParameterizedTestExtension;
+import org.apache.flink.testutils.junit.extensions.parameterized.Parameters;
 import org.apache.flink.util.Collector;
 
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
+import org.apache.commons.lang3.ArrayUtils;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.TestInfo;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
 
+import java.time.Duration;
 import java.util.Arrays;
-import java.util.BitSet;
+import java.util.Collections;
+import java.util.stream.Stream;
 
 import static org.apache.flink.api.common.eventtime.WatermarkStrategy.noWatermarks;
-import static org.apache.flink.shaded.guava18.com.google.common.collect.Iterables.getOnlyElement;
+import static org.apache.flink.shaded.guava33.com.google.common.collect.Iterables.getOnlyElement;
+import static org.apache.flink.test.checkpointing.UnalignedCheckpointTestBase.ChannelType.LOCAL;
+import static org.apache.flink.test.checkpointing.UnalignedCheckpointTestBase.ChannelType.MIXED;
+import static org.apache.flink.test.checkpointing.UnalignedCheckpointTestBase.ChannelType.REMOTE;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertAll;
 
 /**
  * Integration test for performing the unaligned checkpoint.
@@ -93,184 +107,221 @@ import static org.apache.flink.shaded.guava18.com.google.common.collect.Iterable
  *   <li>The number of successful checkpoints is indeed {@code >=n}.
  * </ul>
  */
-@RunWith(Parameterized.class)
-public class UnalignedCheckpointITCase extends UnalignedCheckpointTestBase {
+@ExtendWith(ParameterizedTestExtension.class)
+class UnalignedCheckpointITCase extends UnalignedCheckpointTestBase {
+    enum Topology implements DagCreator {
+        PIPELINE {
+            @Override
+            public void create(
+                    StreamExecutionEnvironment env,
+                    int minCheckpoints,
+                    boolean slotSharing,
+                    int expectedRestarts,
+                    long sourceSleepMs) {
+                final int parallelism = env.getParallelism();
+                final SingleOutputStreamOperator<Long> stream =
+                        env.fromSource(
+                                        new LongSource(
+                                                minCheckpoints,
+                                                parallelism,
+                                                expectedRestarts,
+                                                env.getCheckpointInterval(),
+                                                sourceSleepMs),
+                                        noWatermarks(),
+                                        "source")
+                                .slotSharingGroup(slotSharing ? "default" : "source")
+                                .disableChaining()
+                                .map(i -> checkHeader(i))
+                                .name("forward")
+                                .uid("forward")
+                                .slotSharingGroup(slotSharing ? "default" : "forward")
+                                .keyBy(i -> withoutHeader(i) % parallelism * parallelism)
+                                .process(new KeyedIdentityFunction())
+                                .name("keyed")
+                                .uid("keyed");
+                addFailingPipeline(minCheckpoints, slotSharing, stream);
+            }
+        },
 
-    @Parameterized.Parameters(name = "{0}")
-    public static Object[][] parameters() {
-        return new Object[][] {
-            new Object[] {
-                "non-parallel pipeline with local channels", createPipelineSettings(1, 1, true)
-            },
-            new Object[] {
-                "non-parallel pipeline with remote channels", createPipelineSettings(1, 1, false)
-            },
-            new Object[] {
-                "parallel pipeline with local channels, p = 5", createPipelineSettings(5, 5, true)
-            },
-            new Object[] {
-                "parallel pipeline with remote channels, p = 5", createPipelineSettings(5, 1, false)
-            },
-            new Object[] {
-                "parallel pipeline with mixed channels, p = 5", createPipelineSettings(5, 3, true)
-            },
-            new Object[] {
-                "parallel pipeline with mixed channels, p = 20",
-                createPipelineSettings(20, 10, true)
-            },
-            new Object[] {
-                "parallel pipeline with mixed channels, p = 20, timeout=1",
-                createPipelineSettings(20, 10, true, 1)
-            },
-            new Object[] {"Parallel cogroup, p = 5", createCogroupSettings(5)},
-            new Object[] {"Parallel cogroup, p = 10", createCogroupSettings(10)},
-            new Object[] {"Parallel union, p = 5", createUnionSettings(5)},
-            new Object[] {"Parallel union, p = 10", createUnionSettings(10)},
-        };
-    }
-
-    private static UnalignedSettings createPipelineSettings(
-            int parallelism, int slotsPerTaskManager, boolean slotSharing) {
-        return createPipelineSettings(parallelism, slotsPerTaskManager, slotSharing, 0);
-    }
-
-    private static UnalignedSettings createPipelineSettings(
-            int parallelism, int slotsPerTaskManager, boolean slotSharing, int timeout) {
-        int numShuffles = 4;
-        return new UnalignedSettings(UnalignedCheckpointITCase::createPipeline)
-                .setParallelism(parallelism)
-                .setSlotSharing(slotSharing)
-                .setNumSlots(slotSharing ? parallelism : parallelism * numShuffles)
-                .setNumBuffers(getNumBuffers(parallelism, numShuffles))
-                .setSlotsPerTaskManager(slotsPerTaskManager)
-                .setExpectedFailures(5)
-                .setAlignmentTimeout(timeout);
-    }
-
-    private static UnalignedSettings createCogroupSettings(int parallelism) {
-        int numShuffles = 10;
-        return new UnalignedSettings(UnalignedCheckpointITCase::createMultipleInputTopology)
-                .setParallelism(parallelism)
-                .setSlotSharing(true)
-                .setNumSlots(parallelism * numShuffles)
-                .setNumBuffers(getNumBuffers(parallelism, numShuffles))
-                .setSlotsPerTaskManager(parallelism)
-                .setExpectedFailures(5);
-    }
-
-    private static UnalignedSettings createUnionSettings(int parallelism) {
-        int numShuffles = 6;
-        return new UnalignedSettings(UnalignedCheckpointITCase::createUnionTopology)
-                .setParallelism(parallelism)
-                .setSlotSharing(true)
-                .setNumSlots(parallelism * numShuffles)
-                .setNumBuffers(getNumBuffers(parallelism, numShuffles))
-                .setSlotsPerTaskManager(parallelism)
-                .setExpectedFailures(5);
-    }
-
-    private static int getNumBuffers(int parallelism, int numShuffles) {
-        int buffersPerSubtask =
-                parallelism
-                        + 1
-                        + // output side
-                        2
-                                * BUFFER_PER_CHANNEL
-                                * parallelism; // input side including recovery (=local channels
-        // count fully)
-        return buffersPerSubtask * parallelism * numShuffles;
-    }
-
-    private final UnalignedSettings settings;
-
-    public UnalignedCheckpointITCase(String desc, UnalignedSettings settings) {
-        this.settings = settings;
-    }
-
-    @Test
-    public void execute() throws Exception {
-        execute(settings);
-    }
-
-    private static void createPipeline(
-            StreamExecutionEnvironment env,
-            long minCheckpoints,
-            boolean slotSharing,
-            int expectedRestarts) {
-        final int parallelism = env.getParallelism();
-        final SingleOutputStreamOperator<Long> stream =
-                env.fromSource(
-                                new LongSource(minCheckpoints, parallelism, expectedRestarts),
-                                noWatermarks(),
-                                "source")
-                        .slotSharingGroup(slotSharing ? "default" : "source")
-                        .disableChaining()
-                        .map(i -> i)
-                        .name("forward")
-                        .uid("forward")
-                        .slotSharingGroup(slotSharing ? "default" : "forward")
-                        .keyBy(i -> i % parallelism * parallelism)
-                        .process(new KeyedIdentityFunction())
-                        .name("keyed")
-                        .uid("keyed");
-        addFailingPipeline(minCheckpoints, slotSharing, stream);
-    }
-
-    private static void createMultipleInputTopology(
-            StreamExecutionEnvironment env,
-            long minCheckpoints,
-            boolean slotSharing,
-            int expectedRestarts) {
-        final int parallelism = env.getParallelism();
-        DataStream<Long> combinedSource = null;
-        for (int inputIndex = 0; inputIndex < 4; inputIndex++) {
-            final SingleOutputStreamOperator<Long> source =
-                    env.fromSource(
-                                    new LongSource(minCheckpoints, parallelism, expectedRestarts),
-                                    noWatermarks(),
-                                    "source" + inputIndex)
-                            .slotSharingGroup(slotSharing ? "default" : ("source" + inputIndex))
-                            .disableChaining();
-            combinedSource =
-                    combinedSource == null
-                            ? source
-                            : combinedSource
-                                    .connect(source)
-                                    .flatMap(new MinEmittingFunction())
-                                    .name("min" + inputIndex)
-                                    .uid("min" + inputIndex)
+        MULTI_INPUT {
+            @Override
+            public void create(
+                    StreamExecutionEnvironment env,
+                    int minCheckpoints,
+                    boolean slotSharing,
+                    int expectedRestarts,
+                    long sourceSleepMs) {
+                final int parallelism = env.getParallelism();
+                DataStream<Long> combinedSource = null;
+                for (int inputIndex = 0; inputIndex < NUM_SOURCES; inputIndex++) {
+                    final SingleOutputStreamOperator<Long> source =
+                            env.fromSource(
+                                            new LongSource(
+                                                    minCheckpoints,
+                                                    parallelism,
+                                                    expectedRestarts,
+                                                    env.getCheckpointInterval(),
+                                                    sourceSleepMs),
+                                            noWatermarks(),
+                                            "source" + inputIndex)
                                     .slotSharingGroup(
-                                            slotSharing ? "default" : ("min" + inputIndex));
-        }
+                                            slotSharing ? "default" : ("source" + inputIndex))
+                                    .disableChaining();
+                    combinedSource =
+                            combinedSource == null
+                                    ? source
+                                    : combinedSource
+                                            .connect(source)
+                                            .flatMap(new MinEmittingFunction())
+                                            .name("min" + inputIndex)
+                                            .uid("min" + inputIndex)
+                                            .slotSharingGroup(
+                                                    slotSharing ? "default" : ("min" + inputIndex));
+                }
 
-        addFailingPipeline(minCheckpoints, slotSharing, combinedSource);
+                addFailingPipeline(minCheckpoints, slotSharing, combinedSource);
+            }
+        },
+
+        UNION {
+            @Override
+            public void create(
+                    StreamExecutionEnvironment env,
+                    int minCheckpoints,
+                    boolean slotSharing,
+                    int expectedRestarts,
+                    long sourceSleepMs) {
+                final int parallelism = env.getParallelism();
+                DataStream<Tuple2<Integer, Long>> combinedSource = null;
+                for (int inputIndex = 0; inputIndex < NUM_SOURCES; inputIndex++) {
+                    int finalInputIndex = inputIndex;
+                    final SingleOutputStreamOperator<Tuple2<Integer, Long>> source =
+                            env.fromSource(
+                                            new LongSource(
+                                                    minCheckpoints,
+                                                    parallelism,
+                                                    expectedRestarts,
+                                                    env.getCheckpointInterval(),
+                                                    sourceSleepMs),
+                                            noWatermarks(),
+                                            "source" + inputIndex)
+                                    .slotSharingGroup(
+                                            slotSharing ? "default" : ("source" + inputIndex))
+                                    .map(i -> new Tuple2<>(finalInputIndex, checkHeader(i)))
+                                    .returns(
+                                            TypeInformation.of(
+                                                    new TypeHint<Tuple2<Integer, Long>>() {}))
+                                    .slotSharingGroup(
+                                            slotSharing ? "default" : ("source" + inputIndex))
+                                    .disableChaining();
+                    combinedSource = combinedSource == null ? source : combinedSource.union(source);
+                }
+
+                final SingleOutputStreamOperator<Long> deduplicated =
+                        combinedSource
+                                .flatMap(new SourceAwareMinEmittingFunction(NUM_SOURCES))
+                                .name("min")
+                                .uid("min")
+                                .slotSharingGroup(slotSharing ? "default" : "min");
+                addFailingPipeline(minCheckpoints, slotSharing, deduplicated);
+            }
+        };
+
+        @Override
+        public String toString() {
+            return name().toLowerCase();
+        }
     }
 
-    private static void createUnionTopology(
-            StreamExecutionEnvironment env,
-            long minCheckpoints,
-            boolean slotSharing,
-            int expectedRestarts) {
-        final int parallelism = env.getParallelism();
-        DataStream<Long> combinedSource = null;
-        final int numSources = 4;
-        for (int inputIndex = 0; inputIndex < numSources; inputIndex++) {
-            final SingleOutputStreamOperator<Long> source =
-                    env.fromSource(
-                                    new LongSource(minCheckpoints, parallelism, expectedRestarts),
-                                    noWatermarks(),
-                                    "source" + inputIndex)
-                            .slotSharingGroup(slotSharing ? "default" : ("source" + inputIndex))
-                            .disableChaining();
-            combinedSource = combinedSource == null ? source : combinedSource.union(source);
-        }
+    @Parameters(name = "{0} with {2} channels, p = {1}, timeout = {3}")
+    private static Object[][] parameters() {
+        Object[] defaults = {Topology.PIPELINE, 1, MIXED, 0};
 
-        final SingleOutputStreamOperator<Long> deduplicated =
-                combinedSource
-                        .partitionCustom(
-                                (key, numPartitions) -> (int) (key % numPartitions), l -> l)
-                        .flatMap(new CountingMapFunction(numSources));
-        addFailingPipeline(minCheckpoints, slotSharing, deduplicated);
+        Object[][] runs = {
+            new Object[] {Topology.PIPELINE, 1, LOCAL},
+            new Object[] {Topology.PIPELINE, 1, REMOTE},
+            new Object[] {Topology.PIPELINE, 5, LOCAL},
+            new Object[] {Topology.PIPELINE, 5, REMOTE},
+            new Object[] {Topology.PIPELINE, 20},
+            new Object[] {Topology.PIPELINE, 20, MIXED, 1},
+            new Object[] {Topology.PIPELINE, 20, MIXED, 5},
+            new Object[] {Topology.MULTI_INPUT, 5},
+            new Object[] {Topology.MULTI_INPUT, 10},
+            new Object[] {Topology.UNION, 5},
+            new Object[] {Topology.UNION, 10},
+        };
+        return Stream.of(runs)
+                .map(params -> addDefaults(params, defaults))
+                .map(params -> new Object[][] {ArrayUtils.insert(params.length, params)})
+                .flatMap(Arrays::stream)
+                .toArray(Object[][]::new);
+    }
+
+    private static Object[] addDefaults(Object[] params, Object[] defaults) {
+        return ArrayUtils.addAll(
+                params, ArrayUtils.subarray(defaults, params.length, defaults.length));
+    }
+
+    @Parameter private Topology topology;
+
+    @Parameter(1)
+    private Integer parallelism;
+
+    @Parameter(2)
+    private ChannelType channelType;
+
+    @Parameter(3)
+    private Integer timeout;
+
+    private UnalignedSettings settings;
+
+    @BeforeEach
+    void setupSettings() {
+        settings =
+                new UnalignedSettings(topology)
+                        .setParallelism(parallelism)
+                        .setChannelTypes(channelType)
+                        .setExpectedFailures(5)
+                        .setFailuresAfterSourceFinishes(1)
+                        // prevent test from timing out in case when a failover happens concurrently
+                        // with triggering a checkpoint (some execution status can change right
+                        // after triggering)
+                        .setCheckpointTimeout(Duration.ofSeconds(30))
+                        .setTolerableCheckpointFailures(3)
+                        .setAlignmentTimeout(timeout);
+    }
+
+    @TestTemplate
+    void execute(TestInfo testInfo) throws Exception {
+        // Phase 1: Run with WAIT_FOR_CHECKPOINT_AND_CANCEL to produce a checkpoint
+        settings.setCheckpointGenerationMode(
+                CheckpointGenerationMode.WAIT_FOR_CHECKPOINT_AND_CANCEL);
+        String checkpointPath = super.execute(settings, testInfo);
+
+        // Phase 2: Restore from the checkpoint and run normally
+        settings.setCheckpointGenerationMode(CheckpointGenerationMode.NONE);
+        settings.setRestoreCheckpoint(checkpointPath);
+        super.execute(settings, testInfo);
+    }
+
+    protected void checkCounters(JobExecutionResult result) {
+        assertAll(
+                () ->
+                        assertThat(result.<Long>getAccumulatorResult(NUM_OUT_OF_ORDER))
+                                .as("NUM_OUT_OF_ORDER")
+                                .isEqualTo(0L),
+                () ->
+                        assertThat(result.<Long>getAccumulatorResult(NUM_DUPLICATES))
+                                .as("NUM_DUPLICATES")
+                                .isEqualTo(0L),
+                () ->
+                        assertThat(result.<Long>getAccumulatorResult(NUM_LOST))
+                                .as("NUM_LOST")
+                                .isEqualTo(0L),
+                () ->
+                        assertThat(result.<Integer>getAccumulatorResult(NUM_FAILURES))
+                                .as("NUM_FAILURES")
+                                .isEqualTo(settings.expectedFailures));
     }
 
     private static DataStreamSink<Long> addFailingPipeline(
@@ -279,7 +330,7 @@ public class UnalignedCheckpointITCase extends UnalignedCheckpointTestBase {
                 // shifts records from one partition to another evenly to retain order
                 .partitionCustom(new ShiftingPartitioner(), l -> l)
                 .map(
-                        new FailingMapper(
+                        new FailingMapper<>(
                                 state ->
                                         state.completedCheckpoints >= minCheckpoints / 4
                                                         && state.runNumber == 0
@@ -293,28 +344,15 @@ public class UnalignedCheckpointITCase extends UnalignedCheckpointTestBase {
                                 state -> state.runNumber == 4))
                 .name("failing-map")
                 .uid("failing-map")
-                .slotSharingGroup(slotSharing ? "default" : "map")
+                .slotSharingGroup(slotSharing ? "default" : "failing-map")
                 .partitionCustom(new ChunkDistributingPartitioner(), l -> l)
-                .addSink(new StrictOrderVerifyingSink(minCheckpoints))
+                .addSink(
+                        new StrictOrderVerifyingSink(
+                                minCheckpoints,
+                                combinedSource.getExecutionEnvironment().getCheckpointInterval()))
                 .name("sink")
                 .uid("sink")
                 .slotSharingGroup(slotSharing ? "default" : "sink");
-    }
-
-    /** Shifts the partitions one up. */
-    protected static class ShiftingPartitioner implements Partitioner<Long> {
-        @Override
-        public int partition(Long key, int numPartitions) {
-            return (int) ((key + 1) % numPartitions);
-        }
-    }
-
-    /** Distributes chunks of the size of numPartitions in a round robin fashion. */
-    protected static class ChunkDistributingPartitioner implements Partitioner<Long> {
-        @Override
-        public int partition(Long key, int numPartitions) {
-            return (int) ((key / numPartitions) % numPartitions);
-        }
     }
 
     /**
@@ -322,34 +360,27 @@ public class UnalignedCheckpointITCase extends UnalignedCheckpointTestBase {
      */
     protected static class StrictOrderVerifyingSink
             extends VerifyingSinkBase<StrictOrderVerifyingSink.State> {
-        protected boolean backpressure;
         private boolean firstOutOfOrder = true;
         private boolean firstDuplicate = true;
         private boolean firstLostValue = true;
 
-        protected StrictOrderVerifyingSink(long minCheckpoints) {
-            super(minCheckpoints);
+        protected StrictOrderVerifyingSink(long minCheckpoints, long checkpointingInterval) {
+            super(minCheckpoints, checkpointingInterval);
         }
 
         @Override
         protected State createState() {
-            return new State(getRuntimeContext().getNumberOfParallelSubtasks());
+            return new State(getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks());
         }
 
         @Override
         public void initializeState(FunctionInitializationContext context) throws Exception {
             super.initializeState(context);
-            backpressure = false;
-        }
-
-        @Override
-        public void snapshotState(FunctionSnapshotContext context) throws Exception {
-            super.snapshotState(context);
-            backpressure = state.completedCheckpoints < minCheckpoints;
         }
 
         @Override
         public void invoke(Long value, Context context) throws Exception {
+            value = withoutHeader(value);
             int parallelism = state.lastRecordInPartitions.length;
             int partition = (int) (value % parallelism);
             long lastRecord = state.lastRecordInPartitions[partition];
@@ -360,8 +391,8 @@ public class UnalignedCheckpointITCase extends UnalignedCheckpointTestBase {
                             "Out of order records current={} and last={} @ {} subtask ({} attempt)",
                             value,
                             lastRecord,
-                            getRuntimeContext().getIndexOfThisSubtask(),
-                            getRuntimeContext().getAttemptNumber());
+                            getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(),
+                            getRuntimeContext().getTaskInfo().getAttemptNumber());
                     firstOutOfOrder = false;
                 }
             } else if (value == lastRecord) {
@@ -370,8 +401,8 @@ public class UnalignedCheckpointITCase extends UnalignedCheckpointTestBase {
                     LOG.info(
                             "Duplicate record {} @ {} subtask ({} attempt)",
                             value,
-                            getRuntimeContext().getIndexOfThisSubtask(),
-                            getRuntimeContext().getAttemptNumber());
+                            getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(),
+                            getRuntimeContext().getTaskInfo().getAttemptNumber());
                     firstDuplicate = false;
                 }
             } else if (lastRecord != -1) {
@@ -384,8 +415,8 @@ public class UnalignedCheckpointITCase extends UnalignedCheckpointTestBase {
                                 value,
                                 expectedValue,
                                 lastRecord,
-                                getRuntimeContext().getIndexOfThisSubtask(),
-                                getRuntimeContext().getAttemptNumber());
+                                getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(),
+                                getRuntimeContext().getTaskInfo().getAttemptNumber());
                         firstLostValue = false;
                     }
                 }
@@ -393,12 +424,7 @@ public class UnalignedCheckpointITCase extends UnalignedCheckpointTestBase {
             state.lastRecordInPartitions[partition] = value;
             state.numOutput++;
 
-            if (backpressure) {
-                // induce backpressure until enough checkpoints have been written
-                Thread.sleep(1);
-            }
-            // after all checkpoints have been completed, the remaining data should be flushed out
-            // fairly quickly
+            induceBackpressure();
         }
 
         static class State extends VerifyingSinkStateBase {
@@ -411,53 +437,12 @@ public class UnalignedCheckpointITCase extends UnalignedCheckpointTestBase {
         }
     }
 
-    private static class MinEmittingFunction extends RichCoFlatMapFunction<Long, Long, Long>
-            implements CheckpointedFunction {
-        private ListState<State> stateList;
-        private State state;
-
-        @Override
-        public void snapshotState(FunctionSnapshotContext context) throws Exception {
-            stateList.clear();
-            stateList.add(state);
-        }
-
-        @Override
-        public void initializeState(FunctionInitializationContext context) throws Exception {
-            stateList =
-                    context.getOperatorStateStore()
-                            .getListState(new ListStateDescriptor<>("state", State.class));
-            this.state = getOnlyElement(stateList.get(), new State());
-        }
-
-        @Override
-        public void flatMap1(Long value, Collector<Long> out) {
-            state.lastLeft = value;
-            if (state.lastRight >= value) {
-                out.collect(value);
-            }
-        }
-
-        @Override
-        public void flatMap2(Long value, Collector<Long> out) {
-            state.lastRight = value;
-            if (state.lastLeft >= value) {
-                out.collect(value);
-            }
-        }
-
-        private static class State {
-            private long lastLeft = Long.MIN_VALUE;
-            private long lastRight = Long.MIN_VALUE;
-        }
-    }
-
     private static class KeyedIdentityFunction extends KeyedProcessFunction<Long, Long, Long> {
         ValueState<Long> state;
 
         @Override
-        public void open(Configuration parameters) throws Exception {
-            super.open(parameters);
+        public void open(OpenContext openContext) throws Exception {
+            super.open(openContext);
             state =
                     getRuntimeContext()
                             .getState(
@@ -467,46 +452,68 @@ public class UnalignedCheckpointITCase extends UnalignedCheckpointTestBase {
 
         @Override
         public void processElement(Long value, Context ctx, Collector<Long> out) {
+            checkHeader(value);
             out.collect(value);
         }
     }
 
-    private static class CountingMapFunction extends RichFlatMapFunction<Long, Long>
+    private static class SourceAwareMinEmittingFunction
+            extends RichFlatMapFunction<Tuple2<Integer, Long>, Long>
             implements CheckpointedFunction {
-        private BitSet seenRecords;
+        private final int numSources;
+        private State state;
 
-        private final int withdrawnCount;
+        private ListState<State> stateList;
 
-        private ListState<BitSet> stateList;
-
-        public CountingMapFunction(int numSources) {
-            this.withdrawnCount = numSources - 1;
+        public SourceAwareMinEmittingFunction(int numSources) {
+            this.numSources = numSources;
         }
 
         @Override
-        public void flatMap(Long value, Collector<Long> out) throws Exception {
-            final int offset = StrictMath.toIntExact(value * withdrawnCount);
-            for (int index = 0; index < withdrawnCount; index++) {
-                if (!seenRecords.get(index + offset)) {
-                    seenRecords.set(index + offset);
+        public void flatMap(Tuple2<Integer, Long> sourceValue, Collector<Long> out)
+                throws Exception {
+            int source = sourceValue.f0;
+            long value = withoutHeader(sourceValue.f1);
+            int partition =
+                    (int) (value % getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks());
+            state.lastValues[source][partition] = value;
+            for (int index = 0; index < numSources; index++) {
+                if (state.lastValues[index][partition] < value) {
                     return;
                 }
             }
-            out.collect(value);
+            out.collect(sourceValue.f1);
         }
 
         @Override
         public void snapshotState(FunctionSnapshotContext context) throws Exception {
-            stateList.clear();
-            stateList.add(seenRecords);
+            stateList.update(Collections.singletonList(state));
         }
 
         @Override
         public void initializeState(FunctionInitializationContext context) throws Exception {
             stateList =
                     context.getOperatorStateStore()
-                            .getListState(new ListStateDescriptor<>("state", BitSet.class));
-            this.seenRecords = getOnlyElement(stateList.get(), new BitSet());
+                            .getListState(new ListStateDescriptor<>("state", State.class));
+            state =
+                    getOnlyElement(
+                            stateList.get(),
+                            new State(
+                                    numSources,
+                                    getRuntimeContext()
+                                            .getTaskInfo()
+                                            .getNumberOfParallelSubtasks()));
+        }
+
+        private static class State {
+            private final long[][] lastValues;
+
+            public State(int numSources, int numberOfParallelSubtasks) {
+                this.lastValues = new long[numSources][numberOfParallelSubtasks];
+                for (long[] lastValue : lastValues) {
+                    Arrays.fill(lastValue, Long.MIN_VALUE);
+                }
+            }
         }
     }
 }

@@ -47,7 +47,7 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 public class NonSplittingRecursiveEnumerator implements FileEnumerator {
 
     /** The filter predicate to filter out unwanted files. */
-    private final Predicate<Path> fileFilter;
+    protected final Predicate<Path> fileFilter;
 
     /**
      * The current Id as a mutable string representation. This covers more values than the integer
@@ -87,7 +87,7 @@ public class NonSplittingRecursiveEnumerator implements FileEnumerator {
         return splits;
     }
 
-    private void addSplitsForPath(
+    protected void addSplitsForPath(
             FileStatus fileStatus, FileSystem fs, ArrayList<FileSourceSplit> target)
             throws IOException {
         if (!fileFilter.test(fileStatus.getPath())) {
@@ -111,7 +111,15 @@ public class NonSplittingRecursiveEnumerator implements FileEnumerator {
 
         final String[] hosts =
                 getHostsFromBlockLocations(fs.getFileBlockLocations(file, 0L, file.getLen()));
-        target.add(new FileSourceSplit(getNextId(), file.getPath(), 0, file.getLen(), hosts));
+        target.add(
+                new FileSourceSplit(
+                        getNextId(),
+                        file.getPath(),
+                        0,
+                        file.getLen(),
+                        file.getModificationTime(),
+                        file.getLen(),
+                        hosts));
     }
 
     protected final String getNextId() {

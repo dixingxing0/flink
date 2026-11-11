@@ -19,6 +19,7 @@
 package org.apache.flink.runtime.metrics.groups;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.events.EventBuilder;
 import org.apache.flink.metrics.CharacterFilter;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.Gauge;
@@ -30,6 +31,8 @@ import org.apache.flink.metrics.SimpleCounter;
 import org.apache.flink.runtime.metrics.MetricRegistry;
 import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
 import org.apache.flink.runtime.metrics.scope.ScopeFormat;
+import org.apache.flink.traces.SpanBuilder;
+import org.apache.flink.util.Preconditions;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -80,7 +83,10 @@ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> impl
     private final Map<String, Metric> metrics = new HashMap<>();
 
     /** All metric subgroups of this group. */
-    private final Map<String, AbstractMetricGroup> groups = new HashMap<>();
+    private final Map<String, AbstractMetricGroup<?>> groups = new HashMap<>();
+
+    /** Key under which this group sits in its parent's {@link #groups} map. */
+    private volatile String nameInParent;
 
     /**
      * The metrics scope represented by this group. For example ["host-7", "taskmanager-2",
@@ -99,7 +105,7 @@ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> impl
      * The logical metrics scope represented by this group for each reporter, as a concatenated
      * string, lazily computed. For example: "taskmanager.job.task"
      */
-    private String[] logicalScopeStrings;
+    private final String[] logicalScopeStrings;
 
     /** The metrics query service scope represented by this group, lazily computed. */
     protected QueryScopeInfo queryServiceScopeInfo;
@@ -268,7 +274,7 @@ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> impl
      */
     @Override
     public String getMetricIdentifier(String metricName) {
-        return getMetricIdentifier(metricName, null);
+        return getMetricIdentifier(metricName, CharacterFilter.NO_OP_FILTER);
     }
 
     /**
@@ -297,27 +303,16 @@ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> impl
      */
     public String getMetricIdentifier(
             String metricName, CharacterFilter filter, int reporterIndex, char delimiter) {
+        Preconditions.checkNotNull(filter);
+
+        metricName = filter.filterCharacters(metricName);
         if (scopeStrings.length == 0
                 || (reporterIndex < 0 || reporterIndex >= scopeStrings.length)) {
-            String newScopeString;
-            if (filter != null) {
-                newScopeString = ScopeFormat.concat(filter, delimiter, scopeComponents);
-                metricName = filter.filterCharacters(metricName);
-            } else {
-                newScopeString = ScopeFormat.concat(delimiter, scopeComponents);
-            }
-            return newScopeString + delimiter + metricName;
+            return ScopeFormat.concat(filter, delimiter, scopeComponents) + delimiter + metricName;
         } else {
             if (scopeStrings[reporterIndex] == null) {
-                if (filter != null) {
-                    scopeStrings[reporterIndex] =
-                            ScopeFormat.concat(filter, delimiter, scopeComponents);
-                } else {
-                    scopeStrings[reporterIndex] = ScopeFormat.concat(delimiter, scopeComponents);
-                }
-            }
-            if (filter != null) {
-                metricName = filter.filterCharacters(metricName);
+                scopeStrings[reporterIndex] =
+                        ScopeFormat.concat(filter, delimiter, scopeComponents);
             }
             return scopeStrings[reporterIndex] + delimiter + metricName;
         }
@@ -333,7 +328,7 @@ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> impl
                 closed = true;
 
                 // close all subgroups
-                for (AbstractMetricGroup group : groups.values()) {
+                for (AbstractMetricGroup<?> group : groups.values()) {
                     group.close();
                 }
                 groups.clear();
@@ -345,6 +340,17 @@ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> impl
                 metrics.clear();
             }
         }
+        if (parent != null && nameInParent != null) {
+            parent.removeChildGroup(nameInParent, this);
+        }
+    }
+
+    void removeChildGroup(String name, AbstractMetricGroup<?> childGroup) {
+        synchronized (this) {
+            if (!closed) {
+                groups.remove(name, childGroup);
+            }
+        }
     }
 
     public final boolean isClosed() {
@@ -352,22 +358,52 @@ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> impl
     }
 
     // -----------------------------------------------------------------------------------------------------------------
+    //  Spans
+    // -----------------------------------------------------------------------------------------------------------------
+
+    @Override
+    public void addSpan(SpanBuilder spanBuilder) {
+        if (spanBuilder == null) {
+            LOG.warn("Ignoring attempted addition of a span due to being null");
+            return;
+        }
+        // add the span only if the group is still open
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+
+            registry.addSpan(spanBuilder, this);
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+    //  Events
+    // -----------------------------------------------------------------------------------------------------------------
+
+    @Override
+    public void addEvent(EventBuilder eventBuilder) {
+        if (eventBuilder == null) {
+            LOG.warn("Ignoring attempted addition of a event due to being null");
+            return;
+        }
+        // add the span only if the group is still open
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+
+            registry.addEvent(eventBuilder, this);
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
     //  Metrics
     // -----------------------------------------------------------------------------------------------------------------
 
     @Override
-    public Counter counter(int name) {
-        return counter(String.valueOf(name));
-    }
-
-    @Override
     public Counter counter(String name) {
         return counter(name, new SimpleCounter());
-    }
-
-    @Override
-    public <C extends Counter> C counter(int name, C counter) {
-        return counter(String.valueOf(name), counter);
     }
 
     @Override
@@ -377,30 +413,15 @@ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> impl
     }
 
     @Override
-    public <T, G extends Gauge<T>> G gauge(int name, G gauge) {
-        return gauge(String.valueOf(name), gauge);
-    }
-
-    @Override
     public <T, G extends Gauge<T>> G gauge(String name, G gauge) {
         addMetric(name, gauge);
         return gauge;
     }
 
     @Override
-    public <H extends Histogram> H histogram(int name, H histogram) {
-        return histogram(String.valueOf(name), histogram);
-    }
-
-    @Override
     public <H extends Histogram> H histogram(String name, H histogram) {
         addMetric(name, histogram);
         return histogram;
-    }
-
-    @Override
-    public <M extends Meter> M meter(int name, M meter) {
-        return meter(String.valueOf(name), meter);
     }
 
     @Override
@@ -425,41 +446,43 @@ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> impl
         }
         // add the metric only if the group is still open
         synchronized (this) {
-            if (!closed) {
-                // immediately put without a 'contains' check to optimize the common case (no
-                // collision)
-                // collisions are resolved later
-                Metric prior = metrics.put(name, metric);
+            if (closed) {
+                return;
+            }
 
-                // check for collisions with other metric names
-                if (prior == null) {
-                    // no other metric with this name yet
+            // immediately put without a 'contains' check to optimize the common case (no
+            // collision)
+            // collisions are resolved later
+            Metric prior = metrics.put(name, metric);
 
-                    if (groups.containsKey(name)) {
-                        // we warn here, rather than failing, because metrics are tools that should
-                        // not fail the
-                        // program when used incorrectly
-                        LOG.warn(
-                                "Name collision: Adding a metric with the same name as a metric subgroup: '"
-                                        + name
-                                        + "'. Metric might not get properly reported. "
-                                        + Arrays.toString(scopeComponents));
-                    }
+            // check for collisions with other metric names
+            if (prior == null) {
+                // no other metric with this name yet
 
-                    registry.register(metric, name, this);
-                } else {
-                    // we had a collision. put back the original value
-                    metrics.put(name, prior);
-
-                    // we warn here, rather than failing, because metrics are tools that should not
-                    // fail the
+                if (groups.containsKey(name)) {
+                    // we warn here, rather than failing, because metrics are tools that should
+                    // not fail the
                     // program when used incorrectly
                     LOG.warn(
-                            "Name collision: Group already contains a Metric with the name '"
+                            "Name collision: Adding a metric with the same name as a metric subgroup: '"
                                     + name
-                                    + "'. Metric will not be reported."
+                                    + "'. Metric might not get properly reported. "
                                     + Arrays.toString(scopeComponents));
                 }
+
+                registry.register(metric, name, this);
+            } else {
+                // we had a collision. put back the original value
+                metrics.put(name, prior);
+
+                // we warn here, rather than failing, because metrics are tools that should not
+                // fail the
+                // program when used incorrectly
+                LOG.warn(
+                        "Name collision: Group already contains a Metric with the name '"
+                                + name
+                                + "'. Metric will not be reported."
+                                + Arrays.toString(scopeComponents));
             }
         }
     }
@@ -467,11 +490,6 @@ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> impl
     // ------------------------------------------------------------------------
     //  Groups
     // ------------------------------------------------------------------------
-
-    @Override
-    public MetricGroup addGroup(int name) {
-        return addGroup(String.valueOf(name), ChildType.GENERIC);
-    }
 
     @Override
     public MetricGroup addGroup(String name) {
@@ -499,10 +517,11 @@ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> impl
                                     + Arrays.toString(scopeComponents));
                 }
 
-                AbstractMetricGroup newGroup = createChildGroup(name, childType);
-                AbstractMetricGroup prior = groups.put(name, newGroup);
-                if (prior == null) {
-                    // no prior group with that name
+                AbstractMetricGroup<?> newGroup = createChildGroup(name, childType);
+                AbstractMetricGroup<?> prior = groups.put(name, newGroup);
+                if (prior == null || prior.isClosed()) {
+                    // no prior group or closed group with that name
+                    newGroup.nameInParent = name;
                     return newGroup;
                 } else {
                     // had a prior group with that name, add the prior group back

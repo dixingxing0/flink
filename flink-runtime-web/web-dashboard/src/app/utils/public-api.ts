@@ -16,5 +16,6 @@
  * limitations under the License.
  */
 
-export * from './deepFind';
-export * from './isNil';
+export * from './is-nil';
+export * from './strong-type';
+export * from './time-axis';

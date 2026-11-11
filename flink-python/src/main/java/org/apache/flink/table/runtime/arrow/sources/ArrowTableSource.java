@@ -19,20 +19,54 @@
 package org.apache.flink.table.runtime.arrow.sources;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.table.data.RowData;
+import org.apache.flink.legacy.table.connector.source.SourceFunctionProvider;
+import org.apache.flink.table.api.TableException;
+import org.apache.flink.table.connector.ChangelogMode;
+import org.apache.flink.table.connector.source.DynamicTableSource;
+import org.apache.flink.table.connector.source.ScanTableSource;
+import org.apache.flink.table.runtime.arrow.ByteArrayUtils;
 import org.apache.flink.table.types.DataType;
 
-/** An Arrow TableSource which takes {@link RowData} as the type of the produced records. */
+/** A {@link ScanTableSource} for serialized arrow record batch data. */
 @Internal
-public class ArrowTableSource extends AbstractArrowTableSource<RowData> {
-    public ArrowTableSource(DataType dataType, byte[][] arrowData) {
-        super(dataType, arrowData);
+public class ArrowTableSource implements ScanTableSource {
+
+    private final DataType dataType;
+
+    private final byte[][] arrowData;
+
+    public ArrowTableSource(DataType dataType, String data) {
+        this.dataType = dataType;
+        try {
+            this.arrowData = ByteArrayUtils.stringToTwoDimByteArray(data);
+        } catch (Throwable e) {
+            throw new TableException(
+                    "Failed to convert the data from String to byte[][].\nThe data is: " + data, e);
+        }
+    }
+
+    private ArrowTableSource(DataType dataType, byte[][] arrowData) {
+        this.dataType = dataType;
+        this.arrowData = arrowData;
     }
 
     @Override
-    public DataStream<RowData> getDataStream(StreamExecutionEnvironment execEnv) {
-        return execEnv.addSource(new ArrowSourceFunction(dataType, arrowData));
+    public DynamicTableSource copy() {
+        return new ArrowTableSource(dataType, arrowData);
+    }
+
+    @Override
+    public String asSummaryString() {
+        return "ArrowTableSource";
+    }
+
+    @Override
+    public ChangelogMode getChangelogMode() {
+        return ChangelogMode.insertOnly();
+    }
+
+    @Override
+    public ScanRuntimeProvider getScanRuntimeProvider(ScanContext runtimeProviderContext) {
+        return SourceFunctionProvider.of(new ArrowSourceFunction(dataType, arrowData), true);
     }
 }

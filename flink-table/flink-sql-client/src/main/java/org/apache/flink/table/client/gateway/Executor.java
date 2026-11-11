@@ -18,103 +18,87 @@
 
 package org.apache.flink.table.client.gateway;
 
-import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.table.api.TableResult;
-import org.apache.flink.table.delegation.Parser;
-import org.apache.flink.types.Row;
+import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.table.gateway.rest.util.RowFormat;
+import org.apache.flink.table.gateway.service.context.DefaultContext;
 
+import javax.annotation.Nullable;
+
+import java.io.Closeable;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.URL;
 import java.util.List;
 import java.util.Map;
 
 /** A gateway for communicating with Flink and other external systems. */
-public interface Executor {
+public interface Executor extends Closeable {
 
-    /** Starts the executor and ensures that its is ready for commands to be executed. */
-    void start() throws SqlExecutionException;
+    /** Create an {@link Executor} to execute commands. */
+    static Executor create(
+            DefaultContext defaultContext, InetSocketAddress address, String sessionId) {
+        return new ExecutorImpl(defaultContext, address, sessionId);
+    }
+
+    static Executor create(
+            DefaultContext defaultContext,
+            InetSocketAddress address,
+            String sessionId,
+            RowFormat rowFormat) {
+        return new ExecutorImpl(defaultContext, address, sessionId, rowFormat);
+    }
+
+    static Executor create(DefaultContext defaultContext, URL address, String sessionId) {
+        return new ExecutorImpl(defaultContext, address, sessionId);
+    }
 
     /**
-     * Open a new session by using the given {@link SessionContext}.
+     * Configures session with statement.
      *
-     * @param session context to create new session.
-     * @return session identifier to track the session.
-     * @throws SqlExecutionException if any error happen
+     * @param statement to initialize the session
      */
-    String openSession(SessionContext session) throws SqlExecutionException;
+    void configureSession(String statement);
 
     /**
-     * Close the resources of session for given session id.
+     * Get the configuration of the session.
      *
-     * @param sessionId session identifier
-     * @throws SqlExecutionException if any error happen
+     * @return the session configuration.
      */
-    void closeSession(String sessionId) throws SqlExecutionException;
-
-    /** Lists all session properties that are defined by the executor and the session. */
-    Map<String, String> getSessionProperties(String sessionId) throws SqlExecutionException;
+    ReadableConfig getSessionConfig();
 
     /**
-     * Reset all the properties for the given session identifier.
+     * Get the map configuration of the session.
      *
-     * @param sessionId to identifier the session
-     * @throws SqlExecutionException if any error happen.
+     * @return the map session configuration.
      */
-    void resetSessionProperties(String sessionId) throws SqlExecutionException;
+    Map<String, String> getSessionConfigMap();
 
     /**
-     * Set given key's session property to the specific value.
+     * Execute statement.
      *
-     * @param key of the session property
-     * @param value of the session property
-     * @throws SqlExecutionException if any error happen.
+     * @param statement to execute
+     * @return Iterable results of the statement
      */
-    void setSessionProperty(String sessionId, String key, String value)
-            throws SqlExecutionException;
-
-    /** Executes a SQL statement, and return {@link TableResult} as execution result. */
-    TableResult executeSql(String sessionId, String statement) throws SqlExecutionException;
-
-    /** Lists all modules known to the executor in their loaded order. */
-    List<String> listModules(String sessionId) throws SqlExecutionException;
-
-    /** Returns a sql parser instance. */
-    Parser getSqlParser(String sessionId);
-
-    /** Returns a list of completion hints for the given statement at the given position. */
-    List<String> completeStatement(String sessionId, String statement, int position);
-
-    /** Submits a Flink SQL query job (detached) and returns the result descriptor. */
-    ResultDescriptor executeQuery(String sessionId, String query) throws SqlExecutionException;
-
-    /** Asks for the next changelog results (non-blocking). */
-    TypedResult<List<Tuple2<Boolean, Row>>> retrieveResultChanges(String sessionId, String resultId)
-            throws SqlExecutionException;
+    StatementResult executeStatement(String statement);
 
     /**
-     * Creates an immutable result snapshot of the running Flink job. Throws an exception if no
-     * Flink job can be found. Returns the number of pages.
-     */
-    TypedResult<Integer> snapshotResult(String sessionId, String resultId, int pageSize)
-            throws SqlExecutionException;
-
-    /**
-     * Returns the rows that are part of the current page or throws an exception if the snapshot has
-     * been expired.
-     */
-    List<Row> retrieveResultPage(String resultId, int page) throws SqlExecutionException;
-
-    /**
-     * Cancels a table program and stops the result retrieval. Blocking until cancellation command
-     * has been sent to cluster.
-     */
-    void cancelQuery(String sessionId, String resultId) throws SqlExecutionException;
-
-    /**
-     * Submits a Flink SQL update statement such as INSERT INTO.
+     * Returns a list of completion hints for the given statement at the given position.
      *
-     * @param sessionId to identify the user session.
-     * @param statement SQL update statement (currently only INSERT INTO is supported)
-     * @return information about the target of the submitted Flink job
+     * @param statement Partial or slightly incorrect SQL statement
+     * @param position cursor position
+     * @return completion hints that fit at the current cursor position
      */
-    ProgramTargetDescriptor executeUpdate(String sessionId, String statement)
-            throws SqlExecutionException;
+    List<String> completeStatement(String statement, int position);
+
+    /**
+     * Deploy script in application mode.
+     *
+     * @param script content to run in application mode
+     * @param uri uri to the script
+     * @return the cluster id
+     */
+    String deployScript(@Nullable String script, @Nullable URI uri);
+
+    /** Close the {@link Executor} and process all exceptions. */
+    void close();
 }

@@ -19,21 +19,58 @@
 @import "theme";
 
 :host {
+  display: flex;
+  flex: 1;
+  flex-flow: column nowrap;
+
   ::ng-deep {
-    .ant-tabs-tabpane {
-      position: relative;
-      top: -16px;
+    .ant-tabs-nav-list {
+      padding: 4px 16px;
     }
   }
-}
 
-flink-monaco-editor {
-  height: calc(~"100vh - 320px");
-  &.subtask {
-    height: 300px;
+  nz-tabs {
+    position: relative;
+    flex: 1;
   }
-}
 
-.expand-td {
-  padding: 0 !important;
+  nz-code-editor {
+    position: relative;
+    height: calc(~"100vh - 310px");
+
+    &.subtask {
+      position: relative;
+      top: 0;
+      height: 300px;
+    }
+  }
+
+  nz-table {
+    margin-top: -@margin-md;
+
+    .exception-cell {
+      word-break: break-all;
+
+      nz-tag {
+        max-width: 100%;
+        height: auto;
+        line-height: 1.4;
+        white-space: normal;
+        word-break: break-all;
+      }
+    }
+  }
+
+  nz-tag {
+    margin-bottom: 5px;
+  }
+
+  .expand-td {
+    display: block;
+    padding: 0 !important;
+  }
+
+  .exception-select {
+    width: 100%;
+  }
 }

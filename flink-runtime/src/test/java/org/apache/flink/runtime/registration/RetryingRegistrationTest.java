@@ -18,67 +18,71 @@
 
 package org.apache.flink.runtime.registration;
 
-import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.runtime.concurrent.FutureUtils;
 import org.apache.flink.runtime.rpc.RpcService;
 import org.apache.flink.runtime.rpc.TestingRpcService;
-import org.apache.flink.runtime.testingUtils.TestingUtils;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.testutils.TestingUtils;
+import org.apache.flink.testutils.executor.TestExecutorExtension;
+import org.apache.flink.util.FlinkException;
+import org.apache.flink.util.concurrent.FutureUtils;
+import org.apache.flink.util.concurrent.ScheduledExecutorServiceAdapter;
 
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
-import org.mockito.invocation.InvocationOnMock;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayDeque;
+import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.any;
-import static org.mockito.Mockito.anyLong;
 import static org.mockito.Mockito.anyString;
-import static org.mockito.Mockito.atMost;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
  * Tests for the generic retrying registration class, validating the failure, retry, and back-off
  * behavior.
  */
-public class RetryingRegistrationTest extends TestLogger {
+class RetryingRegistrationTest {
+
+    @RegisterExtension
+    public static final TestExecutorExtension<ScheduledExecutorService> EXECUTOR_EXTENSION =
+            TestingUtils.defaultExecutorExtension();
 
     private TestingRpcService rpcService;
 
-    @Before
-    public void setup() {
+    @BeforeEach
+    void setup() {
         rpcService = new TestingRpcService();
     }
 
-    @After
-    public void tearDown() throws ExecutionException, InterruptedException {
+    @AfterEach
+    void tearDown() throws ExecutionException, InterruptedException {
         if (rpcService != null) {
-            rpcService.stopService().get();
+            rpcService.closeAsync().get();
         }
     }
 
     @Test
-    public void testSimpleSuccessfulRegistration() throws Exception {
+    void testSimpleSuccessfulRegistration() throws Exception {
         final String testId = "laissez les bon temps roulez";
         final String testEndpointAddress = "<test-address>";
         final UUID leaderId = UUID.randomUUID();
 
         // an endpoint that immediately returns success
-        TestRegistrationGateway testGateway =
-                new TestRegistrationGateway(new TestRegistrationSuccess(testId));
+        ManualResponseTestRegistrationGateway testGateway =
+                new ManualResponseTestRegistrationGateway(new TestRegistrationSuccess(testId));
 
         try {
             rpcService.registerGateway(testEndpointAddress, testGateway);
@@ -87,26 +91,33 @@ public class RetryingRegistrationTest extends TestLogger {
                     new TestRetryingRegistration(rpcService, testEndpointAddress, leaderId);
             registration.startRegistration();
 
-            CompletableFuture<Tuple2<TestRegistrationGateway, TestRegistrationSuccess>> future =
-                    registration.getFuture();
-            assertNotNull(future);
+            CompletableFuture<
+                            RetryingRegistration.RetryingRegistrationResult<
+                                    TestRegistrationGateway,
+                                    TestRegistrationSuccess,
+                                    TestRegistrationRejection>>
+                    future = registration.getFuture();
+            assertThat(future).isNotNull();
 
             // multiple accesses return the same future
-            assertEquals(future, registration.getFuture());
+            assertThat(registration.getFuture()).isEqualTo(future);
 
-            Tuple2<TestRegistrationGateway, TestRegistrationSuccess> success =
-                    future.get(10L, TimeUnit.SECONDS);
+            RetryingRegistration.RetryingRegistrationResult<
+                            TestRegistrationGateway,
+                            TestRegistrationSuccess,
+                            TestRegistrationRejection>
+                    registrationResponse = future.get(10L, TimeUnit.SECONDS);
 
             // validate correct invocation and result
-            assertEquals(testId, success.f1.getCorrelationId());
-            assertEquals(leaderId, testGateway.getInvocations().take().leaderId());
+            assertThat(registrationResponse.getSuccess().getCorrelationId()).isEqualTo(testId);
+            assertThat(testGateway.getInvocations().take().leaderId()).isEqualTo(leaderId);
         } finally {
             testGateway.stop();
         }
     }
 
     @Test
-    public void testPropagateFailures() throws Exception {
+    void testPropagateFailures() throws Exception {
         final String testExceptionMessage = "testExceptionMessage";
 
         // RPC service that fails with exception upon the connection
@@ -119,25 +130,24 @@ public class RetryingRegistrationTest extends TestLogger {
         registration.startRegistration();
 
         CompletableFuture<?> future = registration.getFuture();
-        assertTrue(future.isDone());
+        assertThat(future).isDone();
 
-        try {
-            future.get();
-
-            fail("We expected an ExecutionException.");
-        } catch (ExecutionException e) {
-            assertEquals(testExceptionMessage, e.getCause().getMessage());
-        }
+        assertThatThrownBy(future::get)
+                .withFailMessage("We expected an ExecutionException.")
+                .isInstanceOf(ExecutionException.class)
+                .cause()
+                .hasMessage(testExceptionMessage);
     }
 
     @Test
-    public void testRetryConnectOnFailure() throws Exception {
+    void testRetryConnectOnFailure() throws Exception {
         final String testId = "laissez les bon temps roulez";
         final UUID leaderId = UUID.randomUUID();
 
-        ExecutorService executor = TestingUtils.defaultExecutor();
-        TestRegistrationGateway testGateway =
-                new TestRegistrationGateway(new TestRegistrationSuccess(testId));
+        ScheduledExecutorServiceAdapter executor =
+                new ScheduledExecutorServiceAdapter(EXECUTOR_EXTENSION.getExecutor());
+        ManualResponseTestRegistrationGateway testGateway =
+                new ManualResponseTestRegistrationGateway(new TestRegistrationSuccess(testId));
 
         try {
             // RPC service that fails upon the first connection, but succeeds on the second
@@ -151,16 +161,7 @@ public class RetryingRegistrationTest extends TestLogger {
                             CompletableFuture.completedFuture(
                                     testGateway) // second connection attempt succeeds
                             );
-            when(rpc.getExecutor()).thenReturn(executor);
-            when(rpc.scheduleRunnable(any(Runnable.class), anyLong(), any(TimeUnit.class)))
-                    .thenAnswer(
-                            (InvocationOnMock invocation) -> {
-                                final Runnable runnable = invocation.getArgument(0);
-                                final long delay = invocation.getArgument(1);
-                                final TimeUnit timeUnit = invocation.getArgument(2);
-                                return TestingUtils.defaultScheduledExecutor()
-                                        .schedule(runnable, delay, timeUnit);
-                            });
+            when(rpc.getScheduledExecutor()).thenReturn(executor);
 
             TestRetryingRegistration registration =
                     new TestRetryingRegistration(rpc, "foobar address", leaderId);
@@ -169,34 +170,39 @@ public class RetryingRegistrationTest extends TestLogger {
 
             registration.startRegistration();
 
-            Tuple2<TestRegistrationGateway, TestRegistrationSuccess> success =
-                    registration.getFuture().get(10L, TimeUnit.SECONDS);
+            RetryingRegistration.RetryingRegistrationResult<
+                            TestRegistrationGateway,
+                            TestRegistrationSuccess,
+                            TestRegistrationRejection>
+                    registrationResponse = registration.getFuture().get(10L, TimeUnit.SECONDS);
 
             // measure the duration of the registration --> should be longer than the error delay
             long duration = System.currentTimeMillis() - start;
 
-            assertTrue(
-                    "The registration should have failed the first time. Thus the duration should be longer than at least a single error delay.",
-                    duration > TestRetryingRegistration.DELAY_ON_ERROR);
+            assertThat(duration)
+                    .withFailMessage(
+                            "The registration should have failed the first time. Thus the duration should be longer than at least a single error delay.")
+                    .isGreaterThan(TestRetryingRegistration.DELAY_ON_ERROR);
 
             // validate correct invocation and result
-            assertEquals(testId, success.f1.getCorrelationId());
-            assertEquals(leaderId, testGateway.getInvocations().take().leaderId());
+            assertThat(registrationResponse.getSuccess().getCorrelationId()).isEqualTo(testId);
+            assertThat(testGateway.getInvocations().take().leaderId()).isEqualTo(leaderId);
         } finally {
             testGateway.stop();
         }
     }
 
-    @Test(timeout = 10000)
-    public void testRetriesOnTimeouts() throws Exception {
+    @Test
+    @Timeout(10000)
+    void testRetriesOnTimeouts() throws Exception {
         final String testId = "rien ne va plus";
         final String testEndpointAddress = "<test-address>";
         final UUID leaderId = UUID.randomUUID();
 
         // an endpoint that immediately returns futures with timeouts before returning a successful
         // future
-        TestRegistrationGateway testGateway =
-                new TestRegistrationGateway(
+        ManualResponseTestRegistrationGateway testGateway =
+                new ManualResponseTestRegistrationGateway(
                         null, // timeout
                         null, // timeout
                         new TestRegistrationSuccess(testId) // success
@@ -220,35 +226,44 @@ public class RetryingRegistrationTest extends TestLogger {
             long started = System.nanoTime();
             registration.startRegistration();
 
-            CompletableFuture<Tuple2<TestRegistrationGateway, TestRegistrationSuccess>> future =
-                    registration.getFuture();
-            Tuple2<TestRegistrationGateway, TestRegistrationSuccess> success =
-                    future.get(10L, TimeUnit.SECONDS);
+            CompletableFuture<
+                            RetryingRegistration.RetryingRegistrationResult<
+                                    TestRegistrationGateway,
+                                    TestRegistrationSuccess,
+                                    TestRegistrationRejection>>
+                    future = registration.getFuture();
+            RetryingRegistration.RetryingRegistrationResult<
+                            TestRegistrationGateway,
+                            TestRegistrationSuccess,
+                            TestRegistrationRejection>
+                    registrationResponse = future.get(10L, TimeUnit.SECONDS);
 
             long finished = System.nanoTime();
             long elapsedMillis = (finished - started) / 1000000;
 
             // validate correct invocation and result
-            assertEquals(testId, success.f1.getCorrelationId());
-            assertEquals(leaderId, testGateway.getInvocations().take().leaderId());
+            assertThat(registrationResponse.getSuccess().getCorrelationId()).isEqualTo(testId);
+            assertThat(testGateway.getInvocations().take().leaderId()).isEqualTo(leaderId);
 
             // validate that some retry-delay / back-off behavior happened
-            assertTrue("retries did not properly back off", elapsedMillis >= 3 * initialTimeout);
+            assertThat(elapsedMillis)
+                    .withFailMessage("retries did not properly back off")
+                    .isGreaterThanOrEqualTo(3 * initialTimeout);
         } finally {
             testGateway.stop();
         }
     }
 
     @Test
-    public void testDecline() throws Exception {
+    void testFailure() throws Exception {
         final String testId = "qui a coupe le fromage";
         final String testEndpointAddress = "<test-address>";
         final UUID leaderId = UUID.randomUUID();
 
-        TestRegistrationGateway testGateway =
-                new TestRegistrationGateway(
+        ManualResponseTestRegistrationGateway testGateway =
+                new ManualResponseTestRegistrationGateway(
                         null, // timeout
-                        new RegistrationResponse.Decline("no reason "),
+                        new RegistrationResponse.Failure(new FlinkException("no reason")),
                         null, // timeout
                         new TestRegistrationSuccess(testId) // success
                         );
@@ -262,43 +277,76 @@ public class RetryingRegistrationTest extends TestLogger {
             long started = System.nanoTime();
             registration.startRegistration();
 
-            CompletableFuture<Tuple2<TestRegistrationGateway, TestRegistrationSuccess>> future =
-                    registration.getFuture();
-            Tuple2<TestRegistrationGateway, TestRegistrationSuccess> success =
-                    future.get(10L, TimeUnit.SECONDS);
+            CompletableFuture<
+                            RetryingRegistration.RetryingRegistrationResult<
+                                    TestRegistrationGateway,
+                                    TestRegistrationSuccess,
+                                    TestRegistrationRejection>>
+                    future = registration.getFuture();
+            RetryingRegistration.RetryingRegistrationResult<
+                            TestRegistrationGateway,
+                            TestRegistrationSuccess,
+                            TestRegistrationRejection>
+                    registrationResponse = future.get(10L, TimeUnit.SECONDS);
 
             long finished = System.nanoTime();
             long elapsedMillis = (finished - started) / 1000000;
 
             // validate correct invocation and result
-            assertEquals(testId, success.f1.getCorrelationId());
-            assertEquals(leaderId, testGateway.getInvocations().take().leaderId());
+            assertThat(registrationResponse.getSuccess().getCorrelationId()).isEqualTo(testId);
+            assertThat(testGateway.getInvocations().take().leaderId()).isEqualTo(leaderId);
 
             // validate that some retry-delay / back-off behavior happened
-            assertTrue(
-                    "retries did not properly back off",
-                    elapsedMillis
-                            >= 2 * TestRetryingRegistration.INITIAL_TIMEOUT
-                                    + TestRetryingRegistration.DELAY_ON_DECLINE);
+            assertThat(elapsedMillis)
+                    .withFailMessage("retries did not properly back off")
+                    .isGreaterThanOrEqualTo(
+                            2 * TestRetryingRegistration.INITIAL_TIMEOUT
+                                    + TestRetryingRegistration.DELAY_ON_FAILURE);
         } finally {
             testGateway.stop();
         }
     }
 
     @Test
+    void testRegistrationRejection() {
+        final TestRegistrationGateway testRegistrationGateway =
+                new ManualResponseTestRegistrationGateway(
+                        new TestRegistrationRejection(
+                                TestRegistrationRejection.RejectionReason.REJECTED));
+
+        rpcService.registerGateway(testRegistrationGateway.getAddress(), testRegistrationGateway);
+
+        final TestRetryingRegistration testRetryingRegistration =
+                new TestRetryingRegistration(
+                        rpcService, testRegistrationGateway.getAddress(), UUID.randomUUID());
+
+        testRetryingRegistration.startRegistration();
+
+        final RetryingRegistration.RetryingRegistrationResult<
+                        TestRegistrationGateway, TestRegistrationSuccess, TestRegistrationRejection>
+                response = testRetryingRegistration.getFuture().join();
+
+        assertThat(response.isRejection()).isTrue();
+        assertThat(response.getRejection().getRejectionReason())
+                .isEqualTo(TestRegistrationRejection.RejectionReason.REJECTED);
+    }
+
+    @Test
     @SuppressWarnings("unchecked")
-    public void testRetryOnError() throws Exception {
+    void testRetryOnError() throws Exception {
         final String testId = "Petit a petit, l'oiseau fait son nid";
         final String testEndpointAddress = "<test-address>";
         final UUID leaderId = UUID.randomUUID();
 
         // gateway that upon calls first responds with a failure, then with a success
-        TestRegistrationGateway testGateway = mock(TestRegistrationGateway.class);
+        final Queue<CompletableFuture<RegistrationResponse>> responses = new ArrayDeque<>(2);
+        responses.add(FutureUtils.completedExceptionally(new Exception("test exception")));
+        responses.add(CompletableFuture.completedFuture(new TestRegistrationSuccess(testId)));
 
-        when(testGateway.registrationCall(any(UUID.class), anyLong()))
-                .thenReturn(
-                        FutureUtils.completedExceptionally(new Exception("test exception")),
-                        CompletableFuture.completedFuture(new TestRegistrationSuccess(testId)));
+        TestRegistrationGateway testGateway =
+                DefaultTestRegistrationGateway.newBuilder()
+                        .setRegistrationFunction((uuid, aLong) -> responses.poll())
+                        .build();
 
         rpcService.registerGateway(testEndpointAddress, testGateway);
 
@@ -308,31 +356,43 @@ public class RetryingRegistrationTest extends TestLogger {
         long started = System.nanoTime();
         registration.startRegistration();
 
-        CompletableFuture<Tuple2<TestRegistrationGateway, TestRegistrationSuccess>> future =
-                registration.getFuture();
-        Tuple2<TestRegistrationGateway, TestRegistrationSuccess> success =
-                future.get(10, TimeUnit.SECONDS);
+        CompletableFuture<
+                        RetryingRegistration.RetryingRegistrationResult<
+                                TestRegistrationGateway,
+                                TestRegistrationSuccess,
+                                TestRegistrationRejection>>
+                future = registration.getFuture();
+        RetryingRegistration.RetryingRegistrationResult<
+                        TestRegistrationGateway, TestRegistrationSuccess, TestRegistrationRejection>
+                registrationResponse = future.get(10, TimeUnit.SECONDS);
 
         long finished = System.nanoTime();
         long elapsedMillis = (finished - started) / 1000000;
 
-        assertEquals(testId, success.f1.getCorrelationId());
+        assertThat(registrationResponse.getSuccess().getCorrelationId()).isEqualTo(testId);
 
         // validate that some retry-delay / back-off behavior happened
-        assertTrue(
-                "retries did not properly back off",
-                elapsedMillis >= TestRetryingRegistration.DELAY_ON_ERROR);
+        assertThat(elapsedMillis)
+                .withFailMessage("retries did not properly back off")
+                .isGreaterThanOrEqualTo(TestRetryingRegistration.DELAY_ON_ERROR);
     }
 
     @Test
-    public void testCancellation() throws Exception {
+    void testCancellation() throws Exception {
         final String testEndpointAddress = "my-test-address";
         final UUID leaderId = UUID.randomUUID();
 
         CompletableFuture<RegistrationResponse> result = new CompletableFuture<>();
+        AtomicInteger registrationCallCounter = new AtomicInteger(0);
 
-        TestRegistrationGateway testGateway = mock(TestRegistrationGateway.class);
-        when(testGateway.registrationCall(any(UUID.class), anyLong())).thenReturn(result);
+        TestRegistrationGateway testGateway =
+                DefaultTestRegistrationGateway.newBuilder()
+                        .setRegistrationFunction(
+                                (uuid, aLong) -> {
+                                    registrationCallCounter.incrementAndGet();
+                                    return result;
+                                })
+                        .build();
 
         rpcService.registerGateway(testEndpointAddress, testGateway);
 
@@ -345,7 +405,7 @@ public class RetryingRegistrationTest extends TestLogger {
         result.completeExceptionally(new TimeoutException());
 
         // there should not be a second registration attempt
-        verify(testGateway, atMost(1)).registrationCall(any(UUID.class), anyLong());
+        assertThat(registrationCallCounter).hasValueLessThanOrEqualTo(1);
     }
 
     // ------------------------------------------------------------------------
@@ -366,17 +426,43 @@ public class RetryingRegistrationTest extends TestLogger {
         }
     }
 
+    static class TestRegistrationRejection extends RegistrationResponse.Rejection {
+
+        private final RejectionReason rejectionReason;
+
+        /**
+         * Creates a new rejection message.
+         *
+         * @param rejectionReason
+         */
+        public TestRegistrationRejection(RejectionReason rejectionReason) {
+            this.rejectionReason = rejectionReason;
+        }
+
+        public RejectionReason getRejectionReason() {
+            return rejectionReason;
+        }
+
+        enum RejectionReason {
+            REJECTED;
+        }
+    }
+
     static class TestRetryingRegistration
-            extends RetryingRegistration<UUID, TestRegistrationGateway, TestRegistrationSuccess> {
+            extends RetryingRegistration<
+                    UUID,
+                    TestRegistrationGateway,
+                    TestRegistrationSuccess,
+                    TestRegistrationRejection> {
 
         // we use shorter timeouts here to speed up the tests
         static final long INITIAL_TIMEOUT = 20;
         static final long MAX_TIMEOUT = 200;
         static final long DELAY_ON_ERROR = 200;
-        static final long DELAY_ON_DECLINE = 200;
+        static final long DELAY_ON_FAILURE = 200;
         static final RetryingRegistrationConfiguration RETRYING_REGISTRATION_CONFIGURATION =
                 new RetryingRegistrationConfiguration(
-                        INITIAL_TIMEOUT, MAX_TIMEOUT, DELAY_ON_ERROR, DELAY_ON_DECLINE);
+                        INITIAL_TIMEOUT, MAX_TIMEOUT, DELAY_ON_ERROR, DELAY_ON_FAILURE);
 
         public TestRetryingRegistration(RpcService rpc, String targetAddress, UUID leaderId) {
             this(rpc, targetAddress, leaderId, RETRYING_REGISTRATION_CONFIGURATION);

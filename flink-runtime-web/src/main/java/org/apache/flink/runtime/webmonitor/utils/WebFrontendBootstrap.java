@@ -18,20 +18,26 @@
 
 package org.apache.flink.runtime.webmonitor.utils;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
+import org.apache.flink.runtime.io.network.netty.InboundChannelHandlerFactory;
 import org.apache.flink.runtime.io.network.netty.SSLHandlerFactory;
+import org.apache.flink.runtime.rest.FlinkHttpObjectAggregator;
 import org.apache.flink.runtime.rest.handler.router.Router;
 import org.apache.flink.runtime.rest.handler.router.RouterHandler;
 import org.apache.flink.runtime.webmonitor.HttpRequestHandler;
 import org.apache.flink.runtime.webmonitor.PipelineErrorHandler;
+import org.apache.flink.util.ConfigurationException;
 import org.apache.flink.util.Preconditions;
 
 import org.apache.flink.shaded.netty4.io.netty.bootstrap.ServerBootstrap;
 import org.apache.flink.shaded.netty4.io.netty.channel.Channel;
 import org.apache.flink.shaded.netty4.io.netty.channel.ChannelFuture;
+import org.apache.flink.shaded.netty4.io.netty.channel.ChannelHandler;
 import org.apache.flink.shaded.netty4.io.netty.channel.ChannelInitializer;
-import org.apache.flink.shaded.netty4.io.netty.channel.nio.NioEventLoopGroup;
+import org.apache.flink.shaded.netty4.io.netty.channel.MultiThreadIoEventLoopGroup;
+import org.apache.flink.shaded.netty4.io.netty.channel.nio.NioIoHandler;
 import org.apache.flink.shaded.netty4.io.netty.channel.socket.SocketChannel;
 import org.apache.flink.shaded.netty4.io.netty.channel.socket.nio.NioServerSocketChannel;
 import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.HttpServerCodec;
@@ -45,7 +51,16 @@ import java.io.File;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.ServiceLoader;
+
+import static org.apache.flink.configuration.RestOptions.SERVER_MAX_CONTENT_LENGTH;
 
 /** This classes encapsulates the boot-strapping of netty for the web-frontend. */
 public class WebFrontendBootstrap {
@@ -55,6 +70,9 @@ public class WebFrontendBootstrap {
     private final ServerBootstrap bootstrap;
     private final Channel serverChannel;
     private final String restAddress;
+    private final int maxContentLength;
+    private final Map<String, String> responseHeaders;
+    @VisibleForTesting List<InboundChannelHandlerFactory> inboundChannelHandlerFactories;
 
     public WebFrontendBootstrap(
             Router router,
@@ -69,15 +87,35 @@ public class WebFrontendBootstrap {
         this.router = Preconditions.checkNotNull(router);
         this.log = Preconditions.checkNotNull(log);
         this.uploadDir = directory;
+        this.maxContentLength = config.get(SERVER_MAX_CONTENT_LENGTH);
+        this.responseHeaders = new HashMap<>();
+        inboundChannelHandlerFactories = new ArrayList<>();
+        ServiceLoader<InboundChannelHandlerFactory> loader =
+                ServiceLoader.load(InboundChannelHandlerFactory.class);
+        final Iterator<InboundChannelHandlerFactory> factories = loader.iterator();
+        while (factories.hasNext()) {
+            try {
+                final InboundChannelHandlerFactory factory = factories.next();
+                if (factory != null) {
+                    inboundChannelHandlerFactories.add(factory);
+                    log.info("Loaded channel inbound factory: {}", factory);
+                }
+            } catch (Throwable e) {
+                log.error("Could not load channel inbound factory.", e);
+                throw e;
+            }
+        }
+        inboundChannelHandlerFactories.sort(
+                Comparator.comparingInt(InboundChannelHandlerFactory::priority).reversed());
 
         ChannelInitializer<SocketChannel> initializer =
                 new ChannelInitializer<SocketChannel>() {
 
                     @Override
-                    protected void initChannel(SocketChannel ch) {
+                    protected void initChannel(SocketChannel ch) throws ConfigurationException {
                         RouterHandler handler =
                                 new RouterHandler(
-                                        WebFrontendBootstrap.this.router, new HashMap<>());
+                                        WebFrontendBootstrap.this.router, responseHeaders);
 
                         // SSL should be the first handler in the pipeline
                         if (serverSSLFactory != null) {
@@ -89,15 +127,31 @@ public class WebFrontendBootstrap {
 
                         ch.pipeline()
                                 .addLast(new HttpServerCodec())
-                                .addLast(new ChunkedWriteHandler())
                                 .addLast(new HttpRequestHandler(uploadDir))
+                                .addLast(
+                                        new FlinkHttpObjectAggregator(
+                                                maxContentLength, responseHeaders));
+
+                        for (InboundChannelHandlerFactory factory :
+                                inboundChannelHandlerFactories) {
+                            Optional<ChannelHandler> channelHandler =
+                                    factory.createHandler(config, responseHeaders);
+                            if (channelHandler.isPresent()) {
+                                ch.pipeline().addLast(channelHandler.get());
+                            }
+                        }
+
+                        ch.pipeline()
+                                .addLast(new ChunkedWriteHandler())
                                 .addLast(handler.getName(), handler)
                                 .addLast(new PipelineErrorHandler(WebFrontendBootstrap.this.log));
                     }
                 };
 
-        NioEventLoopGroup bossGroup = new NioEventLoopGroup(1);
-        NioEventLoopGroup workerGroup = new NioEventLoopGroup();
+        MultiThreadIoEventLoopGroup bossGroup =
+                new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        MultiThreadIoEventLoopGroup workerGroup =
+                new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
 
         this.bootstrap = new ServerBootstrap();
         this.bootstrap
@@ -120,8 +174,7 @@ public class WebFrontendBootstrap {
 
         if (inetAddress.isAnyLocalAddress()) {
             address =
-                    config.getString(
-                            JobManagerOptions.ADDRESS, InetAddress.getLocalHost().getHostName());
+                    config.get(JobManagerOptions.ADDRESS, InetAddress.getLocalHost().getHostName());
         } else {
             address = inetAddress.getHostAddress();
         }
@@ -161,11 +214,11 @@ public class WebFrontendBootstrap {
             this.serverChannel.close().awaitUninterruptibly();
         }
         if (bootstrap != null) {
-            if (bootstrap.group() != null) {
-                bootstrap.group().shutdownGracefully();
+            if (bootstrap.config().group() != null) {
+                bootstrap.config().group().shutdownGracefully();
             }
-            if (bootstrap.childGroup() != null) {
-                bootstrap.childGroup().shutdownGracefully();
+            if (bootstrap.config().childGroup() != null) {
+                bootstrap.config().childGroup().shutdownGracefully();
             }
         }
     }

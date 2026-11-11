@@ -44,14 +44,12 @@ public final class PythonSharedResources implements AutoCloseable {
     /** Keep track of the PythonEnvironmentManagers of the Python operators in one slot. */
     private final List<PythonEnvironmentManager> environmentManagers;
 
-    /** Keep track of the number of Python operators sharing this Python resource. */
-    private int refCnt;
+    private boolean closed;
 
     PythonSharedResources(JobBundleFactory jobBundleFactory, Environment environment) {
         this.jobBundleFactory = jobBundleFactory;
         this.environment = environment;
         this.environmentManagers = new ArrayList<>();
-        this.refCnt = 0;
     }
 
     JobBundleFactory getJobBundleFactory() {
@@ -62,25 +60,36 @@ public final class PythonSharedResources implements AutoCloseable {
         return environment;
     }
 
-    void addPythonEnvironmentManager(PythonEnvironmentManager environmentManager) {
+    synchronized void addPythonEnvironmentManager(PythonEnvironmentManager environmentManager) {
         environmentManagers.add(environmentManager);
-        refCnt++;
-    }
-
-    /**
-     * Release a Python operator which shares this Python resource. Returns true if there are no
-     * more Python operators sharing this Python resource.
-     */
-    boolean release() {
-        refCnt--;
-        return refCnt == 0;
     }
 
     @Override
-    public void close() throws Exception {
-        jobBundleFactory.close();
+    public synchronized void close() throws Exception {
+        if (closed) {
+            return;
+        }
+
+        Exception exception = null;
+        try {
+            jobBundleFactory.close();
+        } catch (Exception e) {
+            exception = e;
+        }
         for (PythonEnvironmentManager environmentManager : environmentManagers) {
-            environmentManager.close();
+            try {
+                environmentManager.close();
+            } catch (Exception e) {
+                if (exception == null) {
+                    exception = e;
+                } else {
+                    exception.addSuppressed(e);
+                }
+            }
+        }
+        closed = true;
+        if (exception != null) {
+            throw exception;
         }
     }
 }

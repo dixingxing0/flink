@@ -18,9 +18,9 @@
 
 package org.apache.flink.runtime.rest.handler.taskmanager;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.resourcemanager.ResourceManagerGateway;
+import org.apache.flink.runtime.resourcemanager.TaskManagerInfoWithSlots;
 import org.apache.flink.runtime.resourcemanager.exceptions.UnknownTaskExecutorException;
 import org.apache.flink.runtime.rest.handler.HandlerRequest;
 import org.apache.flink.runtime.rest.handler.RestHandlerException;
@@ -31,7 +31,6 @@ import org.apache.flink.runtime.rest.messages.EmptyRequestBody;
 import org.apache.flink.runtime.rest.messages.MessageHeaders;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerDetailsInfo;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerIdPathParameter;
-import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerInfo;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerMessageParameters;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerMetricsInfo;
 import org.apache.flink.runtime.webmonitor.RestfulGateway;
@@ -43,6 +42,7 @@ import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.HttpResponseSt
 
 import javax.annotation.Nonnull;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -62,7 +62,7 @@ public class TaskManagerDetailsHandler
 
     public TaskManagerDetailsHandler(
             GatewayRetriever<? extends RestfulGateway> leaderRetriever,
-            Time timeout,
+            Duration timeout,
             Map<String, String> responseHeaders,
             MessageHeaders<EmptyRequestBody, TaskManagerDetailsInfo, TaskManagerMessageParameters>
                     messageHeaders,
@@ -81,20 +81,20 @@ public class TaskManagerDetailsHandler
 
     @Override
     protected CompletableFuture<TaskManagerDetailsInfo> handleRequest(
-            @Nonnull HandlerRequest<EmptyRequestBody, TaskManagerMessageParameters> request,
+            @Nonnull HandlerRequest<EmptyRequestBody> request,
             @Nonnull ResourceManagerGateway gateway)
             throws RestHandlerException {
         final ResourceID taskManagerResourceId =
                 request.getPathParameter(TaskManagerIdPathParameter.class);
 
-        CompletableFuture<TaskManagerInfo> taskManagerInfoFuture =
-                gateway.requestTaskManagerInfo(taskManagerResourceId, timeout);
+        CompletableFuture<TaskManagerInfoWithSlots> taskManagerInfoWithSlotsFuture =
+                gateway.requestTaskManagerDetailsInfo(taskManagerResourceId, timeout);
 
         metricFetcher.update();
 
-        return taskManagerInfoFuture
+        return taskManagerInfoWithSlotsFuture
                 .thenApply(
-                        (TaskManagerInfo taskManagerInfo) -> {
+                        (taskManagerInfoWithSlots) -> {
                             final MetricStore.TaskManagerMetricStore tmMetrics =
                                     metricStore.getTaskManagerMetricStore(
                                             taskManagerResourceId.getResourceIdString());
@@ -114,12 +114,12 @@ public class TaskManagerDetailsHandler
                             }
 
                             return new TaskManagerDetailsInfo(
-                                    taskManagerInfo, taskManagerMetricsInfo);
+                                    taskManagerInfoWithSlots, taskManagerMetricsInfo);
                         })
                 .exceptionally(
                         (Throwable throwable) -> {
                             final Throwable strippedThrowable =
-                                    ExceptionUtils.stripExecutionException(throwable);
+                                    ExceptionUtils.stripCompletionException(throwable);
 
                             if (strippedThrowable instanceof UnknownTaskExecutorException) {
                                 throw new CompletionException(

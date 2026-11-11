@@ -26,8 +26,10 @@ import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.RowType;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.parquet.hadoop.ParquetOutputFormat;
 import org.apache.parquet.hadoop.ParquetWriter;
 import org.apache.parquet.hadoop.api.WriteSupport;
+import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.apache.parquet.io.OutputFile;
 import org.apache.parquet.io.api.RecordConsumer;
 import org.apache.parquet.schema.MessageType;
@@ -43,7 +45,6 @@ import static org.apache.parquet.hadoop.ParquetOutputFormat.getEnableDictionary;
 import static org.apache.parquet.hadoop.ParquetOutputFormat.getPageSize;
 import static org.apache.parquet.hadoop.ParquetOutputFormat.getValidation;
 import static org.apache.parquet.hadoop.ParquetOutputFormat.getWriterVersion;
-import static org.apache.parquet.hadoop.codec.CodecConfig.getParquetCompressionCodec;
 
 /** {@link RowData} of {@link ParquetWriter.Builder}. */
 public class ParquetRowDataBuilder extends ParquetWriter.Builder<RowData, ParquetRowDataBuilder> {
@@ -64,13 +65,19 @@ public class ParquetRowDataBuilder extends ParquetWriter.Builder<RowData, Parque
 
     @Override
     protected WriteSupport<RowData> getWriteSupport(Configuration conf) {
-        return new ParquetWriteSupport();
+        return new ParquetWriteSupport(conf);
     }
 
     private class ParquetWriteSupport extends WriteSupport<RowData> {
 
-        private MessageType schema = convertToParquetMessageType("flink_schema", rowType);
+        private MessageType schema = null;
         private ParquetRowDataWriter writer;
+        private Configuration conf;
+
+        private ParquetWriteSupport(Configuration conf) {
+            this.conf = conf;
+            schema = convertToParquetMessageType("flink_schema", rowType, conf);
+        }
 
         @Override
         public WriteContext init(Configuration configuration) {
@@ -79,7 +86,8 @@ public class ParquetRowDataBuilder extends ParquetWriter.Builder<RowData, Parque
 
         @Override
         public void prepareForWrite(RecordConsumer recordConsumer) {
-            this.writer = new ParquetRowDataWriter(recordConsumer, rowType, schema, utcTimestamp);
+            this.writer =
+                    new ParquetRowDataWriter(recordConsumer, rowType, schema, utcTimestamp, conf);
         }
 
         @Override
@@ -122,7 +130,11 @@ public class ParquetRowDataBuilder extends ParquetWriter.Builder<RowData, Parque
         public ParquetWriter<RowData> createWriter(OutputFile out) throws IOException {
             Configuration conf = configuration.conf();
             return new ParquetRowDataBuilder(out, rowType, utcTimestamp)
-                    .withCompressionCodec(getParquetCompressionCodec(conf))
+                    .withCompressionCodec(
+                            CompressionCodecName.fromConf(
+                                    conf.get(
+                                            ParquetOutputFormat.COMPRESSION,
+                                            CompressionCodecName.SNAPPY.name())))
                     .withRowGroupSize(getBlockSize(conf))
                     .withPageSize(getPageSize(conf))
                     .withDictionaryPageSize(getDictionaryPageSize(conf))

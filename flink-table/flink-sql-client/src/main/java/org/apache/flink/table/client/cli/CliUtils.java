@@ -19,6 +19,8 @@
 package org.apache.flink.table.client.cli;
 
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.configuration.DeploymentOptions;
+import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.table.types.DataType;
 
 import org.jline.utils.AttributedString;
@@ -106,7 +108,9 @@ public final class CliUtils {
             if (parent == null) {
                 return false;
             }
-            Files.createDirectories(parent);
+            if (Files.notExists(parent)) {
+                Files.createDirectories(parent);
+            }
             if (Files.notExists(filePath)) {
                 Files.createFile(filePath);
             }
@@ -114,5 +118,10 @@ public final class CliUtils {
         } catch (final Exception e) {
             return false;
         }
+    }
+
+    public static boolean isApplicationMode(ReadableConfig config) {
+        final String executionTarget = config.getOptional(DeploymentOptions.TARGET).orElse("");
+        return executionTarget.trim().endsWith("application");
     }
 }

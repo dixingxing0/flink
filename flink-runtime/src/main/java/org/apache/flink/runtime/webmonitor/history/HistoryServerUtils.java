@@ -20,7 +20,7 @@ package org.apache.flink.runtime.webmonitor.history;
 
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.HistoryServerOptions;
-import org.apache.flink.runtime.net.SSLUtils;
+import org.apache.flink.configuration.SecurityOptions;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,8 +38,8 @@ public enum HistoryServerUtils {
     private static final Logger LOG = LoggerFactory.getLogger(HistoryServerUtils.class);
 
     public static boolean isSSLEnabled(Configuration config) {
-        return config.getBoolean(HistoryServerOptions.HISTORY_SERVER_WEB_SSL_ENABLED)
-                && SSLUtils.isRestSSLEnabled(config);
+        return config.get(HistoryServerOptions.HISTORY_SERVER_WEB_SSL_ENABLED)
+                && SecurityOptions.isRestSSLEnabled(config);
     }
 
     public static Optional<URL> getHistoryServerURL(Configuration configuration) {
@@ -68,12 +68,12 @@ public enum HistoryServerUtils {
     }
 
     private static int getPort(Configuration configuration) {
-        return configuration.getInteger(HistoryServerOptions.HISTORY_SERVER_WEB_PORT);
+        return configuration.get(HistoryServerOptions.HISTORY_SERVER_WEB_PORT);
     }
 
     @Nullable
     private static String getHostname(Configuration configuration) {
-        return configuration.getString(HistoryServerOptions.HISTORY_SERVER_WEB_ADDRESS);
+        return configuration.get(HistoryServerOptions.HISTORY_SERVER_WEB_ADDRESS);
     }
 
     private static String getProtocol(Configuration configuration) {

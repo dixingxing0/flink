@@ -24,7 +24,7 @@ import org.apache.flink.api.common.typeutils.TypeSerializerSnapshot;
 import org.apache.flink.api.common.typeutils.base.TypeSerializerSingleton;
 import org.apache.flink.core.memory.DataInputView;
 import org.apache.flink.core.memory.DataOutputView;
-import org.apache.flink.table.runtime.util.StringUtf8Utils;
+import org.apache.flink.table.data.binary.StringUtf8Utils;
 
 import java.io.IOException;
 
@@ -32,7 +32,7 @@ import java.io.IOException;
  * We create the StringSerializer instead of using the StringSerializer of flink-core module because
  * the StringSerializer of flink-core module serialize every Char of String in serialize method and
  * deserialize the Char to build the String. We want to convert String to UTF-8 bytes to serialize
- * which is compatible with BinaryStringSerializer in blink.
+ * which is compatible with BinaryStringSerializer.
  *
  * <p>So we create this StringSerializer (only used in Java and Python data communication in udf).
  *

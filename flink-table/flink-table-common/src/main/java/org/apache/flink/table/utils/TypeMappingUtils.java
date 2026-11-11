@@ -19,13 +19,15 @@
 package org.apache.flink.table.utils;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.table.api.TableColumn;
-import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.api.ValidationException;
-import org.apache.flink.table.sources.DefinedProctimeAttribute;
-import org.apache.flink.table.sources.DefinedRowtimeAttributes;
-import org.apache.flink.table.sources.RowtimeAttributeDescriptor;
-import org.apache.flink.table.sources.TableSource;
+import org.apache.flink.table.catalog.ResolvedSchema;
+import org.apache.flink.table.legacy.api.TableColumn;
+import org.apache.flink.table.legacy.api.TableSchema;
+import org.apache.flink.table.legacy.sinks.TableSink;
+import org.apache.flink.table.legacy.sources.DefinedProctimeAttribute;
+import org.apache.flink.table.legacy.sources.DefinedRowtimeAttributes;
+import org.apache.flink.table.legacy.sources.RowtimeAttributeDescriptor;
+import org.apache.flink.table.legacy.sources.TableSource;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.LegacyTypeInformationType;
@@ -47,12 +49,8 @@ import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static org.apache.flink.table.types.logical.utils.LogicalTypeCasts.supportsAvoidingCast;
-import static org.apache.flink.table.types.logical.utils.LogicalTypeChecks.hasFamily;
 
-/**
- * Utility methods for dealing with field types in {@link
- * org.apache.flink.table.sources.TableSource} and {@link org.apache.flink.table.sinks.TableSink}.
- */
+/** Utility methods for dealing with field types in {@link TableSource} and {@link TableSink}. */
 @Internal
 public final class TypeMappingUtils {
 
@@ -151,8 +149,7 @@ public final class TypeMappingUtils {
      * Checks whether the given physical field type and logical field type are compatible at the
      * edges of the table ecosystem. Types are still compatible if the physical type is a legacy
      * decimal type (converted from Types#BIG_DEC) and the logical type is DECIMAL(38, 18). This is
-     * to support legacy TypeInformation for {@link TableSource} and {@link
-     * org.apache.flink.table.sinks.TableSink}.
+     * to support legacy TypeInformation for {@link TableSource} and {@link TableSink}.
      *
      * @param physicalFieldType physical field type
      * @param logicalFieldType logical field type
@@ -199,7 +196,7 @@ public final class TypeMappingUtils {
 
     private static void verifyTimeAttributeType(
             TableColumn logicalColumn, String rowtimeOrProctime) {
-        if (!hasFamily(logicalColumn.getType().getLogicalType(), LogicalTypeFamily.TIMESTAMP)) {
+        if (!logicalColumn.getType().getLogicalType().is(LogicalTypeFamily.TIMESTAMP)) {
             throw new ValidationException(
                     String.format(
                             "%s field '%s' has invalid type %s. %s attributes must be of a Timestamp family.",
@@ -215,7 +212,7 @@ public final class TypeMappingUtils {
             DataType physicalType,
             Function<String, String> nameRemappingFunction) {
         if (LogicalTypeChecks.isCompositeType(physicalType.getLogicalType())) {
-            TableSchema physicalSchema = DataTypeUtils.expandCompositeTypeToSchema(physicalType);
+            ResolvedSchema physicalSchema = DataTypeUtils.expandCompositeTypeToSchema(physicalType);
             return computeInCompositeType(
                     columns, physicalSchema, wrapWithNotNullCheck(nameRemappingFunction));
         } else {
@@ -238,7 +235,7 @@ public final class TypeMappingUtils {
 
     private static Map<TableColumn, Integer> computeInCompositeType(
             Stream<TableColumn> columns,
-            TableSchema physicalSchema,
+            ResolvedSchema physicalSchema,
             Function<String, String> nameRemappingFunction) {
         return columns.collect(
                 Collectors.toMap(
@@ -247,12 +244,12 @@ public final class TypeMappingUtils {
                             String remappedName = nameRemappingFunction.apply(column.getName());
 
                             int idx =
-                                    IntStream.range(0, physicalSchema.getFieldCount())
+                                    IntStream.range(0, physicalSchema.getColumnCount())
                                             .filter(
                                                     i ->
                                                             physicalSchema
-                                                                    .getFieldName(i)
-                                                                    .get()
+                                                                    .getColumnNames()
+                                                                    .get(i)
                                                                     .equals(remappedName))
                                             .findFirst()
                                             .orElseThrow(
@@ -264,7 +261,7 @@ public final class TypeMappingUtils {
                                                                             physicalSchema)));
 
                             LogicalType physicalFieldType =
-                                    physicalSchema.getFieldDataType(idx).get().getLogicalType();
+                                    physicalSchema.getColumnDataTypes().get(idx).getLogicalType();
                             LogicalType logicalFieldType = column.getType().getLogicalType();
 
                             checkPhysicalLogicalTypeCompatible(

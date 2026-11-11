@@ -31,7 +31,7 @@ public interface ResourceTracker {
     /**
      * Notifies the tracker about a new or updated {@link ResourceRequirements}.
      *
-     * @param jobId the job that that the resource requirements belongs to
+     * @param jobId the job that the resource requirements belongs to
      * @param resourceRequirements new resource requirements
      */
     void notifyResourceRequirements(
@@ -71,6 +71,14 @@ public interface ResourceTracker {
      * @return required/exceeding resources for each jobs
      */
     Collection<ResourceRequirement> getAcquiredResources(JobID jobId);
+
+    /**
+     * Returns whether the {@link ResourceRequirement} of the given job is empty.
+     *
+     * @param jobId job ID
+     * @return true if the {@link ResourceRequirement} of the given job is empty
+     */
+    boolean isRequirementEmpty(JobID jobId);
 
     /** Removes all state from the tracker. */
     void clear();

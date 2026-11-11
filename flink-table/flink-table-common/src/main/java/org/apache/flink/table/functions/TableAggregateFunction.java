@@ -75,7 +75,8 @@ import org.apache.flink.util.Collector;
  * mentioned above to be called by generated code.
  *
  * <p>For storing a user-defined function in a catalog, the class must have a default constructor
- * and must be instantiable during runtime.
+ * and must be instantiable during runtime. Anonymous functions in Table API can only be persisted
+ * if the function is not stateful (i.e. containing only transient and static fields).
  *
  * <pre>{@code
  * Processes the input values and updates the provided accumulator instance. The method
@@ -159,6 +160,7 @@ public abstract class TableAggregateFunction<T, ACC> extends ImperativeAggregate
      * Collects a record and forwards it. The collector can output retract messages with the retract
      * method. Note: This collector can only be used in the {@code emitUpdateWithRetract()} method.
      */
+    @PublicEvolving
     public interface RetractableCollector<T> extends Collector<T> {
 
         /**

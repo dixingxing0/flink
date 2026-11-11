@@ -18,26 +18,38 @@
 
 package org.apache.flink.streaming.examples.statemachine;
 
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.functions.RichFlatMapFunction;
+import org.apache.flink.api.common.serialization.SimpleStringEncoder;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
-import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.connector.source.util.ratelimit.RateLimiterStrategy;
+import org.apache.flink.api.java.typeutils.TypeExtractor;
+import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.contrib.streaming.state.RocksDBStateBackend;
-import org.apache.flink.core.fs.FileSystem;
-import org.apache.flink.runtime.state.filesystem.FsStateBackend;
+import org.apache.flink.configuration.MemorySize;
+import org.apache.flink.configuration.StateBackendOptions;
+import org.apache.flink.connector.datagen.source.DataGeneratorSource;
+import org.apache.flink.connector.datagen.source.GeneratorFunction;
+import org.apache.flink.connector.file.sink.FileSink;
+import org.apache.flink.connector.kafka.source.KafkaSource;
+import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+import org.apache.flink.core.fs.Path;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.source.SourceFunction;
-import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
+import org.apache.flink.streaming.api.functions.sink.filesystem.rollingpolicies.DefaultRollingPolicy;
 import org.apache.flink.streaming.examples.statemachine.dfa.State;
 import org.apache.flink.streaming.examples.statemachine.event.Alert;
 import org.apache.flink.streaming.examples.statemachine.event.Event;
-import org.apache.flink.streaming.examples.statemachine.generator.EventsGeneratorSource;
-import org.apache.flink.streaming.examples.statemachine.kafka.EventDeSerializer;
+import org.apache.flink.streaming.examples.statemachine.generator.EventsGeneratorFunction;
+import org.apache.flink.streaming.examples.statemachine.kafka.EventDeSerializationSchema;
 import org.apache.flink.util.Collector;
+import org.apache.flink.util.ParameterTool;
 
-import java.util.Properties;
+import java.time.Duration;
 
 /**
  * Main class of the state machine example. This class implements the streaming application that
@@ -56,21 +68,41 @@ public class StateMachineExample {
         // ---- print some usage help ----
 
         System.out.println(
-                "Usage with built-in data generator: StateMachineExample [--error-rate <probability-of-invalid-transition>] [--sleep <sleep-per-record-in-ms>]");
+                "Usage with built-in data generator: StateMachineExample [--error-rate <probability-of-invalid-transition>] [--sleep <sleep-per-record-in-ms> | --rps <records-per-second>]");
         System.out.println(
                 "Usage with Kafka: StateMachineExample --kafka-topic <topic> [--brokers <brokers>]");
         System.out.println("Options for both the above setups: ");
-        System.out.println("\t[--backend <file|rocks>]");
+        System.out.println("\t[--backend <hashmap|rocksdb|forst>]");
         System.out.println("\t[--checkpoint-dir <filepath>]");
-        System.out.println("\t[--async-checkpoints <true|false>]");
         System.out.println("\t[--incremental-checkpoints <true|false>]");
         System.out.println("\t[--output <filepath> OR null for stdout]");
         System.out.println();
 
         // ---- determine whether to use the built-in source, or read from Kafka ----
 
-        final SourceFunction<Event> source;
+        final DataStream<Event> events;
         final ParameterTool params = ParameterTool.fromArgs(args);
+
+        // create the environment to create streams and configure execution
+        Configuration configuration = new Configuration();
+
+        final String stateBackend = params.get("backend", "memory");
+        if ("hashmap".equals(stateBackend)) {
+            final String checkpointDir = params.get("checkpoint-dir");
+            configuration.set(StateBackendOptions.STATE_BACKEND, "hashmap");
+            configuration.set(CheckpointingOptions.CHECKPOINT_STORAGE, "filesystem");
+            configuration.set(CheckpointingOptions.CHECKPOINTS_DIRECTORY, checkpointDir);
+        } else if ("rocksdb".equals(stateBackend) || "forst".equals(stateBackend)) {
+            final String checkpointDir = params.get("checkpoint-dir");
+            boolean incrementalCheckpoints = params.getBoolean("incremental-checkpoints", false);
+            configuration.set(StateBackendOptions.STATE_BACKEND, stateBackend);
+            configuration.set(CheckpointingOptions.INCREMENTAL_CHECKPOINTS, incrementalCheckpoints);
+            configuration.set(CheckpointingOptions.CHECKPOINT_STORAGE, "filesystem");
+            configuration.set(CheckpointingOptions.CHECKPOINTS_DIRECTORY, checkpointDir);
+        }
+        final StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(configuration);
+        env.enableCheckpointing(2000L);
 
         if (params.has("kafka-topic")) {
             // set up the Kafka reader
@@ -80,56 +112,57 @@ public class StateMachineExample {
             System.out.printf("Reading from kafka topic %s @ %s\n", kafkaTopic, brokers);
             System.out.println();
 
-            Properties kafkaProps = new Properties();
-            kafkaProps.setProperty("bootstrap.servers", brokers);
-
-            FlinkKafkaConsumer<Event> kafka =
-                    new FlinkKafkaConsumer<>(kafkaTopic, new EventDeSerializer(), kafkaProps);
-            kafka.setStartFromLatest();
-            kafka.setCommitOffsetsOnCheckpoints(false);
-            source = kafka;
+            KafkaSource<Event> source =
+                    KafkaSource.<Event>builder()
+                            .setBootstrapServers(brokers)
+                            .setGroupId("stateMachineExample")
+                            .setTopics(kafkaTopic)
+                            .setDeserializer(
+                                    KafkaRecordDeserializationSchema.valueOnly(
+                                            new EventDeSerializationSchema()))
+                            .setStartingOffsets(OffsetsInitializer.latest())
+                            .build();
+            events =
+                    env.fromSource(
+                            source, WatermarkStrategy.noWatermarks(), "StateMachineExampleSource");
         } else {
-            double errorRate = params.getDouble("error-rate", 0.0);
-            int sleep = params.getInt("sleep", 1);
-
+            final double errorRate = params.getDouble("error-rate", 0.0);
+            final int sleep = params.getInt("sleep", 1);
+            final double recordsPerSecond =
+                    params.getDouble("rps", rpsFromSleep(sleep, env.getParallelism()));
             System.out.printf(
-                    "Using standalone source with error rate %f and sleep delay %s millis\n",
-                    errorRate, sleep);
+                    "Using standalone source with error rate %f and %.1f records per second\n",
+                    errorRate, recordsPerSecond);
             System.out.println();
 
-            source = new EventsGeneratorSource(errorRate, sleep);
+            GeneratorFunction<Long, Event> generatorFunction =
+                    new EventsGeneratorFunction(errorRate);
+            DataGeneratorSource<Event> eventGeneratorSource =
+                    new DataGeneratorSource<>(
+                            generatorFunction,
+                            Long.MAX_VALUE,
+                            RateLimiterStrategy.perSecond(recordsPerSecond),
+                            TypeInformation.of(Event.class));
+
+            events =
+                    env.fromSource(
+                            eventGeneratorSource,
+                            WatermarkStrategy.noWatermarks(),
+                            "Events Generator Source");
         }
 
         // ---- main program ----
-
-        // create the environment to create streams and configure execution
-        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.enableCheckpointing(2000L);
-
-        final String stateBackend = params.get("backend", "memory");
-        if ("file".equals(stateBackend)) {
-            final String checkpointDir = params.get("checkpoint-dir");
-            boolean asyncCheckpoints = params.getBoolean("async-checkpoints", false);
-            env.setStateBackend(new FsStateBackend(checkpointDir, asyncCheckpoints));
-        } else if ("rocks".equals(stateBackend)) {
-            final String checkpointDir = params.get("checkpoint-dir");
-            boolean incrementalCheckpoints = params.getBoolean("incremental-checkpoints", false);
-            env.setStateBackend(new RocksDBStateBackend(checkpointDir, incrementalCheckpoints));
-        }
 
         final String outputFile = params.get("output");
 
         // make parameters available in the web interface
         env.getConfig().setGlobalJobParameters(params);
 
-        DataStream<Event> events = env.addSource(source);
-
         DataStream<Alert> alerts =
                 events
                         // partition on the address to make sure equal addresses
                         // end up in the same state machine flatMap function
                         .keyBy(Event::sourceAddress)
-
                         // the function that evaluates the state machine over the sequence of events
                         .flatMap(new StateMachineMapper());
 
@@ -137,7 +170,17 @@ public class StateMachineExample {
         if (outputFile == null) {
             alerts.print();
         } else {
-            alerts.writeAsText(outputFile, FileSystem.WriteMode.OVERWRITE).setParallelism(1);
+            alerts.sinkTo(
+                            FileSink.<Alert>forRowFormat(
+                                            new Path(outputFile), new SimpleStringEncoder<>())
+                                    .withRollingPolicy(
+                                            DefaultRollingPolicy.builder()
+                                                    .withMaxPartSize(MemorySize.ofMebiBytes(1))
+                                                    .withRolloverInterval(Duration.ofSeconds(10))
+                                                    .build())
+                                    .build())
+                    .setParallelism(1)
+                    .name("output");
         }
 
         // trigger program execution
@@ -158,27 +201,29 @@ public class StateMachineExample {
         private ValueState<State> currentState;
 
         @Override
-        public void open(Configuration conf) {
+        public void open(OpenContext openContext) {
             // get access to the state object
             currentState =
-                    getRuntimeContext().getState(new ValueStateDescriptor<>("state", State.class));
+                    getRuntimeContext()
+                            .getState(
+                                    new ValueStateDescriptor<>(
+                                            "state", TypeExtractor.createTypeInfo(State.class)));
         }
 
         @Override
         public void flatMap(Event evt, Collector<Alert> out) throws Exception {
             // get the current state for the key (source address)
-            // if no state exists, yet, the state must be the state machine's initial state
             State state = currentState.value();
+
+            // if no state exists, yet, the state must be the state machine's initial state
             if (state == null) {
                 state = State.Initial;
             }
 
             // ask the state machine what state we should go to based on the given event
             State nextState = state.transition(evt.type());
-
             if (nextState == State.InvalidTransition) {
-                // the current event resulted in an invalid transition
-                // raise an alert!
+                // the current event resulted in an invalid transition — raise an alert!
                 out.collect(new Alert(evt.sourceAddress(), state, evt.type()));
             } else if (nextState.isTerminal()) {
                 // we reached a terminal state, clean up the current state
@@ -188,5 +233,10 @@ public class StateMachineExample {
                 currentState.update(nextState);
             }
         }
+    }
+
+    // Used for backwards compatibility to convert legacy 'sleep' parameter to records per second.
+    private static double rpsFromSleep(int sleep, int parallelism) {
+        return (1000d / sleep) * parallelism;
     }
 }

@@ -19,6 +19,7 @@
 package org.apache.flink.runtime.operators.util;
 
 import org.apache.flink.api.common.ExecutionConfig;
+import org.apache.flink.api.common.JobInfo;
 import org.apache.flink.api.common.TaskInfo;
 import org.apache.flink.api.common.accumulators.Accumulator;
 import org.apache.flink.api.common.externalresource.ExternalResourceInfo;
@@ -26,7 +27,7 @@ import org.apache.flink.api.common.functions.BroadcastVariableInitializer;
 import org.apache.flink.api.common.functions.RuntimeContext;
 import org.apache.flink.api.common.functions.util.AbstractRuntimeUDFContext;
 import org.apache.flink.core.fs.Path;
-import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.groups.OperatorMetricGroup;
 import org.apache.flink.runtime.broadcast.BroadcastVariableMaterialization;
 import org.apache.flink.runtime.broadcast.InitializationTypeConflictException;
 import org.apache.flink.runtime.externalresource.ExternalResourceInfoProvider;
@@ -48,14 +49,22 @@ public class DistributedRuntimeUDFContext extends AbstractRuntimeUDFContext {
     private final ExternalResourceInfoProvider externalResourceInfoProvider;
 
     public DistributedRuntimeUDFContext(
+            JobInfo jobInfo,
             TaskInfo taskInfo,
             UserCodeClassLoader userCodeClassLoader,
             ExecutionConfig executionConfig,
             Map<String, Future<Path>> cpTasks,
             Map<String, Accumulator<?, ?>> accumulators,
-            MetricGroup metrics,
+            OperatorMetricGroup metrics,
             ExternalResourceInfoProvider externalResourceInfoProvider) {
-        super(taskInfo, userCodeClassLoader, executionConfig, accumulators, cpTasks, metrics);
+        super(
+                jobInfo,
+                taskInfo,
+                userCodeClassLoader,
+                executionConfig,
+                accumulators,
+                cpTasks,
+                metrics);
         this.externalResourceInfoProvider =
                 Preconditions.checkNotNull(externalResourceInfoProvider);
     }

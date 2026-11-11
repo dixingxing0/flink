@@ -20,15 +20,20 @@ package org.apache.flink.client.python;
 
 import org.apache.flink.client.deployment.application.UnsuccessfulExecutionException;
 import org.apache.flink.configuration.ConfigConstants;
+import org.apache.flink.configuration.ConfigurationUtils;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.configuration.SecurityOptions;
 import org.apache.flink.core.fs.Path;
+import org.apache.flink.python.util.PythonDependencyUtils;
+import org.apache.flink.util.CompressionUtils;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FileUtils;
 import org.apache.flink.util.NetUtils;
 import org.apache.flink.util.OperatingSystem;
 import org.apache.flink.util.Preconditions;
+import org.apache.flink.util.StringUtils;
 
-import org.apache.flink.shaded.guava18.com.google.common.base.Strings;
+import org.apache.flink.shaded.guava33.com.google.common.base.Strings;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,17 +66,28 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import static org.apache.flink.python.PythonOptions.PYTHON_ARCHIVES;
 import static org.apache.flink.python.PythonOptions.PYTHON_CLIENT_EXECUTABLE;
 import static org.apache.flink.python.PythonOptions.PYTHON_FILES;
+import static org.apache.flink.python.PythonOptions.PYTHON_PATH;
 import static org.apache.flink.python.util.PythonDependencyUtils.FILE_DELIMITER;
 
 /** The util class help to prepare Python env and run the python process. */
 final class PythonEnvUtils {
     private static final Logger LOG = LoggerFactory.getLogger(PythonEnvUtils.class);
 
+    private static final String PYTHON_ARCHIVES_DIR = "python-archives";
+
     static final String PYFLINK_CLIENT_EXECUTABLE = "PYFLINK_CLIENT_EXECUTABLE";
+
+    static final long CHECK_INTERVAL = 100;
+
+    static final long TIMEOUT_MILLIS = 10000;
+
+    public static int maxConcurrentPythonFunctionFactories = 10;
 
     static volatile Throwable capturedJavaException = null;
 
@@ -79,35 +95,13 @@ final class PythonEnvUtils {
     static class PythonEnvironment {
         String tempDirectory;
 
+        String archivesDirectory;
+
         String pythonExec = OperatingSystem.isWindows() ? "python.exe" : "python";
 
         String pythonPath;
 
         Map<String, String> systemEnv = new HashMap<>();
-    }
-
-    /**
-     * The hook thread that delete the tmp working dir of python process after the python process
-     * shutdown.
-     */
-    private static class ShutDownPythonHook extends Thread {
-        private Process p;
-        private String pyFileDir;
-
-        ShutDownPythonHook(Process p, String pyFileDir) {
-            this.p = p;
-            this.pyFileDir = pyFileDir;
-        }
-
-        public void run() {
-
-            p.destroyForcibly();
-
-            if (pyFileDir != null) {
-                File pyDir = new File(pyFileDir);
-                FileUtils.deleteDirectoryQuietly(pyDir);
-            }
-        }
     }
 
     /**
@@ -154,6 +148,82 @@ final class PythonEnvUtils {
                             .collect(Collectors.toList());
             addToPythonPath(env, pythonFiles);
         }
+
+        // 5. set the archives directory as the working directory, then user could access the
+        // content of the archives via relative path
+        if (config.getOptional(PYTHON_ARCHIVES).isPresent()
+                && (config.getOptional(PYTHON_CLIENT_EXECUTABLE).isPresent()
+                        || !StringUtils.isNullOrWhitespaceOnly(
+                                System.getenv(PYFLINK_CLIENT_EXECUTABLE)))) {
+            env.archivesDirectory = String.join(File.separator, tmpDir, PYTHON_ARCHIVES_DIR);
+
+            // extract archives to archives directory
+            config.getOptional(PYTHON_ARCHIVES)
+                    .ifPresent(
+                            pyArchives -> {
+                                for (String archive : pyArchives.split(FILE_DELIMITER)) {
+                                    final Path archivePath;
+                                    final String targetDirName;
+                                    final String originalFileName;
+                                    if (archive.contains(PythonDependencyUtils.PARAM_DELIMITER)) {
+                                        String[] filePathAndTargetDir =
+                                                archive.split(
+                                                        PythonDependencyUtils.PARAM_DELIMITER, 2);
+                                        archivePath = new Path(filePathAndTargetDir[0]);
+                                        targetDirName = filePathAndTargetDir[1];
+                                        originalFileName = archivePath.getName();
+                                    } else {
+                                        archivePath = new Path(archive);
+                                        originalFileName = archivePath.getName();
+                                        targetDirName = originalFileName;
+                                    }
+
+                                    Path localArchivePath = archivePath;
+                                    try {
+                                        if (archivePath.getFileSystem().isDistributedFS()) {
+                                            localArchivePath =
+                                                    new Path(
+                                                            env.tempDirectory,
+                                                            String.join(
+                                                                    File.separator,
+                                                                    UUID.randomUUID().toString(),
+                                                                    originalFileName));
+                                            FileUtils.copy(archivePath, localArchivePath, false);
+                                        }
+                                    } catch (IOException e) {
+                                        String msg =
+                                                String.format(
+                                                        "Error occurred when copying %s to %s.",
+                                                        archivePath, localArchivePath);
+                                        throw new RuntimeException(msg, e);
+                                    }
+
+                                    try {
+                                        CompressionUtils.extractFile(
+                                                localArchivePath.getPath(),
+                                                String.join(
+                                                        File.separator,
+                                                        env.archivesDirectory,
+                                                        targetDirName),
+                                                originalFileName);
+                                    } catch (IOException e) {
+                                        throw new RuntimeException(
+                                                "Extract archives to archives directory failed.",
+                                                e);
+                                    }
+                                }
+                            });
+        }
+
+        // 4. append configured python.pythonpath to the PYTHONPATH.
+        if (config.getOptional(PYTHON_PATH).isPresent()) {
+            env.pythonPath =
+                    String.join(
+                            File.pathSeparator,
+                            config.getOptional(PYTHON_PATH).get(),
+                            env.pythonPath);
+        }
+
         if (entryPointScript != null) {
             addToPythonPath(env, Collections.singletonList(new Path(entryPointScript)));
         }
@@ -201,8 +271,8 @@ final class PythonEnvUtils {
                 };
         try {
             Files.walkFileTree(FileSystems.getDefault().getPath(libDir), finder);
-        } catch (IOException e) {
-            LOG.error("Gets pyflink dependent libs failed.", e);
+        } catch (Throwable t) {
+            // ignore, this may occur when executing `flink run` using the PyFlink Python package.
         }
         return libFiles;
     }
@@ -242,6 +312,17 @@ final class PythonEnvUtils {
                     && sourceFileName.endsWith(".py")) {
                 // add the parent directory of .py file itself to PYTHONPATH
                 pythonPathList.add(targetPath.getParent().toString());
+            } else if (Files.isRegularFile(Paths.get(targetPath.toString()).toRealPath())
+                    && CompressionUtils.isCompressedFile(sourceFileName)) {
+                // expand the compressed file and add the root directory to PYTHONPATH
+                // as not all compressed files are importable
+                Path targetDirectory =
+                        new Path(
+                                targetPath.getParent(),
+                                CompressionUtils.getBaseNameWithoutExtension(sourceFileName));
+                CompressionUtils.extractFile(
+                        targetPath.toString(), targetDirectory.toString(), sourceFileName);
+                pythonPathList.add(targetDirectory.toString());
             } else {
                 pythonPathList.add(targetPath.toString());
             }
@@ -262,7 +343,10 @@ final class PythonEnvUtils {
      * @throws IOException Thrown if an error occurred when python process start.
      */
     static Process startPythonProcess(
-            PythonEnvironment pythonEnv, List<String> commands, boolean redirectToPipe)
+            PythonEnvironment pythonEnv,
+            List<String> commands,
+            boolean redirectToPipe,
+            List<String> additionalSensitiveKeys)
             throws IOException {
         ProcessBuilder pythonProcessBuilder = new ProcessBuilder();
         Map<String, String> env = pythonProcessBuilder.environment();
@@ -276,6 +360,9 @@ final class PythonEnvUtils {
                         String.join(File.pathSeparator, pythonEnv.pythonPath, defaultPythonPath));
             }
         }
+        if (pythonEnv.archivesDirectory != null) {
+            pythonProcessBuilder.directory(new File(pythonEnv.archivesDirectory));
+        }
         pythonEnv.systemEnv.forEach(env::put);
         commands.add(0, pythonEnv.pythonExec);
         pythonProcessBuilder.command(commands);
@@ -287,14 +374,19 @@ final class PythonEnvUtils {
             // set the child process the output same as the parent process.
             pythonProcessBuilder.redirectOutput(ProcessBuilder.Redirect.INHERIT);
         }
+        LOG.info(
+                "Starting Python process with environment variables: {{}}, command: {}",
+                ConfigurationUtils.hideSensitiveValues(env, additionalSensitiveKeys)
+                        .entrySet()
+                        .stream()
+                        .map(e -> e.getKey() + "=" + e.getValue())
+                        .collect(Collectors.joining(", ")),
+                String.join(" ", commands));
         Process process = pythonProcessBuilder.start();
-        if (!process.isAlive()) {
+        // Only a non-zero exit is a start failure; a fast process may already have finished.
+        if (!process.isAlive() && process.exitValue() != 0) {
             throw new RuntimeException("Failed to start Python process. ");
         }
-
-        // Make sure that the python sub process will be killed when JVM exit
-        ShutDownPythonHook hook = new ShutDownPythonHook(process, pythonEnv.tempDirectory);
-        Runtime.getRuntime().addShutdownHook(hook);
 
         return process;
     }
@@ -309,8 +401,8 @@ final class PythonEnvUtils {
         Thread thread =
                 new Thread(
                         () -> {
-                            try {
-                                int freePort = NetUtils.getAvailablePort();
+                            try (NetUtils.Port port = NetUtils.getAvailablePort()) {
+                                int freePort = port.getPort();
                                 GatewayServer server =
                                         new GatewayServer.GatewayServerBuilder()
                                                 .gateway(
@@ -342,7 +434,9 @@ final class PythonEnvUtils {
      * @param gatewayServer the gateway which creates the callback server.
      */
     private static void resetCallbackClientExecutorService(GatewayServer gatewayServer)
-            throws NoSuchFieldException, IllegalAccessException, NoSuchMethodException,
+            throws NoSuchFieldException,
+                    IllegalAccessException,
+                    NoSuchMethodException,
                     InvocationTargetException {
         CallbackClient callbackClient = (CallbackClient) gatewayServer.getCallbackClient();
         // The Java API of py4j does not provide approach to set "daemonize_connections" parameter.
@@ -364,11 +458,15 @@ final class PythonEnvUtils {
      * @param callbackServerListeningPort the listening port of the callback server.
      */
     public static void resetCallbackClient(
-            String callbackServerListeningAddress, int callbackServerListeningPort)
-            throws UnknownHostException, InvocationTargetException, NoSuchMethodException,
-                    IllegalAccessException, NoSuchFieldException {
+            GatewayServer gatewayServer,
+            String callbackServerListeningAddress,
+            int callbackServerListeningPort)
+            throws UnknownHostException,
+                    InvocationTargetException,
+                    NoSuchMethodException,
+                    IllegalAccessException,
+                    NoSuchFieldException {
 
-        gatewayServer = getGatewayServer();
         gatewayServer.resetCallbackClient(
                 InetAddress.getByName(callbackServerListeningAddress), callbackServerListeningPort);
         resetCallbackClientExecutorService(gatewayServer);
@@ -404,13 +502,58 @@ final class PythonEnvUtils {
         pythonEnv.systemEnv.put(
                 "PYFLINK_GATEWAY_PORT", String.valueOf(gatewayServer.getListeningPort()));
         // start the python process.
-        return PythonEnvUtils.startPythonProcess(pythonEnv, commands, redirectToPipe);
+        return PythonEnvUtils.startPythonProcess(
+                pythonEnv,
+                commands,
+                redirectToPipe,
+                config.get(SecurityOptions.ADDITIONAL_SENSITIVE_KEYS));
     }
 
     public static void setPythonException(Throwable pythonException) {
         if (ExceptionUtils.findThrowable(pythonException, UnsuccessfulExecutionException.class)
                 .isPresent()) {
             capturedJavaException = pythonException;
+        }
+    }
+
+    public static void shutdownPythonProcess(Process pythonProcess, long timeoutMillis) {
+        pythonProcess.destroy();
+        try {
+            pythonProcess.waitFor(timeoutMillis, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(
+                    "Interrupt while waiting for the python process to stop.", e);
+        }
+        if (pythonProcess.isAlive()) {
+            pythonProcess.destroyForcibly();
+        }
+    }
+
+    /** The shutdown hook used to destroy the Python process. */
+    public static class PythonProcessShutdownHook extends Thread {
+
+        private final Process process;
+        private final GatewayServer gatewayServer;
+        private final String tmpDir;
+
+        public PythonProcessShutdownHook(
+                Process process, GatewayServer gatewayServer, String tmpDir) {
+            this.process = process;
+            this.gatewayServer = gatewayServer;
+            this.tmpDir = tmpDir;
+        }
+
+        @Override
+        public void run() {
+            if (tmpDir != null) {
+                FileUtils.deleteDirectoryQuietly(new File(tmpDir));
+            }
+
+            try {
+                shutdownPythonProcess(process, TIMEOUT_MILLIS);
+            } finally {
+                gatewayServer.shutdown();
+            }
         }
     }
 }

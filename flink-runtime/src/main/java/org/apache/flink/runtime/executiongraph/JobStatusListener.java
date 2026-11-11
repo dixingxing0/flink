@@ -30,8 +30,16 @@ public interface JobStatusListener {
      * @param jobId The ID of the job.
      * @param newJobStatus The status the job switched to.
      * @param timestamp The timestamp when the status transition occurred.
-     * @param error In case the job status switches to a failure state, this is the exception that
-     *     caused the failure.
      */
-    void jobStatusChanges(JobID jobId, JobStatus newJobStatus, long timestamp, Throwable error);
+    void jobStatusChanges(JobID jobId, JobStatus newJobStatus, long timestamp);
+
+    static JobStatusListener combine(JobStatusListener... jobStatusListeners) {
+        return (jobId, newJobStatus, timestamp) -> {
+            for (JobStatusListener jobStatusListener : jobStatusListeners) {
+                if (jobStatusListener != null) {
+                    jobStatusListener.jobStatusChanges(jobId, newJobStatus, timestamp);
+                }
+            }
+        };
+    }
 }

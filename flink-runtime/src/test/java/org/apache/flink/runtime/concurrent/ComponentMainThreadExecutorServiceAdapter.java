@@ -20,6 +20,8 @@ package org.apache.flink.runtime.concurrent;
 
 import org.apache.flink.runtime.rpc.MainThreadValidatorUtil;
 import org.apache.flink.runtime.testutils.DirectScheduledExecutorService;
+import org.apache.flink.util.concurrent.ScheduledExecutor;
+import org.apache.flink.util.concurrent.ScheduledExecutorServiceAdapter;
 
 import javax.annotation.Nonnull;
 
@@ -76,6 +78,13 @@ public class ComponentMainThreadExecutorServiceAdapter implements ComponentMainT
             @Nonnull ScheduledExecutorService singleThreadExecutor) {
         final Thread thread =
                 CompletableFuture.supplyAsync(Thread::currentThread, singleThreadExecutor).join();
+        final String testMainThreadNamePrefix = "ComponentMainThread";
+        if (!thread.getName().contains(testMainThreadNamePrefix)) {
+            // we have to check the current name first because this instance can be reused as a
+            // ScheduledExecutorService
+            thread.setName(String.format("%s-%s", testMainThreadNamePrefix, thread.getName()));
+        }
+
         return new ComponentMainThreadExecutorServiceAdapter(singleThreadExecutor, thread);
     }
 

@@ -18,41 +18,38 @@
 
 package org.apache.flink.runtime.scheduler.strategy;
 
-import org.apache.flink.api.common.InputDependencyConstraint;
 import org.apache.flink.runtime.execution.ExecutionState;
+import org.apache.flink.runtime.jobgraph.IntermediateResultPartitionID;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
+import org.apache.flink.util.IterableUtils;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
-
-import static org.apache.flink.api.common.InputDependencyConstraint.ANY;
-import static org.apache.flink.util.Preconditions.checkNotNull;
+import java.util.Map;
 
 /** A simple scheduling execution vertex for testing purposes. */
 public class TestingSchedulingExecutionVertex implements SchedulingExecutionVertex {
 
     private final ExecutionVertexID executionVertexId;
 
-    private final Collection<TestingSchedulingResultPartition> consumedPartitions;
+    private final List<ConsumedPartitionGroup> consumedPartitionGroups;
 
     private final Collection<TestingSchedulingResultPartition> producedPartitions;
 
-    private final InputDependencyConstraint inputDependencyConstraint;
+    private final Map<IntermediateResultPartitionID, TestingSchedulingResultPartition>
+            resultPartitionsById;
 
     private ExecutionState executionState;
 
     public TestingSchedulingExecutionVertex(
-            JobVertexID jobVertexId,
-            int subtaskIndex,
-            InputDependencyConstraint constraint,
-            Collection<TestingSchedulingResultPartition> consumedPartitions,
-            ExecutionState executionState) {
+            JobVertexID jobVertexId, int subtaskIndex, ExecutionState executionState) {
 
         this.executionVertexId = new ExecutionVertexID(jobVertexId, subtaskIndex);
-        this.inputDependencyConstraint = constraint;
-        this.consumedPartitions = checkNotNull(consumedPartitions);
+        this.consumedPartitionGroups = new ArrayList<>();
         this.producedPartitions = new ArrayList<>();
+        this.resultPartitionsById = new HashMap<>();
         this.executionState = executionState;
     }
 
@@ -72,7 +69,7 @@ public class TestingSchedulingExecutionVertex implements SchedulingExecutionVert
 
     @Override
     public Iterable<TestingSchedulingResultPartition> getConsumedResults() {
-        return consumedPartitions;
+        return IterableUtils.flatMap(consumedPartitionGroups, resultPartitionsById::get);
     }
 
     @Override
@@ -81,12 +78,16 @@ public class TestingSchedulingExecutionVertex implements SchedulingExecutionVert
     }
 
     @Override
-    public InputDependencyConstraint getInputDependencyConstraint() {
-        return inputDependencyConstraint;
+    public List<ConsumedPartitionGroup> getConsumedPartitionGroups() {
+        return consumedPartitionGroups;
     }
 
-    void addConsumedPartition(TestingSchedulingResultPartition partition) {
-        consumedPartitions.add(partition);
+    void addConsumedPartitionGroup(
+            ConsumedPartitionGroup consumedPartitionGroup,
+            Map<IntermediateResultPartitionID, TestingSchedulingResultPartition>
+                    consumedResultPartitionById) {
+        this.consumedPartitionGroups.add(consumedPartitionGroup);
+        this.resultPartitionsById.putAll(consumedResultPartitionById);
     }
 
     void addProducedPartition(TestingSchedulingResultPartition partition) {
@@ -106,23 +107,11 @@ public class TestingSchedulingExecutionVertex implements SchedulingExecutionVert
     public static class Builder {
         private JobVertexID jobVertexId = new JobVertexID();
         private int subtaskIndex = 0;
-        private InputDependencyConstraint inputDependencyConstraint = ANY;
-        private List<TestingSchedulingResultPartition> partitions = new ArrayList<>();
         private ExecutionState executionState = ExecutionState.CREATED;
 
         Builder withExecutionVertexID(JobVertexID jobVertexId, int subtaskIndex) {
             this.jobVertexId = jobVertexId;
             this.subtaskIndex = subtaskIndex;
-            return this;
-        }
-
-        Builder withInputDependencyConstraint(InputDependencyConstraint constraint) {
-            this.inputDependencyConstraint = constraint;
-            return this;
-        }
-
-        public Builder withConsumedPartitions(List<TestingSchedulingResultPartition> partitions) {
-            this.partitions = partitions;
             return this;
         }
 
@@ -132,12 +121,7 @@ public class TestingSchedulingExecutionVertex implements SchedulingExecutionVert
         }
 
         public TestingSchedulingExecutionVertex build() {
-            return new TestingSchedulingExecutionVertex(
-                    jobVertexId,
-                    subtaskIndex,
-                    inputDependencyConstraint,
-                    partitions,
-                    executionState);
+            return new TestingSchedulingExecutionVertex(jobVertexId, subtaskIndex, executionState);
         }
     }
 }

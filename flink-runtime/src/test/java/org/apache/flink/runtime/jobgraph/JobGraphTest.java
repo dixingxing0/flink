@@ -26,7 +26,7 @@ import org.apache.flink.runtime.checkpoint.CheckpointRetentionPolicy;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
 import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguration;
 import org.apache.flink.runtime.jobgraph.tasks.JobCheckpointingSettings;
-import org.apache.flink.runtime.jobmanager.scheduler.CoLocationGroupDesc;
+import org.apache.flink.runtime.jobmanager.scheduler.CoLocationGroup;
 import org.apache.flink.runtime.jobmanager.scheduler.SlotSharingGroup;
 import org.apache.flink.util.InstantiationUtil;
 import org.apache.flink.util.TestLogger;
@@ -34,9 +34,11 @@ import org.apache.flink.util.TestLogger;
 import org.junit.Test;
 
 import java.io.IOException;
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.List;
 
+import static org.apache.flink.configuration.ConfigurationUtils.getDoubleConfigOption;
+import static org.apache.flink.runtime.util.JobVertexConnectionUtils.connectNewDataSetAsInput;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.hasSize;
 import static org.junit.Assert.assertEquals;
@@ -57,7 +59,7 @@ public class JobGraphTest extends TestLogger {
             // add some configuration values
             {
                 jg.getJobConfiguration().setString("some key", "some value");
-                jg.getJobConfiguration().setDouble("Life of ", Math.PI);
+                jg.getJobConfiguration().set(getDoubleConfigOption("Life of "), Math.PI);
             }
 
             // add some vertices
@@ -65,10 +67,16 @@ public class JobGraphTest extends TestLogger {
                 JobVertex source1 = new JobVertex("source1");
                 JobVertex source2 = new JobVertex("source2");
                 JobVertex target = new JobVertex("target");
-                target.connectNewDataSetAsInput(
-                        source1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-                target.connectNewDataSetAsInput(
-                        source2, DistributionPattern.ALL_TO_ALL, ResultPartitionType.PIPELINED);
+                connectNewDataSetAsInput(
+                        target,
+                        source1,
+                        DistributionPattern.POINTWISE,
+                        ResultPartitionType.PIPELINED);
+                connectNewDataSetAsInput(
+                        target,
+                        source2,
+                        DistributionPattern.ALL_TO_ALL,
+                        ResultPartitionType.PIPELINED);
 
                 jg.addVertex(source1);
                 jg.addVertex(source2);
@@ -100,49 +108,48 @@ public class JobGraphTest extends TestLogger {
 
     @Test
     public void testTopologicalSort1() {
-        try {
-            JobVertex source1 = new JobVertex("source1");
-            JobVertex source2 = new JobVertex("source2");
-            JobVertex target1 = new JobVertex("target1");
-            JobVertex target2 = new JobVertex("target2");
-            JobVertex intermediate1 = new JobVertex("intermediate1");
-            JobVertex intermediate2 = new JobVertex("intermediate2");
+        JobVertex source1 = new JobVertex("source1");
+        JobVertex source2 = new JobVertex("source2");
+        JobVertex target1 = new JobVertex("target1");
+        JobVertex target2 = new JobVertex("target2");
+        JobVertex intermediate1 = new JobVertex("intermediate1");
+        JobVertex intermediate2 = new JobVertex("intermediate2");
 
-            target1.connectNewDataSetAsInput(
-                    source1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            target2.connectNewDataSetAsInput(
-                    source1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            target2.connectNewDataSetAsInput(
-                    intermediate2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            intermediate2.connectNewDataSetAsInput(
-                    intermediate1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            intermediate1.connectNewDataSetAsInput(
-                    source2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+        connectNewDataSetAsInput(
+                target1, source1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+        connectNewDataSetAsInput(
+                target2, source1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+        connectNewDataSetAsInput(
+                target2,
+                intermediate2,
+                DistributionPattern.POINTWISE,
+                ResultPartitionType.PIPELINED);
+        connectNewDataSetAsInput(
+                intermediate2,
+                intermediate1,
+                DistributionPattern.POINTWISE,
+                ResultPartitionType.PIPELINED);
+        connectNewDataSetAsInput(
+                intermediate1,
+                source2,
+                DistributionPattern.POINTWISE,
+                ResultPartitionType.PIPELINED);
 
-            JobGraph graph =
-                    new JobGraph(
-                            "TestGraph",
-                            source1,
-                            source2,
-                            intermediate1,
-                            intermediate2,
-                            target1,
-                            target2);
-            List<JobVertex> sorted = graph.getVerticesSortedTopologicallyFromSources();
+        JobGraph graph =
+                JobGraphTestUtils.streamingJobGraph(
+                        source1, source2, intermediate1, intermediate2, target1, target2);
 
-            assertEquals(6, sorted.size());
+        List<JobVertex> sorted = graph.getVerticesSortedTopologicallyFromSources();
 
-            assertBefore(source1, target1, sorted);
-            assertBefore(source1, target2, sorted);
-            assertBefore(source2, target2, sorted);
-            assertBefore(source2, intermediate1, sorted);
-            assertBefore(source2, intermediate2, sorted);
-            assertBefore(intermediate1, target2, sorted);
-            assertBefore(intermediate2, target2, sorted);
-        } catch (Exception e) {
-            e.printStackTrace();
-            fail(e.getMessage());
-        }
+        assertEquals(6, sorted.size());
+
+        assertBefore(source1, target1, sorted);
+        assertBefore(source1, target2, sorted);
+        assertBefore(source2, target2, sorted);
+        assertBefore(source2, intermediate1, sorted);
+        assertBefore(source2, intermediate2, sorted);
+        assertBefore(intermediate1, target2, sorted);
+        assertBefore(intermediate2, target2, sorted);
     }
 
     @Test
@@ -156,30 +163,31 @@ public class JobGraphTest extends TestLogger {
             JobVertex l13 = new JobVertex("layer 1 - 3");
             JobVertex l2 = new JobVertex("layer 2");
 
-            root.connectNewDataSetAsInput(
-                    l13, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            root.connectNewDataSetAsInput(
-                    source2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            root.connectNewDataSetAsInput(
-                    l2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    root, l13, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    root, source2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    root, l2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            l2.connectNewDataSetAsInput(
-                    l11, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            l2.connectNewDataSetAsInput(
-                    l12, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    l2, l11, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    l2, l12, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            l11.connectNewDataSetAsInput(
-                    source1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    l11, source1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            l12.connectNewDataSetAsInput(
-                    source1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            l12.connectNewDataSetAsInput(
-                    source2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    l12, source1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    l12, source2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            l13.connectNewDataSetAsInput(
-                    source2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    l13, source2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            JobGraph graph = new JobGraph("TestGraph", source1, source2, root, l11, l13, l12, l2);
+            JobGraph graph =
+                    JobGraphTestUtils.streamingJobGraph(source1, source2, root, l11, l13, l12, l2);
             List<JobVertex> sorted = graph.getVerticesSortedTopologicallyFromSources();
 
             assertEquals(7, sorted.size());
@@ -219,16 +227,16 @@ public class JobGraphTest extends TestLogger {
             JobVertex op2 = new JobVertex("op2");
             JobVertex op3 = new JobVertex("op3");
 
-            op1.connectNewDataSetAsInput(
-                    source, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            op2.connectNewDataSetAsInput(
-                    op1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            op2.connectNewDataSetAsInput(
-                    source, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            op3.connectNewDataSetAsInput(
-                    op2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    op1, source, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    op2, op1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    op2, source, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    op3, op2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            JobGraph graph = new JobGraph("TestGraph", source, op1, op2, op3);
+            JobGraph graph = JobGraphTestUtils.streamingJobGraph(source, op1, op2, op3);
             List<JobVertex> sorted = graph.getVerticesSortedTopologicallyFromSources();
 
             assertEquals(4, sorted.size());
@@ -251,16 +259,16 @@ public class JobGraphTest extends TestLogger {
             JobVertex v3 = new JobVertex("3");
             JobVertex v4 = new JobVertex("4");
 
-            v1.connectNewDataSetAsInput(
-                    v4, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            v2.connectNewDataSetAsInput(
-                    v1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            v3.connectNewDataSetAsInput(
-                    v2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            v4.connectNewDataSetAsInput(
-                    v3, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    v1, v4, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    v2, v1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    v3, v2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    v4, v3, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            JobGraph jg = new JobGraph("Cyclic Graph", v1, v2, v3, v4);
+            JobGraph jg = JobGraphTestUtils.streamingJobGraph(v1, v2, v3, v4);
             try {
                 jg.getVerticesSortedTopologicallyFromSources();
                 fail("Failed to raise error on topologically sorting cyclic graph.");
@@ -283,20 +291,20 @@ public class JobGraphTest extends TestLogger {
             JobVertex v4 = new JobVertex("4");
             JobVertex target = new JobVertex("target");
 
-            v1.connectNewDataSetAsInput(
-                    source, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            v1.connectNewDataSetAsInput(
-                    v4, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            v2.connectNewDataSetAsInput(
-                    v1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            v3.connectNewDataSetAsInput(
-                    v2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            v4.connectNewDataSetAsInput(
-                    v3, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
-            target.connectNewDataSetAsInput(
-                    v3, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    v1, source, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    v1, v4, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    v2, v1, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    v3, v2, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    v4, v3, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
+            connectNewDataSetAsInput(
+                    target, v3, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
-            JobGraph jg = new JobGraph("Cyclic Graph", v1, v2, v3, v4, source, target);
+            JobGraph jg = JobGraphTestUtils.streamingJobGraph(v1, v2, v3, v4, source, target);
             try {
                 jg.getVerticesSortedTopologicallyFromSources();
                 fail("Failed to raise error on topologically sorting cyclic graph.");
@@ -330,7 +338,7 @@ public class JobGraphTest extends TestLogger {
 
     @Test
     public void testSetUserArtifactBlobKey() throws IOException, ClassNotFoundException {
-        JobGraph jb = new JobGraph();
+        JobGraph jb = JobGraphTestUtils.emptyJobGraph();
 
         final DistributedCache.DistributedCacheEntry[] entries = {
             new DistributedCache.DistributedCacheEntry("p1", true, true),
@@ -353,7 +361,7 @@ public class JobGraphTest extends TestLogger {
             assertEquals(
                     blobKey,
                     InstantiationUtil.deserializeObject(
-                            jobGraphEntry.blobKey, ClassLoader.getSystemClassLoader(), false));
+                            jobGraphEntry.blobKey, ClassLoader.getSystemClassLoader()));
             assertEquals(entry.isExecutable, jobGraphEntry.isExecutable);
             assertEquals(entry.isZipped, jobGraphEntry.isZipped);
             assertEquals(entry.filePath, jobGraphEntry.filePath);
@@ -361,24 +369,36 @@ public class JobGraphTest extends TestLogger {
     }
 
     @Test
-    public void checkpointingIsDisabledByDefault() {
-        final JobGraph jobGraph = new JobGraph();
+    public void checkpointingIsDisabledByDefaultForStreamingJobGraph() {
+        final JobGraph jobGraph = JobGraphBuilder.newStreamingJobGraphBuilder().build();
+
+        assertFalse(jobGraph.isCheckpointingEnabled());
+    }
+
+    @Test
+    public void checkpointingIsDisabledByDefaultForBatchJobGraph() {
+        final JobGraph jobGraph = JobGraphBuilder.newBatchJobGraphBuilder().build();
 
         assertFalse(jobGraph.isCheckpointingEnabled());
     }
 
     @Test
     public void checkpointingIsEnabledIfIntervalIsqAndLegal() {
-        final JobGraph jobGraph = new JobGraph();
-        jobGraph.setSnapshotSettings(createCheckpointSettingsWithInterval(10));
+        final JobGraph jobGraph =
+                JobGraphBuilder.newStreamingJobGraphBuilder()
+                        .setJobCheckpointingSettings(createCheckpointSettingsWithInterval(10))
+                        .build();
 
         assertTrue(jobGraph.isCheckpointingEnabled());
     }
 
     @Test
     public void checkpointingIsDisabledIfIntervalIsMaxValue() {
-        final JobGraph jobGraph = new JobGraph();
-        jobGraph.setSnapshotSettings(createCheckpointSettingsWithInterval(Long.MAX_VALUE));
+        final JobGraph jobGraph =
+                JobGraphBuilder.newStreamingJobGraphBuilder()
+                        .setJobCheckpointingSettings(
+                                createCheckpointSettingsWithInterval(Long.MAX_VALUE))
+                        .build();
 
         assertFalse(jobGraph.isCheckpointingEnabled());
     }
@@ -394,15 +414,10 @@ public class JobGraphTest extends TestLogger {
                         CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,
                         true,
                         false,
-                        false,
+                        0,
                         0);
 
-        return new JobCheckpointingSettings(
-                Collections.emptyList(),
-                Collections.emptyList(),
-                Collections.emptyList(),
-                checkpointCoordinatorConfiguration,
-                null);
+        return new JobCheckpointingSettings(checkpointCoordinatorConfiguration, null);
     }
 
     @Test
@@ -420,13 +435,16 @@ public class JobGraphTest extends TestLogger {
         v3.setSlotSharingGroup(group2);
         v4.setSlotSharingGroup(group2);
 
-        final JobGraph jobGraph = new JobGraph(v1, v2, v3, v4);
+        final JobGraph jobGraph =
+                JobGraphBuilder.newStreamingJobGraphBuilder()
+                        .addJobVertices(Arrays.asList(v1, v2, v3, v4))
+                        .build();
 
         assertThat(jobGraph.getSlotSharingGroups(), containsInAnyOrder(group1, group2));
     }
 
     @Test
-    public void testGetCoLocationGroupDescriptors() {
+    public void testGetCoLocationGroups() {
         final JobVertex v1 = new JobVertex("1");
         final JobVertex v2 = new JobVertex("2");
         final JobVertex v3 = new JobVertex("3");
@@ -437,13 +455,15 @@ public class JobGraphTest extends TestLogger {
         v2.setSlotSharingGroup(slotSharingGroup);
         v1.setStrictlyCoLocatedWith(v2);
 
-        final JobGraph jobGraph = new JobGraph(v1, v2, v3, v4);
+        final JobGraph jobGraph =
+                JobGraphBuilder.newStreamingJobGraphBuilder()
+                        .addJobVertices(Arrays.asList(v1, v2, v3, v4))
+                        .build();
 
-        assertThat(jobGraph.getCoLocationGroupDescriptors(), hasSize(1));
+        assertThat(jobGraph.getCoLocationGroups(), hasSize(1));
 
-        final CoLocationGroupDesc onlyCoLocationGroupDesc =
-                jobGraph.getCoLocationGroupDescriptors().iterator().next();
-        assertThat(
-                onlyCoLocationGroupDesc.getVertices(), containsInAnyOrder(v1.getID(), v2.getID()));
+        final CoLocationGroup onlyCoLocationGroup =
+                jobGraph.getCoLocationGroups().iterator().next();
+        assertThat(onlyCoLocationGroup.getVertexIds(), containsInAnyOrder(v1.getID(), v2.getID()));
     }
 }

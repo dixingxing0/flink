@@ -21,17 +21,23 @@ package org.apache.flink.table.expressions;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.api.ApiExpression;
 import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.Model;
 import org.apache.flink.table.api.Table;
+import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.ValidationException;
+import org.apache.flink.table.api.internal.ModelImpl;
+import org.apache.flink.table.api.internal.TableImpl;
+import org.apache.flink.table.catalog.ContextResolvedFunction;
 import org.apache.flink.table.functions.BuiltInFunctionDefinition;
 import org.apache.flink.table.functions.BuiltInFunctionDefinitions;
 import org.apache.flink.table.functions.FunctionDefinition;
-import org.apache.flink.table.functions.FunctionIdentifier;
 import org.apache.flink.table.functions.FunctionKind;
 import org.apache.flink.table.operations.QueryOperation;
 import org.apache.flink.table.types.DataType;
+import org.apache.flink.table.types.UnresolvedDataType;
 import org.apache.flink.types.Row;
 import org.apache.flink.types.RowKind;
+import org.apache.flink.types.bitmap.Bitmap;
 
 import java.lang.reflect.Array;
 import java.lang.reflect.InvocationTargetException;
@@ -108,6 +114,10 @@ public final class ApiExpressionUtils {
             return convertArray(expression);
         } else if (expression instanceof List) {
             return convertJavaList((List<?>) expression);
+        } else if (expression instanceof Bitmap) {
+            return unresolvedCall(
+                    BuiltInFunctionDefinitions.BITMAP_FROM_BYTES,
+                    new ValueLiteralExpression(((Bitmap) expression).toBytes()));
         } else {
             return convertScala(expression).orElseGet(() -> valueLiteral(expression));
         }
@@ -174,7 +184,9 @@ public final class ApiExpressionUtils {
     }
 
     private static Optional<Expression> convertScalaMap(Object obj)
-            throws ClassNotFoundException, NoSuchMethodException, IllegalAccessException,
+            throws ClassNotFoundException,
+                    NoSuchMethodException,
+                    IllegalAccessException,
                     InvocationTargetException {
         Class<?> mapClass = Class.forName("scala.collection.Map");
         if (mapClass.isAssignableFrom(obj.getClass())) {
@@ -202,7 +214,9 @@ public final class ApiExpressionUtils {
     }
 
     private static Optional<Expression> convertScalaSeq(Object obj)
-            throws ClassNotFoundException, NoSuchMethodException, IllegalAccessException,
+            throws ClassNotFoundException,
+                    NoSuchMethodException,
+                    IllegalAccessException,
                     InvocationTargetException {
         Class<?> seqClass = Class.forName("scala.collection.Seq");
         if (seqClass.isAssignableFrom(obj.getClass())) {
@@ -220,7 +234,9 @@ public final class ApiExpressionUtils {
     }
 
     private static Optional<Expression> convertScalaBigDecimal(Object obj)
-            throws ClassNotFoundException, NoSuchMethodException, IllegalAccessException,
+            throws ClassNotFoundException,
+                    NoSuchMethodException,
+                    IllegalAccessException,
                     InvocationTargetException {
         Class<?> decimalClass = Class.forName("scala.math.BigDecimal");
         if (decimalClass.equals(obj.getClass())) {
@@ -255,24 +271,24 @@ public final class ApiExpressionUtils {
         return new TypeLiteralExpression(dataType);
     }
 
+    public static UnresolvedTypeLiteralExpression unresolvedType(
+            UnresolvedDataType unresolvedDataType) {
+        return new UnresolvedTypeLiteralExpression(unresolvedDataType);
+    }
+
     public static UnresolvedReferenceExpression unresolvedRef(String name) {
         return new UnresolvedReferenceExpression(name);
     }
 
     public static UnresolvedCallExpression unresolvedCall(
-            FunctionIdentifier functionIdentifier,
-            FunctionDefinition functionDefinition,
-            Expression... args) {
-        return unresolvedCall(functionIdentifier, functionDefinition, Arrays.asList(args));
+            ContextResolvedFunction resolvedFunction, Expression... args) {
+        return unresolvedCall(resolvedFunction, Arrays.asList(args));
     }
 
     public static UnresolvedCallExpression unresolvedCall(
-            FunctionIdentifier functionIdentifier,
-            FunctionDefinition functionDefinition,
-            List<Expression> args) {
+            ContextResolvedFunction resolvedFunction, List<Expression> args) {
         return new UnresolvedCallExpression(
-                functionIdentifier,
-                functionDefinition,
+                resolvedFunction,
                 args.stream().map(ApiExpressionUtils::unwrapFromApi).collect(Collectors.toList()));
     }
 
@@ -284,16 +300,23 @@ public final class ApiExpressionUtils {
     public static UnresolvedCallExpression unresolvedCall(
             FunctionDefinition functionDefinition, List<Expression> args) {
         return new UnresolvedCallExpression(
-                functionDefinition,
+                ContextResolvedFunction.anonymous(functionDefinition),
                 args.stream().map(ApiExpressionUtils::unwrapFromApi).collect(Collectors.toList()));
     }
 
     public static TableReferenceExpression tableRef(String name, Table table) {
-        return tableRef(name, table.getQueryOperation());
+        return new TableReferenceExpression(
+                name, table.getQueryOperation(), ((TableImpl) table).getTableEnvironment());
     }
 
-    public static TableReferenceExpression tableRef(String name, QueryOperation queryOperation) {
-        return new TableReferenceExpression(name, queryOperation);
+    public static TableReferenceExpression tableRef(
+            String name, QueryOperation queryOperation, TableEnvironment env) {
+        return new TableReferenceExpression(name, queryOperation, env);
+    }
+
+    public static ModelReferenceExpression modelRef(String name, Model model) {
+        return new ModelReferenceExpression(
+                name, ((ModelImpl) model).getModel(), ((ModelImpl) model).getTableEnvironment());
     }
 
     public static LookupCallExpression lookupCall(String name, Expression... args) {
@@ -302,6 +325,10 @@ public final class ApiExpressionUtils {
                 Arrays.stream(args)
                         .map(ApiExpressionUtils::unwrapFromApi)
                         .collect(Collectors.toList()));
+    }
+
+    public static SqlCallExpression sqlCall(String sqlExpression) {
+        return new SqlCallExpression(sqlExpression);
     }
 
     public static Expression toMonthInterval(Expression e, int multiplier) {

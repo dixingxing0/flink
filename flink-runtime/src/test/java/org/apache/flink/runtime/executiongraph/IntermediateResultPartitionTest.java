@@ -18,129 +18,417 @@
 
 package org.apache.flink.runtime.executiongraph;
 
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutorServiceAdapter;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
+import org.apache.flink.runtime.jobgraph.DistributionPattern;
+import org.apache.flink.runtime.jobgraph.IntermediateDataSet;
+import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
+import org.apache.flink.runtime.jobgraph.JobEdge;
+import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobgraph.JobGraphBuilder;
+import org.apache.flink.runtime.jobgraph.JobGraphTestUtils;
 import org.apache.flink.runtime.jobgraph.JobVertex;
-import org.apache.flink.runtime.jobgraph.ScheduleMode;
+import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
+import org.apache.flink.runtime.scheduler.DefaultSchedulerBuilder;
+import org.apache.flink.runtime.scheduler.SchedulerBase;
+import org.apache.flink.runtime.scheduler.VertexParallelismStore;
+import org.apache.flink.runtime.scheduler.adaptivebatch.AdaptiveBatchScheduler;
+import org.apache.flink.runtime.scheduler.strategy.ConsumedPartitionGroup;
 import org.apache.flink.runtime.testtasks.NoOpInvokable;
 import org.apache.flink.runtime.testutils.DirectScheduledExecutorService;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.testutils.TestingUtils;
+import org.apache.flink.testutils.executor.TestExecutorExtension;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
-import static org.apache.flink.runtime.executiongraph.ExecutionGraphTestUtils.getExecutionJobVertex;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.stream.Collectors;
+
+import static org.apache.flink.runtime.scheduler.adaptivebatch.AdaptiveBatchScheduler.computeVertexParallelismStoreForDynamicGraph;
+import static org.apache.flink.runtime.util.JobVertexConnectionUtils.connectNewDataSetAsInput;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for {@link IntermediateResultPartition}. */
-public class IntermediateResultPartitionTest extends TestLogger {
+public class IntermediateResultPartitionTest {
+    @RegisterExtension
+    static final TestExecutorExtension<ScheduledExecutorService> EXECUTOR_RESOURCE =
+            TestingUtils.defaultExecutorExtension();
 
     @Test
-    public void testPipelinedPartitionConsumable() throws Exception {
-        IntermediateResult result = createResult(ResultPartitionType.PIPELINED, 2);
-        IntermediateResultPartition partition1 = result.getPartitions()[0];
-        IntermediateResultPartition partition2 = result.getPartitions()[1];
-
-        // Not consumable on init
-        assertFalse(partition1.isConsumable());
-        assertFalse(partition2.isConsumable());
-
-        // Partition 1 consumable after data are produced
-        partition1.markDataProduced();
-        assertTrue(partition1.isConsumable());
-        assertFalse(partition2.isConsumable());
-
-        // Not consumable if failover happens
-        result.resetForNewExecution();
-        assertFalse(partition1.isConsumable());
-        assertFalse(partition2.isConsumable());
-    }
-
-    @Test
-    public void testBlockingPartitionConsumable() throws Exception {
+    void testPartitionDataAllProduced() throws Exception {
         IntermediateResult result = createResult(ResultPartitionType.BLOCKING, 2);
         IntermediateResultPartition partition1 = result.getPartitions()[0];
         IntermediateResultPartition partition2 = result.getPartitions()[1];
 
-        // Not consumable on init
-        assertFalse(partition1.isConsumable());
-        assertFalse(partition2.isConsumable());
+        ConsumedPartitionGroup consumedPartitionGroup =
+                partition1.getConsumedPartitionGroups().get(0);
 
-        // Not consumable if only one partition is FINISHED
+        // Not all data produced on init
+        assertThat(partition1.hasDataAllProduced()).isFalse();
+        assertThat(partition2.hasDataAllProduced()).isFalse();
+        assertThat(consumedPartitionGroup.areAllPartitionsFinished()).isFalse();
+
+        // Finished partition has produced all data
         partition1.markFinished();
-        assertFalse(partition1.isConsumable());
-        assertFalse(partition2.isConsumable());
-        assertFalse(result.areAllPartitionsFinished());
+        assertThat(partition1.hasDataAllProduced()).isTrue();
+        assertThat(partition2.hasDataAllProduced()).isFalse();
+        assertThat(consumedPartitionGroup.areAllPartitionsFinished()).isFalse();
 
-        // Consumable after all partitions are FINISHED
+        // Finished partition has produced all data
         partition2.markFinished();
-        assertTrue(partition1.isConsumable());
-        assertTrue(partition2.isConsumable());
-        assertTrue(result.areAllPartitionsFinished());
+        assertThat(partition1.hasDataAllProduced()).isTrue();
+        assertThat(partition2.hasDataAllProduced()).isTrue();
+        assertThat(consumedPartitionGroup.areAllPartitionsFinished()).isTrue();
 
-        // Not consumable if failover happens
+        // Not all data produced if failover happens
         result.resetForNewExecution();
-        assertFalse(partition1.isConsumable());
-        assertFalse(partition2.isConsumable());
-        assertFalse(result.areAllPartitionsFinished());
+        assertThat(partition1.hasDataAllProduced()).isFalse();
+        assertThat(partition2.hasDataAllProduced()).isFalse();
+        assertThat(consumedPartitionGroup.areAllPartitionsFinished()).isFalse();
     }
 
     @Test
-    public void testBlockingPartitionResetting() throws Exception {
+    void testBlockingPartitionResetting() throws Exception {
         IntermediateResult result = createResult(ResultPartitionType.BLOCKING, 2);
         IntermediateResultPartition partition1 = result.getPartitions()[0];
         IntermediateResultPartition partition2 = result.getPartitions()[1];
 
-        // Not consumable on init
-        assertFalse(partition1.isConsumable());
-        assertFalse(partition2.isConsumable());
+        ConsumedPartitionGroup consumedPartitionGroup =
+                partition1.getConsumedPartitionGroups().get(0);
 
-        // Not consumable if partition1 is FINISHED
+        // Not all data data produced on init
+        assertThat(partition1.hasDataAllProduced()).isFalse();
+        assertThat(partition2.hasDataAllProduced()).isFalse();
+
+        // Finished partition has produced all data
         partition1.markFinished();
-        assertEquals(1, result.getNumberOfRunningProducers());
-        assertFalse(partition1.isConsumable());
-        assertFalse(partition2.isConsumable());
-        assertFalse(result.areAllPartitionsFinished());
+        assertThat(consumedPartitionGroup.getNumberOfUnfinishedPartitions()).isOne();
+        assertThat(partition1.hasDataAllProduced()).isTrue();
+        assertThat(partition2.hasDataAllProduced()).isFalse();
+        assertThat(consumedPartitionGroup.areAllPartitionsFinished()).isFalse();
 
-        // Reset the result and mark partition2 FINISHED, the result should still not be consumable
+        // Reset the result and mark partition2 FINISHED, partition1's hasDataAllProduced should be
+        // false, partition2's hasDataAllProduced should be true
         result.resetForNewExecution();
-        assertEquals(2, result.getNumberOfRunningProducers());
+        assertThat(consumedPartitionGroup.getNumberOfUnfinishedPartitions()).isEqualTo(2);
         partition2.markFinished();
-        assertEquals(1, result.getNumberOfRunningProducers());
-        assertFalse(partition1.isConsumable());
-        assertFalse(partition2.isConsumable());
-        assertFalse(result.areAllPartitionsFinished());
+        assertThat(consumedPartitionGroup.getNumberOfUnfinishedPartitions()).isOne();
+        assertThat(partition1.hasDataAllProduced()).isFalse();
+        assertThat(partition2.hasDataAllProduced()).isTrue();
+        assertThat(consumedPartitionGroup.areAllPartitionsFinished()).isFalse();
 
-        // Consumable after all partitions are FINISHED
+        // All partition finished.
         partition1.markFinished();
-        assertEquals(0, result.getNumberOfRunningProducers());
-        assertTrue(partition1.isConsumable());
-        assertTrue(partition2.isConsumable());
-        assertTrue(result.areAllPartitionsFinished());
+        assertThat(consumedPartitionGroup.getNumberOfUnfinishedPartitions()).isZero();
+        assertThat(partition1.hasDataAllProduced()).isTrue();
+        assertThat(partition2.hasDataAllProduced()).isTrue();
+        assertThat(consumedPartitionGroup.areAllPartitionsFinished()).isTrue();
 
-        // Not consumable again if failover happens
+        // Not all data produced and not all partition finished again if failover happens
         result.resetForNewExecution();
-        assertEquals(2, result.getNumberOfRunningProducers());
-        assertFalse(partition1.isConsumable());
-        assertFalse(partition2.isConsumable());
-        assertFalse(result.areAllPartitionsFinished());
+        assertThat(consumedPartitionGroup.getNumberOfUnfinishedPartitions()).isEqualTo(2);
+        assertThat(partition1.hasDataAllProduced()).isFalse();
+        assertThat(partition2.hasDataAllProduced()).isFalse();
+        assertThat(consumedPartitionGroup.areAllPartitionsFinished()).isFalse();
+    }
+
+    @Test
+    void testReleasePartitionGroups() throws Exception {
+        IntermediateResult result = createResult(ResultPartitionType.BLOCKING, 2);
+
+        IntermediateResultPartition partition1 = result.getPartitions()[0];
+        IntermediateResultPartition partition2 = result.getPartitions()[1];
+        assertThat(partition1.canBeReleased()).isFalse();
+        assertThat(partition2.canBeReleased()).isFalse();
+
+        List<ConsumedPartitionGroup> consumedPartitionGroup1 =
+                partition1.getConsumedPartitionGroups();
+        List<ConsumedPartitionGroup> consumedPartitionGroup2 =
+                partition2.getConsumedPartitionGroups();
+        assertThat(consumedPartitionGroup1).isEqualTo(consumedPartitionGroup2);
+
+        assertThat(consumedPartitionGroup1).hasSize(2);
+        partition1.markPartitionGroupReleasable(consumedPartitionGroup1.get(0));
+        assertThat(partition1.canBeReleased()).isFalse();
+
+        partition1.markPartitionGroupReleasable(consumedPartitionGroup1.get(1));
+        assertThat(partition1.canBeReleased()).isTrue();
+
+        result.resetForNewExecution();
+        assertThat(partition1.canBeReleased()).isFalse();
+    }
+
+    @Test
+    void testReleasePartitionGroupsForDynamicGroup() throws Exception {
+        JobVertex source = new JobVertex("source");
+        source.setParallelism(1);
+        source.setInvokableClass(NoOpInvokable.class);
+
+        JobVertex sink1 = new JobVertex("sink1");
+        sink1.setParallelism(1);
+        sink1.setInvokableClass(NoOpInvokable.class);
+
+        JobVertex sink2 = new JobVertex("sink2");
+        sink2.setParallelism(1);
+        sink2.setInvokableClass(NoOpInvokable.class);
+
+        // At first, create job graph with topology: source -> sink1
+        IntermediateDataSetID dataSetId = new IntermediateDataSetID();
+        IntermediateDataSet dataSet =
+                source.getOrCreateResultDataSet(dataSetId, ResultPartitionType.BLOCKING);
+        // add two stream edges
+        dataSet.increaseNumJobEdgesToCreate();
+        dataSet.increaseNumJobEdgesToCreate();
+
+        sink1.connectNewDataSetAsInput(
+                source,
+                DistributionPattern.ALL_TO_ALL,
+                ResultPartitionType.BLOCKING,
+                dataSetId,
+                false,
+                false);
+        JobGraph jobGraph = JobGraphTestUtils.batchJobGraph(source, sink1);
+        jobGraph.setDynamic(true);
+
+        SchedulerBase scheduler =
+                new DefaultSchedulerBuilder(
+                                jobGraph,
+                                ComponentMainThreadExecutorServiceAdapter.forMainThread(),
+                                new DirectScheduledExecutorService())
+                        .buildAdaptiveBatchJobScheduler();
+
+        ExecutionJobVertex sourceVertex = scheduler.getExecutionJobVertex(source.getID());
+        ExecutionJobVertex sinkVertex1 = scheduler.getExecutionJobVertex(sink1.getID());
+        scheduler.getExecutionGraph().initializeJobVertex(sourceVertex, 1L);
+        scheduler.getExecutionGraph().initializeJobVertex(sinkVertex1, 1L);
+
+        // mark partition can be released
+        IntermediateResultPartition partition =
+                sourceVertex.getProducedDataSets()[0].getPartitions()[0];
+        assertThat(partition.canBeReleased()).isFalse();
+        List<ConsumedPartitionGroup> consumedPartitionGroup =
+                partition.getConsumedPartitionGroups();
+        partition.markPartitionGroupReleasable(consumedPartitionGroup.get(0));
+
+        // because not all job vertices are created, partition can not be released
+        assertThat(partition.canBeReleased()).isFalse();
+
+        // add a new job vertex
+        dataSet.addConsumer(
+                new JobEdge(
+                        dataSet,
+                        sink2,
+                        DistributionPattern.ALL_TO_ALL,
+                        false,
+                        false,
+                        1,
+                        false,
+                        false));
+        scheduler
+                .getExecutionGraph()
+                .addNewJobVertices(
+                        Collections.singletonList(sink2),
+                        UnregisteredMetricGroups.createUnregisteredJobManagerJobMetricGroup(),
+                        computeVertexParallelismStoreForDynamicGraph(
+                                Collections.singletonList(sink2), 1));
+        ExecutionJobVertex sinkVertex2 = scheduler.getExecutionJobVertex(sink2.getID());
+        scheduler.getExecutionGraph().initializeJobVertex(sinkVertex2, 1L);
+
+        assertThat(partition.canBeReleased()).isTrue();
+    }
+
+    @Test
+    void testGetNumberOfSubpartitionsForNonDynamicAllToAllGraph() throws Exception {
+        testGetNumberOfSubpartitions(7, DistributionPattern.ALL_TO_ALL, false, Arrays.asList(7, 7));
+    }
+
+    @Test
+    void testGetNumberOfSubpartitionsForNonDynamicPointwiseGraph() throws Exception {
+        testGetNumberOfSubpartitions(7, DistributionPattern.POINTWISE, false, Arrays.asList(4, 3));
+    }
+
+    @Test
+    void testGetNumberOfSubpartitionsFromConsumerParallelismForDynamicAllToAllGraph()
+            throws Exception {
+        testGetNumberOfSubpartitions(7, DistributionPattern.ALL_TO_ALL, true, Arrays.asList(7, 7));
+    }
+
+    @Test
+    void testGetNumberOfSubpartitionsFromConsumerParallelismForDynamicPointwiseGraph()
+            throws Exception {
+        testGetNumberOfSubpartitions(7, DistributionPattern.POINTWISE, true, Arrays.asList(4, 4));
+    }
+
+    @Test
+    void testGetNumberOfSubpartitionsFromConsumerMaxParallelismForDynamicAllToAllGraph()
+            throws Exception {
+        testGetNumberOfSubpartitions(
+                -1, DistributionPattern.ALL_TO_ALL, true, Arrays.asList(13, 13));
+    }
+
+    @Test
+    void testGetNumberOfSubpartitionsFromConsumerMaxParallelismForDynamicPointwiseGraph()
+            throws Exception {
+        testGetNumberOfSubpartitions(-1, DistributionPattern.POINTWISE, true, Arrays.asList(7, 7));
+    }
+
+    private void testGetNumberOfSubpartitions(
+            int consumerParallelism,
+            DistributionPattern distributionPattern,
+            boolean isDynamicGraph,
+            List<Integer> expectedNumSubpartitions)
+            throws Exception {
+
+        final int producerParallelism = 2;
+        final int consumerMaxParallelism = 13;
+
+        final ExecutionGraph eg =
+                createExecutionGraph(
+                        producerParallelism,
+                        consumerParallelism,
+                        consumerMaxParallelism,
+                        distributionPattern,
+                        isDynamicGraph,
+                        EXECUTOR_RESOURCE.getExecutor());
+
+        final Iterator<ExecutionJobVertex> vertexIterator =
+                eg.getVerticesTopologically().iterator();
+        final ExecutionJobVertex producer = vertexIterator.next();
+
+        if (isDynamicGraph) {
+            ExecutionJobVertexTest.initializeVertex(producer);
+        }
+
+        final IntermediateResult result = producer.getProducedDataSets()[0];
+
+        assertThat(expectedNumSubpartitions).hasSize(producerParallelism);
+        assertThat(
+                        Arrays.stream(result.getPartitions())
+                                .map(IntermediateResultPartition::getNumberOfSubpartitions)
+                                .collect(Collectors.toList()))
+                .isEqualTo(expectedNumSubpartitions);
+    }
+
+    public static ExecutionGraph createExecutionGraph(
+            int producerParallelism,
+            int consumerParallelism,
+            int consumerMaxParallelism,
+            DistributionPattern distributionPattern,
+            boolean isDynamicGraph,
+            ScheduledExecutorService scheduledExecutorService)
+            throws Exception {
+
+        final JobVertex v1 = new JobVertex("v1");
+        v1.setInvokableClass(NoOpInvokable.class);
+        v1.setParallelism(producerParallelism);
+
+        final JobVertex v2 = new JobVertex("v2");
+        v2.setInvokableClass(NoOpInvokable.class);
+        if (consumerParallelism > 0) {
+            v2.setParallelism(consumerParallelism);
+        }
+        if (consumerMaxParallelism > 0) {
+            v2.setMaxParallelism(consumerMaxParallelism);
+        }
+
+        final JobVertex v3 = new JobVertex("v3");
+        v3.setInvokableClass(NoOpInvokable.class);
+        if (consumerParallelism > 0) {
+            v3.setParallelism(consumerParallelism);
+        }
+        if (consumerMaxParallelism > 0) {
+            v3.setMaxParallelism(consumerMaxParallelism);
+        }
+
+        IntermediateDataSetID dataSetId = new IntermediateDataSetID();
+        connectNewDataSetAsInput(
+                v2, v1, distributionPattern, ResultPartitionType.BLOCKING, dataSetId, false);
+        connectNewDataSetAsInput(
+                v3, v1, distributionPattern, ResultPartitionType.BLOCKING, dataSetId, false);
+
+        final JobGraph jobGraph =
+                JobGraphBuilder.newBatchJobGraphBuilder()
+                        .addJobVertices(Arrays.asList(v1, v2, v3))
+                        .build();
+
+        final Configuration configuration = new Configuration();
+
+        TestingDefaultExecutionGraphBuilder builder =
+                TestingDefaultExecutionGraphBuilder.newBuilder()
+                        .setJobGraph(jobGraph)
+                        .setJobMasterConfig(configuration)
+                        .setVertexParallelismStore(
+                                computeVertexParallelismStoreConsideringDynamicGraph(
+                                        jobGraph.getVertices(),
+                                        isDynamicGraph,
+                                        consumerMaxParallelism));
+        if (isDynamicGraph) {
+            return builder.buildDynamicGraph(scheduledExecutorService);
+        } else {
+            return builder.build(scheduledExecutorService);
+        }
+    }
+
+    public static VertexParallelismStore computeVertexParallelismStoreConsideringDynamicGraph(
+            Iterable<JobVertex> vertices, boolean isDynamicGraph, int defaultMaxParallelism) {
+        if (isDynamicGraph) {
+            return AdaptiveBatchScheduler.computeVertexParallelismStoreForDynamicGraph(
+                    vertices, defaultMaxParallelism);
+        } else {
+            return SchedulerBase.computeVertexParallelismStore(vertices);
+        }
     }
 
     private static IntermediateResult createResult(
-            ResultPartitionType resultPartitionType, int producerCount) throws Exception {
+            ResultPartitionType resultPartitionType, int parallelism) throws Exception {
 
-        JobVertex jobVertex = new JobVertex("v1");
-        jobVertex.setInvokableClass(NoOpInvokable.class);
-        jobVertex.setParallelism(producerCount);
-        jobVertex.createAndAddResultDataSet(resultPartitionType);
+        JobVertex source = new JobVertex("v1");
+        source.setInvokableClass(NoOpInvokable.class);
+        source.setParallelism(parallelism);
 
-        ExecutionJobVertex ejv =
-                getExecutionJobVertex(
-                        jobVertex,
-                        new DirectScheduledExecutorService(),
-                        ScheduleMode.LAZY_FROM_SOURCES);
-        IntermediateResult result = ejv.getProducedDataSets()[0];
+        JobVertex sink1 = new JobVertex("v2");
+        sink1.setInvokableClass(NoOpInvokable.class);
+        sink1.setParallelism(parallelism);
 
-        return result;
+        JobVertex sink2 = new JobVertex("v3");
+        sink2.setInvokableClass(NoOpInvokable.class);
+        sink2.setParallelism(parallelism);
+
+        IntermediateDataSetID dataSetId = new IntermediateDataSetID();
+        connectNewDataSetAsInput(
+                sink1,
+                source,
+                DistributionPattern.ALL_TO_ALL,
+                resultPartitionType,
+                dataSetId,
+                false);
+        connectNewDataSetAsInput(
+                sink2,
+                source,
+                DistributionPattern.ALL_TO_ALL,
+                resultPartitionType,
+                dataSetId,
+                false);
+
+        ScheduledExecutorService executorService = new DirectScheduledExecutorService();
+
+        JobGraph jobGraph = JobGraphTestUtils.batchJobGraph(source, sink1, sink2);
+
+        SchedulerBase scheduler =
+                new DefaultSchedulerBuilder(
+                                jobGraph,
+                                ComponentMainThreadExecutorServiceAdapter.forMainThread(),
+                                executorService)
+                        .build();
+
+        ExecutionJobVertex ejv = scheduler.getExecutionJobVertex(source.getID());
+
+        return ejv.getProducedDataSets()[0];
     }
 }

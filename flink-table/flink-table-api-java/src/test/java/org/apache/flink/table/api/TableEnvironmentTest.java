@@ -18,84 +18,400 @@
 
 package org.apache.flink.table.api;
 
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.table.catalog.Catalog;
 import org.apache.flink.table.catalog.CatalogBaseTable;
-import org.apache.flink.table.catalog.CatalogManager;
+import org.apache.flink.table.catalog.CatalogDescriptor;
+import org.apache.flink.table.catalog.CatalogMaterializedTable;
+import org.apache.flink.table.catalog.CatalogModel;
 import org.apache.flink.table.catalog.CatalogTable;
-import org.apache.flink.table.catalog.CatalogTableImpl;
+import org.apache.flink.table.catalog.CatalogView;
+import org.apache.flink.table.catalog.ContextResolvedModel;
+import org.apache.flink.table.catalog.ContextResolvedTable;
+import org.apache.flink.table.catalog.IntervalFreshness;
 import org.apache.flink.table.catalog.ObjectIdentifier;
-import org.apache.flink.table.descriptors.Schema;
-import org.apache.flink.table.utils.ConnectorDescriptorMock;
-import org.apache.flink.table.utils.FormatDescriptorMock;
+import org.apache.flink.table.catalog.ObjectPath;
+import org.apache.flink.table.catalog.exceptions.ModelNotExistException;
+import org.apache.flink.table.catalog.exceptions.TableAlreadyExistException;
+import org.apache.flink.table.operations.SourceQueryOperation;
 import org.apache.flink.table.utils.TableEnvironmentMock;
-import org.apache.flink.table.utils.TableSourceFactoryMock;
 
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
-import java.util.Arrays;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Stream;
 
-import static org.hamcrest.CoreMatchers.equalTo;
-import static org.junit.Assert.assertThat;
-import static org.junit.Assert.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatNoException;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.entry;
+import static org.assertj.core.api.InstanceOfAssertFactories.type;
 
 /** Tests for {@link TableEnvironment}. */
-public class TableEnvironmentTest {
+class TableEnvironmentTest {
+    private TableEnvironmentMock tEnv;
+    private static final Schema TEST_SCHEMA =
+            Schema.newBuilder().column("f0", DataTypes.INT()).build();
+    private static final Schema TEST_SCHEMA_2 =
+            Schema.newBuilder().column("f1", DataTypes.INT()).build();
+    private static final TableDescriptor TEST_DESCRIPTOR =
+            TableDescriptor.forConnector("fake").schema(TEST_SCHEMA).option("a", "Test").build();
+    private static final ModelDescriptor TEST_MODEL_DESCRIPTOR =
+            ModelDescriptor.forProvider("TestProvider")
+                    .option("a", "Test")
+                    .inputSchema(TEST_SCHEMA)
+                    .outputSchema(TEST_SCHEMA)
+                    .build();
+    private static final ModelDescriptor TEST_MODEL_DESCRIPTOR_2 =
+            ModelDescriptor.forProvider("TestProvider")
+                    .option("a", "Test")
+                    .inputSchema(TEST_SCHEMA)
+                    .outputSchema(TEST_SCHEMA_2)
+                    .build();
 
-    @Test
-    public void testConnect() {
-        final TableEnvironmentMock tableEnv = TableEnvironmentMock.getStreamingInstance();
-
-        tableEnv.connect(
-                        new ConnectorDescriptorMock(
-                                TableSourceFactoryMock.CONNECTOR_TYPE_VALUE, 1, true))
-                .withFormat(new FormatDescriptorMock("my_format", 1))
-                .withSchema(
-                        new Schema()
-                                .field("my_field_0", "INT")
-                                .field("my_field_1", "BOOLEAN")
-                                .field("my_part_1", "BIGINT")
-                                .field("my_part_2", "STRING"))
-                .withPartitionKeys(Arrays.asList("my_part_1", "my_part_2"))
-                .inAppendMode()
-                .createTemporaryTable("my_table");
-
-        CatalogManager.TableLookupResult lookupResult =
-                tableEnv.catalogManager
-                        .getTable(
-                                ObjectIdentifier.of(
-                                        EnvironmentSettings.DEFAULT_BUILTIN_CATALOG,
-                                        EnvironmentSettings.DEFAULT_BUILTIN_DATABASE,
-                                        "my_table"))
-                        .orElseThrow(AssertionError::new);
-
-        assertThat(lookupResult.isTemporary(), equalTo(true));
-
-        CatalogBaseTable catalogBaseTable = lookupResult.getTable();
-        assertTrue(catalogBaseTable instanceof CatalogTable);
-        CatalogTable table = (CatalogTable) catalogBaseTable;
-        assertCatalogTable(table);
-        assertCatalogTable(CatalogTableImpl.fromProperties(table.toProperties()));
+    private static Stream<Arguments> getModelNamesAndDescriptors() {
+        return Stream.of(
+                Arguments.of("M", TEST_MODEL_DESCRIPTOR),
+                Arguments.of("M2", TEST_MODEL_DESCRIPTOR_2));
     }
 
-    private static void assertCatalogTable(CatalogTable table) {
-        assertThat(
-                table.getSchema(),
-                equalTo(
-                        TableSchema.builder()
-                                .field("my_field_0", DataTypes.INT())
-                                .field("my_field_1", DataTypes.BOOLEAN())
-                                .field("my_part_1", DataTypes.BIGINT())
-                                .field("my_part_2", DataTypes.STRING())
-                                .build()));
-        assertThat(table.getPartitionKeys(), equalTo(Arrays.asList("my_part_1", "my_part_2")));
+    @BeforeEach
+    void setUp() {
+        tEnv = TableEnvironmentMock.getStreamingInstance();
+    }
 
-        Map<String, String> properties = new HashMap<>();
-        properties.put("update-mode", "append");
-        properties.put("connector.property-version", "1");
-        properties.put("format.type", "my_format");
-        properties.put("format.property-version", "1");
-        properties.put("connector.type", "table-source-factory-mock");
-        assertThat(table.getProperties(), equalTo(properties));
+    @Test
+    void testCreateTemporaryTableFromDescriptor() {
+        assertTemporaryCreateTableFromDescriptor(tEnv, TEST_SCHEMA, false);
+    }
+
+    @Test
+    void testCreateTemporaryTableIfNotExistsFromDescriptor() {
+        assertTemporaryCreateTableFromDescriptor(tEnv, TEST_SCHEMA, true);
+        assertThatNoException()
+                .isThrownBy(() -> tEnv.createTemporaryTable("T", TEST_DESCRIPTOR, true));
+
+        assertThatThrownBy(() -> tEnv.createTemporaryTable("T", TEST_DESCRIPTOR, false))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining(
+                        "Temporary table '`default_catalog`.`default_database`.`T`' already exists");
+    }
+
+    @Test
+    void testCreateTableFromDescriptor() throws Exception {
+        assertCreateTableFromDescriptor(tEnv, TEST_SCHEMA, false);
+    }
+
+    @ParameterizedTest(name = "{index}: ignoreIfExists ({0})")
+    @ValueSource(booleans = {true, false})
+    void testCreateViewFromTable(final boolean ignoreIfExists) throws Exception {
+        final String catalog = tEnv.getCurrentCatalog();
+        final String database = tEnv.getCurrentDatabase();
+
+        tEnv.createTable("T", TEST_DESCRIPTOR);
+
+        assertThat(tEnv.createView("V", tEnv.from("T"), ignoreIfExists)).isTrue();
+
+        final ObjectPath objectPath = new ObjectPath(database, "V");
+
+        final CatalogBaseTable catalogView =
+                tEnv.getCatalog(catalog).orElseThrow(AssertionError::new).getTable(objectPath);
+        assertThat(catalogView).isInstanceOf(CatalogView.class);
+        assertThat(catalogView.getUnresolvedSchema()).isEqualTo(TEST_SCHEMA);
+        assertThat(catalogView.getComment()).isEmpty();
+    }
+
+    @Test
+    void testCreateViewWithSameNameIgnoreIfExists() {
+        tEnv.createTable("T", TEST_DESCRIPTOR);
+        tEnv.createView("V", tEnv.from("T"));
+
+        assertThat(tEnv.createView("V", tEnv.from("T"), true)).isFalse();
+    }
+
+    @Test
+    void testCreateViewWithSameName() {
+        tEnv.createTable("T", TEST_DESCRIPTOR);
+        tEnv.createView("V", tEnv.from("T"));
+
+        assertThatThrownBy(() -> tEnv.createView("V", tEnv.from("T"), false))
+                .hasCauseInstanceOf(TableAlreadyExistException.class)
+                .hasMessageContaining(
+                        "Could not execute CreateTable in path `default_catalog`.`default_database`.`V`");
+
+        assertThatThrownBy(() -> tEnv.createView("V", tEnv.from("T")))
+                .hasCauseInstanceOf(TableAlreadyExistException.class)
+                .hasMessageContaining(
+                        "Could not execute CreateTable in path `default_catalog`.`default_database`.`V`");
+    }
+
+    @Test
+    void testCreateTableIfNotExistsFromDescriptor() throws Exception {
+        assertCreateTableFromDescriptor(tEnv, TEST_SCHEMA, true);
+        assertThatNoException().isThrownBy(() -> tEnv.createTable("T", TEST_DESCRIPTOR, true));
+
+        assertThatThrownBy(() -> tEnv.createTable("T", TEST_DESCRIPTOR, false))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining(
+                        "Could not execute CreateTable in path `default_catalog`.`default_database`.`T`");
+    }
+
+    @Test
+    void testTableFromDescriptor() {
+        final Table table = tEnv.from(TEST_DESCRIPTOR);
+
+        assertThat(Schema.newBuilder().fromResolvedSchema(table.getResolvedSchema()).build())
+                .isEqualTo(TEST_SCHEMA);
+
+        assertThat(table.getQueryOperation())
+                .asInstanceOf(type(SourceQueryOperation.class))
+                .extracting(SourceQueryOperation::getContextResolvedTable)
+                .satisfies(
+                        crs -> {
+                            assertThat(crs.isAnonymous()).isTrue();
+                            assertThat(crs.getIdentifier().toList()).hasSize(1);
+                            assertThat(crs.getResolvedTable().getOptions())
+                                    .containsEntry("connector", "fake");
+                        });
+
+        assertThat(tEnv.getCatalogManager().listTables()).isEmpty();
+    }
+
+    @ParameterizedTest
+    @MethodSource("getModelNamesAndDescriptors")
+    void testCreateModelFromDescriptor(String modelPath, ModelDescriptor modelDescriptor)
+            throws Exception {
+        assertCreateModelFromDescriptor(tEnv, modelPath, modelDescriptor);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testCreateModelWithSameNameWithIgnoreIfExists(boolean ignoreIfExists) throws Exception {
+        assertCreateModelFromDescriptor(tEnv, "M", TEST_MODEL_DESCRIPTOR);
+
+        if (ignoreIfExists) {
+            assertThatNoException()
+                    .isThrownBy(() -> tEnv.createModel("M", TEST_MODEL_DESCRIPTOR, true));
+        } else {
+            assertThatThrownBy(() -> tEnv.createModel("M", TEST_MODEL_DESCRIPTOR, false))
+                    .isInstanceOf(ValidationException.class)
+                    .hasMessage(
+                            "Could not execute CreateModel in path `default_catalog`.`default_database`.`M`");
+        }
+        assertThatThrownBy(() -> tEnv.createModel("M", TEST_MODEL_DESCRIPTOR))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage(
+                        "Could not execute CreateModel in path `default_catalog`.`default_database`.`M`");
+    }
+
+    @Test
+    void testDropModel() throws Exception {
+        tEnv.createModel("M", TEST_MODEL_DESCRIPTOR);
+
+        final String catalog = tEnv.getCurrentCatalog();
+        final String database = tEnv.getCurrentDatabase();
+        final ObjectPath objectPath = new ObjectPath(database, "M");
+        CatalogModel catalogModel =
+                tEnv.getCatalog(catalog).orElseThrow(AssertionError::new).getModel(objectPath);
+        assertThat(catalogModel).isInstanceOf(CatalogModel.class);
+        assertThat(tEnv.dropModel("M", true)).isTrue();
+        assertThatThrownBy(
+                        () ->
+                                tEnv.getCatalog(catalog)
+                                        .orElseThrow(AssertionError::new)
+                                        .getModel(objectPath))
+                .isInstanceOf(ModelNotExistException.class)
+                .hasMessage("Model '`default_catalog`.`default_database`.`M`' does not exist.");
+    }
+
+    @Test
+    void testNonExistingDropModel() throws Exception {
+        assertThat(tEnv.dropModel("M", true)).isFalse();
+
+        assertThatThrownBy(() -> tEnv.dropModel("M", false))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage(
+                        "Model with identifier 'default_catalog.default_database.M' does not exist.");
+    }
+
+    @ParameterizedTest
+    @MethodSource("getModelNamesAndDescriptors")
+    void testCreateTemporaryModelFromDescriptor(String modelPath, ModelDescriptor modelDescriptor) {
+        assertTemporaryCreateModelFromDescriptor(tEnv, modelPath, modelDescriptor);
+        assertThatNoException()
+                .isThrownBy(() -> tEnv.createTemporaryModel(modelPath, modelDescriptor, true));
+
+        assertThatThrownBy(() -> tEnv.createTemporaryModel(modelPath, modelDescriptor, false))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage(
+                        String.format(
+                                "Temporary model '`default_catalog`.`default_database`.`%s`' already exists",
+                                modelPath));
+    }
+
+    @Test
+    void testListModels() {
+        tEnv.createModel("M1", TEST_MODEL_DESCRIPTOR);
+        tEnv.createModel("M2", TEST_MODEL_DESCRIPTOR);
+
+        assertThat(tEnv.listModels()).containsExactly("M1", "M2");
+    }
+
+    @Test
+    void testListMaterializedTablesInGivenNamespace() throws Exception {
+        final String currentCatalog = tEnv.getCurrentCatalog();
+        tEnv.createCatalog(
+                "other_catalog",
+                CatalogDescriptor.of(
+                        "other_catalog",
+                        Configuration.fromMap(
+                                Map.of(
+                                        "type", "generic_in_memory",
+                                        "default-database", "other_database"))));
+        final Catalog otherCatalog =
+                tEnv.getCatalog("other_catalog").orElseThrow(AssertionError::new);
+        otherCatalog.createTable(
+                new ObjectPath("other_database", "mt_b"), createMaterializedTable(), false);
+        otherCatalog.createTable(
+                new ObjectPath("other_database", "mt_a"), createMaterializedTable(), false);
+
+        tEnv.useCatalog("other_catalog");
+        tEnv.createTable("T", TEST_DESCRIPTOR);
+        tEnv.createView("V", tEnv.from("T"));
+        tEnv.createTemporaryTable("TMP", TEST_DESCRIPTOR);
+        tEnv.useCatalog(currentCatalog);
+
+        assertThat(tEnv.listMaterializedTables("other_catalog", "other_database"))
+                .containsExactly("mt_a", "mt_b");
+    }
+
+    @Test
+    void testListMaterializedTablesThrowsForUnknownNamespace() {
+        assertThatThrownBy(
+                        () ->
+                                tEnv.listMaterializedTables(
+                                        "unknown_catalog", tEnv.getCurrentDatabase()))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("Catalog unknown_catalog does not exist");
+        assertThatThrownBy(
+                        () ->
+                                tEnv.listMaterializedTables(
+                                        tEnv.getCurrentCatalog(), "unknown_database"))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("Database unknown_database does not exist");
+    }
+
+    private static void assertCreateTableFromDescriptor(
+            TableEnvironmentMock tEnv, Schema schema, boolean ignoreIfExists)
+            throws org.apache.flink.table.catalog.exceptions.TableNotExistException {
+        final String catalog = tEnv.getCurrentCatalog();
+        final String database = tEnv.getCurrentDatabase();
+
+        if (ignoreIfExists) {
+            assertThat(tEnv.createTable("T", TEST_DESCRIPTOR, true)).isTrue();
+        } else {
+            tEnv.createTable("T", TEST_DESCRIPTOR);
+        }
+
+        final ObjectPath objectPath = new ObjectPath(database, "T");
+        assertThat(
+                        tEnv.getCatalog(catalog)
+                                .orElseThrow(AssertionError::new)
+                                .tableExists(objectPath))
+                .isTrue();
+
+        final CatalogBaseTable catalogTable =
+                tEnv.getCatalog(catalog).orElseThrow(AssertionError::new).getTable(objectPath);
+        assertThat(catalogTable).isInstanceOf(CatalogTable.class);
+        assertThat(catalogTable.getUnresolvedSchema()).isEqualTo(schema);
+        assertThat(catalogTable.getOptions())
+                .contains(entry("connector", "fake"), entry("a", "Test"));
+    }
+
+    private static void assertTemporaryCreateTableFromDescriptor(
+            TableEnvironmentMock tEnv, Schema schema, boolean ignoreIfExists) {
+        final String catalog = tEnv.getCurrentCatalog();
+        final String database = tEnv.getCurrentDatabase();
+
+        if (ignoreIfExists) {
+            tEnv.createTemporaryTable("T", TEST_DESCRIPTOR, true);
+        } else {
+            tEnv.createTemporaryTable("T", TEST_DESCRIPTOR);
+        }
+
+        assertThat(
+                        tEnv.getCatalog(catalog)
+                                .orElseThrow(AssertionError::new)
+                                .tableExists(new ObjectPath(database, "T")))
+                .isFalse();
+
+        final Optional<ContextResolvedTable> lookupResult =
+                tEnv.getCatalogManager().getTable(ObjectIdentifier.of(catalog, database, "T"));
+        assertThat(lookupResult).isPresent();
+
+        final CatalogBaseTable catalogTable = lookupResult.get().getResolvedTable();
+        assertThat(catalogTable instanceof CatalogTable).isTrue();
+        assertThat(catalogTable.getUnresolvedSchema()).isEqualTo(schema);
+        assertThat(catalogTable.getOptions().get("connector")).isEqualTo("fake");
+        assertThat(catalogTable.getOptions().get("a")).isEqualTo("Test");
+    }
+
+    private static void assertCreateModelFromDescriptor(
+            TableEnvironmentMock tEnv, String modelPath, ModelDescriptor modelDescriptor)
+            throws ModelNotExistException {
+        final String catalog = tEnv.getCurrentCatalog();
+        final String database = tEnv.getCurrentDatabase();
+
+        tEnv.createModel(modelPath, modelDescriptor, true);
+        final ObjectPath objectPath = new ObjectPath(database, modelPath);
+        CatalogModel catalogModel =
+                tEnv.getCatalog(catalog).orElseThrow(AssertionError::new).getModel(objectPath);
+        assertCatalogModelWithModelDescriptor(catalogModel, modelDescriptor);
+    }
+
+    private static void assertTemporaryCreateModelFromDescriptor(
+            TableEnvironmentMock tEnv, String modelPath, ModelDescriptor modelDescriptor) {
+        final String catalog = tEnv.getCurrentCatalog();
+        final String database = tEnv.getCurrentDatabase();
+
+        tEnv.createTemporaryModel(modelPath, modelDescriptor, true);
+        final Optional<ContextResolvedModel> lookupResult =
+                tEnv.getCatalogManager()
+                        .getModel(ObjectIdentifier.of(catalog, database, modelPath));
+        assertThat(lookupResult).isPresent();
+        CatalogModel catalogModel = lookupResult.get().getResolvedModel();
+        assertCatalogModelWithModelDescriptor(catalogModel, modelDescriptor);
+    }
+
+    private static void assertCatalogModelWithModelDescriptor(
+            CatalogModel catalogModel, ModelDescriptor modelDescriptor) {
+        assertThat(catalogModel).isNotNull();
+        assertThat(catalogModel).isInstanceOf(CatalogModel.class);
+        assertThat(catalogModel.getInputSchema()).isEqualTo(modelDescriptor.getInputSchema().get());
+        assertThat(catalogModel.getOutputSchema())
+                .isEqualTo(modelDescriptor.getOutputSchema().get());
+        for (Map.Entry<String, String> entry : modelDescriptor.getOptions().entrySet()) {
+            assertThat(catalogModel.getOptions()).contains(entry);
+            assertThat(catalogModel.getOptions()).containsEntry(entry.getKey(), entry.getValue());
+        }
+    }
+
+    private static CatalogMaterializedTable createMaterializedTable() {
+        return CatalogMaterializedTable.newBuilder()
+                .schema(TEST_SCHEMA)
+                .options(Map.of())
+                .originalQuery("SELECT 1 AS f0")
+                .expandedQuery("SELECT 1 AS f0")
+                .freshness(IntervalFreshness.ofSecond(30))
+                .logicalRefreshMode(CatalogMaterializedTable.LogicalRefreshMode.AUTOMATIC)
+                .refreshMode(CatalogMaterializedTable.RefreshMode.CONTINUOUS)
+                .refreshStatus(CatalogMaterializedTable.RefreshStatus.INITIALIZING)
+                .build();
     }
 }

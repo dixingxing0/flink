@@ -45,6 +45,7 @@ class ExpressionCompletenessTests(PythonAPICompletenessTestCase, PyFlinkTestCase
             # such as __and__ for and to be more Pythonic.
             'and',
             'or',
+            'not',
             'isGreater',
             'isGreaterOrEqual',
             'isLess',
@@ -56,7 +57,7 @@ class ExpressionCompletenessTests(PythonAPICompletenessTestCase, PyFlinkTestCase
             'dividedBy',
             'times',
             'mod',
-            'power'
+            'power',
         }
 
     @classmethod

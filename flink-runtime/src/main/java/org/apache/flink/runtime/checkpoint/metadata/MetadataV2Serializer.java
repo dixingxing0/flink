@@ -19,6 +19,7 @@
 package org.apache.flink.runtime.checkpoint.metadata;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.core.fs.Path;
 import org.apache.flink.runtime.checkpoint.OperatorState;
 import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.runtime.jobgraph.OperatorID;
@@ -29,6 +30,8 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.Map;
+
+import static org.apache.flink.util.Preconditions.checkState;
 
 /**
  * (De)serializer for checkpoint metadata format version 2. This format was introduced with Apache
@@ -64,13 +67,28 @@ public class MetadataV2Serializer extends MetadataV2V3SerializerBase implements 
         return deserializeMetadata(dis, externalPointer);
     }
 
+    @Override
+    public void serialize(
+            CheckpointMetadata checkpointMetadata,
+            DataOutputStream dos,
+            @Nullable Path exclusiveDirPath)
+            throws IOException {
+        throw new UnsupportedOperationException(
+                "Serialization in v" + getVersion() + " is no longer supported");
+    }
+
     // ------------------------------------------------------------------------
     //  version-specific serialization
     // ------------------------------------------------------------------------
 
     @Override
-    protected void serializeOperatorState(OperatorState operatorState, DataOutputStream dos)
+    protected void serializeOperatorState(
+            OperatorState operatorState, DataOutputStream dos, SerializationContext context)
             throws IOException {
+        checkState(
+                !operatorState.isFullyFinished(),
+                "Could not support finished Operator state in state serializers.");
+
         // Operator ID
         dos.writeLong(operatorState.getOperatorID().getLowerPart());
         dos.writeLong(operatorState.getOperatorID().getUpperPart());
@@ -89,7 +107,7 @@ public class MetadataV2Serializer extends MetadataV2V3SerializerBase implements 
         dos.writeInt(subtaskStateMap.size());
         for (Map.Entry<Integer, OperatorSubtaskState> entry : subtaskStateMap.entrySet()) {
             dos.writeInt(entry.getKey());
-            serializeSubtaskState(entry.getValue(), dos);
+            serializeSubtaskState(entry.getValue(), dos, context);
         }
     }
 
@@ -105,7 +123,8 @@ public class MetadataV2Serializer extends MetadataV2V3SerializerBase implements 
         dis.readInt();
 
         // Add task state
-        final OperatorState taskState = new OperatorState(jobVertexId, parallelism, maxParallelism);
+        final OperatorState taskState =
+                new OperatorState(null, null, jobVertexId, parallelism, maxParallelism);
 
         // Sub task states
         final int numSubTaskStates = dis.readInt();
@@ -120,7 +139,8 @@ public class MetadataV2Serializer extends MetadataV2V3SerializerBase implements 
     }
 
     @Override
-    protected void serializeSubtaskState(OperatorSubtaskState subtaskState, DataOutputStream dos)
+    protected void serializeSubtaskState(
+            OperatorSubtaskState subtaskState, DataOutputStream dos, SerializationContext context)
             throws IOException {
         // write two unused fields for compatibility:
         //   - "duration"
@@ -128,7 +148,7 @@ public class MetadataV2Serializer extends MetadataV2V3SerializerBase implements 
         dos.writeLong(-1);
         dos.writeInt(0);
 
-        super.serializeSubtaskState(subtaskState, dos);
+        super.serializeSubtaskState(subtaskState, dos, context);
     }
 
     @Override

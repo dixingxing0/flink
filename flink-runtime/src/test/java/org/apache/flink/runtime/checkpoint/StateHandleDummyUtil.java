@@ -27,6 +27,7 @@ import org.apache.flink.runtime.state.OperatorStateHandle;
 import org.apache.flink.runtime.state.OperatorStreamStateHandle;
 import org.apache.flink.runtime.state.ResultSubpartitionStateHandle;
 import org.apache.flink.runtime.state.SharedStateRegistry;
+import org.apache.flink.runtime.state.StateHandleID;
 import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
 
 import java.util.ArrayList;
@@ -54,7 +55,8 @@ public class StateHandleDummyUtil {
             OperatorStateHandle.StateMetaInfo metaInfo =
                     new OperatorStateHandle.StateMetaInfo(
                             offsets, OperatorStateHandle.Mode.SPLIT_DISTRIBUTE);
-            operatorStateMetaData.put(String.valueOf(UUID.randomUUID()), metaInfo);
+            operatorStateMetaData.put(
+                    String.valueOf(new UUID(random.nextLong(), random.nextLong())), metaInfo);
         }
         return new OperatorStreamStateHandle(
                 operatorStateMetaData, createStreamStateHandle(numNamedStates, random));
@@ -64,7 +66,8 @@ public class StateHandleDummyUtil {
             int numNamedStates, Random random) {
         byte[] streamData = new byte[numNamedStates * 4];
         random.nextBytes(streamData);
-        return new ByteStreamStateHandle(String.valueOf(UUID.randomUUID()), streamData);
+        return new ByteStreamStateHandle(
+                String.valueOf(new UUID(random.nextLong(), random.nextLong())), streamData);
     }
 
     /** Creates a new test {@link KeyedStateHandle} for the given key-group. */
@@ -141,18 +144,34 @@ public class StateHandleDummyUtil {
 
     public static InputChannelStateHandle createNewInputChannelStateHandle(
             int numNamedStates, Random random) {
+        return createNewInputChannelStateHandle(numNamedStates, 0, random);
+    }
+
+    public static InputChannelStateHandle createNewInputChannelStateHandle(
+            int numNamedStates, int gateIndex, Random random) {
         return new InputChannelStateHandle(
-                new InputChannelInfo(random.nextInt(), random.nextInt()),
+                new InputChannelInfo(gateIndex, random.nextInt()),
                 createStreamStateHandle(numNamedStates, random),
                 genOffsets(numNamedStates, random));
     }
 
     public static ResultSubpartitionStateHandle createNewResultSubpartitionStateHandle(
-            int i, Random random) {
+            int numNamedStates, Random random) {
+        return createNewResultSubpartitionStateHandle(numNamedStates, 0, random);
+    }
+
+    public static ResultSubpartitionStateHandle createNewResultSubpartitionStateHandle(
+            int numNamedStates, int partitionIndex, Random random) {
+        return createNewResultSubpartitionStateHandle(
+                numNamedStates, partitionIndex, random.nextInt(), random);
+    }
+
+    public static ResultSubpartitionStateHandle createNewResultSubpartitionStateHandle(
+            int numNamedStates, int partitionIndex, int subPartitionIdx, Random random) {
         return new ResultSubpartitionStateHandle(
-                new ResultSubpartitionInfo(random.nextInt(), random.nextInt()),
-                createStreamStateHandle(i, random),
-                genOffsets(i, random));
+                new ResultSubpartitionInfo(partitionIndex, subPartitionIdx),
+                createStreamStateHandle(numNamedStates, random),
+                genOffsets(numNamedStates, random));
     }
 
     private static ArrayList<Long> genOffsets(int size, Random random) {
@@ -163,15 +182,34 @@ public class StateHandleDummyUtil {
         return offsets;
     }
 
+    public static KeyedStateHandle createKeyedStateHandleFromSeed(int seed) {
+        return createNewKeyedStateHandle(KeyGroupRange.of(seed * 4, seed * 4 + 3));
+    }
+
+    public static OperatorStateHandle createOperatorStateHandleFromSeed(int seed) {
+        return createNewOperatorStateHandle(1 + (seed % 3), new Random(seed));
+    }
+
+    public static InputChannelStateHandle createInputChannelStateHandleFromSeed(int seed) {
+        return createNewInputChannelStateHandle(1 + (seed % 3), new Random(seed));
+    }
+
+    public static ResultSubpartitionStateHandle createResultSubpartitionStateHandleFromSeed(
+            int seed) {
+        return createNewResultSubpartitionStateHandle(1 + (seed % 3), new Random(seed));
+    }
+
     /** KeyedStateHandle that only holds a key-group information. */
     private static class DummyKeyedStateHandle implements KeyedStateHandle {
 
         private static final long serialVersionUID = 1L;
 
         private final KeyGroupRange keyGroupRange;
+        private final StateHandleID stateHandleId;
 
         private DummyKeyedStateHandle(KeyGroupRange keyGroupRange) {
             this.keyGroupRange = keyGroupRange;
+            this.stateHandleId = StateHandleID.randomStateHandleId();
         }
 
         @Override
@@ -185,7 +223,12 @@ public class StateHandleDummyUtil {
         }
 
         @Override
-        public void registerSharedStates(SharedStateRegistry stateRegistry) {}
+        public StateHandleID getStateHandleId() {
+            return stateHandleId;
+        }
+
+        @Override
+        public void registerSharedStates(SharedStateRegistry stateRegistry, long checkpointID) {}
 
         @Override
         public void discardState() throws Exception {}
@@ -193,6 +236,11 @@ public class StateHandleDummyUtil {
         @Override
         public long getStateSize() {
             return 0L;
+        }
+
+        @Override
+        public long getCheckpointedSize() {
+            return getStateSize();
         }
     }
 }

@@ -18,20 +18,21 @@
 
 package org.apache.flink.runtime.scheduler;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.jobmaster.slotpool.PhysicalSlotProvider;
 import org.apache.flink.runtime.jobmaster.slotpool.PhysicalSlotRequestBulkChecker;
 import org.apache.flink.runtime.scheduler.SharedSlotProfileRetriever.SharedSlotProfileRetrieverFactory;
 
+import java.time.Duration;
+
 /** Factory for {@link SlotSharingExecutionSlotAllocator}. */
-class SlotSharingExecutionSlotAllocatorFactory implements ExecutionSlotAllocatorFactory {
+public class SlotSharingExecutionSlotAllocatorFactory implements ExecutionSlotAllocatorFactory {
     private final PhysicalSlotProvider slotProvider;
 
     private final boolean slotWillBeOccupiedIndefinitely;
 
     private final PhysicalSlotRequestBulkChecker bulkChecker;
 
-    private final Time allocationTimeout;
+    private final Duration allocationTimeout;
 
     private final SlotSharingStrategy.Factory slotSharingStrategyFactory;
 
@@ -39,20 +40,7 @@ class SlotSharingExecutionSlotAllocatorFactory implements ExecutionSlotAllocator
             PhysicalSlotProvider slotProvider,
             boolean slotWillBeOccupiedIndefinitely,
             PhysicalSlotRequestBulkChecker bulkChecker,
-            Time allocationTimeout) {
-        this(
-                slotProvider,
-                slotWillBeOccupiedIndefinitely,
-                bulkChecker,
-                allocationTimeout,
-                new LocalInputPreferredSlotSharingStrategy.Factory());
-    }
-
-    SlotSharingExecutionSlotAllocatorFactory(
-            PhysicalSlotProvider slotProvider,
-            boolean slotWillBeOccupiedIndefinitely,
-            PhysicalSlotRequestBulkChecker bulkChecker,
-            Time allocationTimeout,
+            Duration allocationTimeout,
             SlotSharingStrategy.Factory slotSharingStrategyFactory) {
         this.slotProvider = slotProvider;
         this.slotWillBeOccupiedIndefinitely = slotWillBeOccupiedIndefinitely;
@@ -72,7 +60,9 @@ class SlotSharingExecutionSlotAllocatorFactory implements ExecutionSlotAllocator
                 new DefaultSyncPreferredLocationsRetriever(context, context);
         SharedSlotProfileRetrieverFactory sharedSlotProfileRetrieverFactory =
                 new MergingSharedSlotProfileRetrieverFactory(
-                        preferredLocationsRetriever, context::getPriorAllocationId);
+                        preferredLocationsRetriever,
+                        context::findPriorAllocationId,
+                        context::getReservedAllocations);
         return new SlotSharingExecutionSlotAllocator(
                 slotProvider,
                 slotWillBeOccupiedIndefinitely,

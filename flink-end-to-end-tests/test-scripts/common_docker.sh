@@ -21,7 +21,6 @@ set -o pipefail
 source "$(dirname "$0")"/common.sh
 
 docker --version
-docker-compose --version
 
 function containers_health_check() {
   local container_names=${@:1}
@@ -47,26 +46,43 @@ function build_image() {
     start_file_server
     local server_pid=$!
 
-    echo "Preparing Dockeriles"
-    git clone https://github.com/apache/flink-docker.git --branch dev-master --single-branch
+    echo "Preparing Dockerfiles"
+    retry_times_with_exponential_backoff 5 git clone https://github.com/apache/flink-docker.git --branch dev-master --single-branch
+
+    local java_version=17
+    if [[ ${PROFILE} == *"jdk17"* ]]; then
+        java_version=17
+    fi
+    if [[ ${PROFILE} == *"jdk21"* ]]; then
+        java_version=21
+    fi
+    if [[ ${PROFILE} == *"jdk25"* ]]; then
+        java_version=25
+    fi
+
     cd flink-docker
-    ./add-custom.sh -u ${file_server_address}:9999/flink.tgz -n ${image_name}
+    ./add-custom.sh -u ${file_server_address}:9999/flink.tgz -n ${image_name} -j ${java_version}
+
+    # eclipse-temurin:25+ images don't include wget; add it to the install step
+    sed -i 's/apt-get -y install gpg/apt-get -y install gpg wget/' dev/${image_name}-ubuntu/Dockerfile
 
     echo "Building images"
-    run_with_timeout 600 docker build --no-cache --network="host" -t ${image_name} dev/${image_name}-debian
+    run_with_timeout 600 docker build --no-cache --network="host" -t ${image_name} dev/${image_name}-ubuntu
+    local build_image_result=$?
     popd
+    return $build_image_result
 }
 
 function start_file_server() {
-    command -v python >/dev/null 2>&1
-    if [[ $? -eq 0 ]]; then
-      python ${TEST_INFRA_DIR}/python2_fileserver.py &
-      return
-    fi
-
     command -v python3 >/dev/null 2>&1
     if [[ $? -eq 0 ]]; then
       python3 ${TEST_INFRA_DIR}/python3_fileserver.py &
+      return
+    fi
+
+    command -v python >/dev/null 2>&1
+    if [[ $? -eq 0 ]]; then
+      python ${TEST_INFRA_DIR}/python2_fileserver.py &
       return
     fi
 

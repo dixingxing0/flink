@@ -19,24 +19,23 @@
 package org.apache.flink.runtime.checkpoint;
 
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.core.fs.FSDataInputStream;
+import org.apache.flink.core.fs.Path;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
-import org.apache.flink.mock.Whitebox;
 import org.apache.flink.runtime.OperatorIDPair;
-import org.apache.flink.runtime.concurrent.Executors;
-import org.apache.flink.runtime.concurrent.ManuallyTriggeredScheduledExecutor;
-import org.apache.flink.runtime.concurrent.ScheduledExecutor;
+import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
+import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutorServiceAdapter;
 import org.apache.flink.runtime.execution.ExecutionState;
-import org.apache.flink.runtime.executiongraph.Execution;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
+import org.apache.flink.runtime.executiongraph.ExecutionGraph;
+import org.apache.flink.runtime.executiongraph.ExecutionGraphCheckpointPlanCalculatorContext;
 import org.apache.flink.runtime.executiongraph.ExecutionGraphTestUtils;
 import org.apache.flink.runtime.executiongraph.ExecutionJobVertex;
-import org.apache.flink.runtime.executiongraph.ExecutionVertex;
-import org.apache.flink.runtime.executiongraph.IntermediateResult;
 import org.apache.flink.runtime.executiongraph.utils.SimpleAckingTaskManagerGateway;
-import org.apache.flink.runtime.executiongraph.utils.SimpleAckingTaskManagerGateway.CheckpointConsumer;
+import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
+import org.apache.flink.runtime.jobgraph.DistributionPattern;
+import org.apache.flink.runtime.jobgraph.JobVertex;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguration;
@@ -44,51 +43,62 @@ import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguratio
 import org.apache.flink.runtime.jobmanager.slots.TaskManagerGateway;
 import org.apache.flink.runtime.jobmaster.LogicalSlot;
 import org.apache.flink.runtime.jobmaster.TestingLogicalSlotBuilder;
+import org.apache.flink.runtime.messages.Acknowledge;
+import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
 import org.apache.flink.runtime.state.ChainedStateHandle;
+import org.apache.flink.runtime.state.CheckpointStorage;
+import org.apache.flink.runtime.state.InputChannelStateHandle;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyGroupRangeOffsets;
 import org.apache.flink.runtime.state.KeyGroupsStateHandle;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.OperatorStateHandle;
 import org.apache.flink.runtime.state.OperatorStreamStateHandle;
-import org.apache.flink.runtime.state.SharedStateRegistry;
-import org.apache.flink.runtime.state.SharedStateRegistryFactory;
-import org.apache.flink.runtime.state.StateBackend;
+import org.apache.flink.runtime.state.ResultSubpartitionStateHandle;
+import org.apache.flink.runtime.state.StateObject;
+import org.apache.flink.runtime.state.filesystem.FileStateHandle;
 import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
-import org.apache.flink.runtime.state.memory.MemoryStateBackend;
+import org.apache.flink.runtime.state.storage.JobManagerCheckpointStorage;
+import org.apache.flink.runtime.testtasks.NoOpInvokable;
 import org.apache.flink.runtime.testutils.CommonTestUtils;
 import org.apache.flink.util.InstantiationUtil;
 import org.apache.flink.util.Preconditions;
+import org.apache.flink.util.clock.Clock;
+import org.apache.flink.util.clock.SystemClock;
+import org.apache.flink.util.concurrent.Executors;
+import org.apache.flink.util.concurrent.ManuallyTriggeredScheduledExecutor;
+import org.apache.flink.util.concurrent.ScheduledExecutor;
 
 import org.junit.Assert;
-import org.mockito.invocation.InvocationOnMock;
 
 import javax.annotation.Nullable;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.BiConsumer;
-import java.util.function.Consumer;
+import java.util.function.BiFunction;
 
+import static org.apache.flink.runtime.checkpoint.StateHandleDummyUtil.createNewInputChannelStateHandle;
+import static org.apache.flink.runtime.checkpoint.StateHandleDummyUtil.createNewResultSubpartitionStateHandle;
+import static org.apache.flink.runtime.util.JobVertexConnectionUtils.connectNewDataSetAsInput;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
-import static org.mockito.Mockito.when;
 
 /** Testing utils for checkpoint coordinator. */
 public class CheckpointCoordinatorTestingUtils {
@@ -216,6 +226,15 @@ public class CheckpointCoordinatorTestingUtils {
             runningGroupsOffset += serializedGroupValue.length;
         }
         return new Tuple2<>(allSerializedValuesConcatenated, offsets);
+    }
+
+    public static void verifyStateRestore(ExecutionJobVertex executionJobVertex) throws Exception {
+        verifyStateRestore(
+                executionJobVertex.getJobVertexId(),
+                executionJobVertex,
+                StateAssignmentOperation.createKeyGroupPartitions(
+                        executionJobVertex.getMaxParallelism(),
+                        executionJobVertex.getParallelism()));
     }
 
     public static void verifyStateRestore(
@@ -355,153 +374,6 @@ public class CheckpointCoordinatorTestingUtils {
         }
     }
 
-    static ExecutionJobVertex mockExecutionJobVertex(
-            JobVertexID jobVertexID, int parallelism, int maxParallelism) throws Exception {
-
-        return mockExecutionJobVertex(
-                jobVertexID,
-                Collections.singletonList(OperatorID.fromJobVertexID(jobVertexID)),
-                parallelism,
-                maxParallelism);
-    }
-
-    static ExecutionJobVertex mockExecutionJobVertex(
-            JobVertexID jobVertexID,
-            List<OperatorID> jobVertexIDs,
-            int parallelism,
-            int maxParallelism)
-            throws Exception {
-        final ExecutionJobVertex executionJobVertex = mock(ExecutionJobVertex.class);
-
-        ExecutionVertex[] executionVertices = new ExecutionVertex[parallelism];
-
-        for (int i = 0; i < parallelism; i++) {
-            executionVertices[i] =
-                    mockExecutionVertex(
-                            new ExecutionAttemptID(),
-                            jobVertexID,
-                            jobVertexIDs,
-                            parallelism,
-                            maxParallelism,
-                            ExecutionState.RUNNING);
-
-            when(executionVertices[i].getParallelSubtaskIndex()).thenReturn(i);
-        }
-
-        when(executionJobVertex.getJobVertexId()).thenReturn(jobVertexID);
-        when(executionJobVertex.getTaskVertices()).thenReturn(executionVertices);
-        when(executionJobVertex.getParallelism()).thenReturn(parallelism);
-        when(executionJobVertex.getMaxParallelism()).thenReturn(maxParallelism);
-        when(executionJobVertex.isMaxParallelismConfigured()).thenReturn(true);
-        List<OperatorIDPair> operatorIDPairs = new ArrayList<>();
-        for (OperatorID operatorID : jobVertexIDs) {
-            operatorIDPairs.add(OperatorIDPair.generatedIDOnly(operatorID));
-        }
-        when(executionJobVertex.getOperatorIDs()).thenReturn(operatorIDPairs);
-        when(executionJobVertex.getProducedDataSets()).thenReturn(new IntermediateResult[0]);
-
-        return executionJobVertex;
-    }
-
-    static ExecutionVertex mockExecutionVertex(ExecutionAttemptID attemptID) {
-        return mockExecutionVertex(attemptID, (LogicalSlot) null);
-    }
-
-    static ExecutionVertex mockExecutionVertex(
-            ExecutionAttemptID attemptID, CheckpointConsumer checkpointConsumer) {
-
-        final SimpleAckingTaskManagerGateway taskManagerGateway =
-                new SimpleAckingTaskManagerGateway();
-        taskManagerGateway.setCheckpointConsumer(checkpointConsumer);
-        return mockExecutionVertex(attemptID, taskManagerGateway);
-    }
-
-    static ExecutionVertex mockExecutionVertex(
-            ExecutionAttemptID attemptID, TaskManagerGateway taskManagerGateway) {
-
-        TestingLogicalSlotBuilder slotBuilder = new TestingLogicalSlotBuilder();
-        slotBuilder.setTaskManagerGateway(taskManagerGateway);
-        LogicalSlot slot = slotBuilder.createTestingLogicalSlot();
-        return mockExecutionVertex(attemptID, slot);
-    }
-
-    static ExecutionVertex mockExecutionVertex(
-            ExecutionAttemptID attemptID, @Nullable LogicalSlot slot) {
-
-        JobVertexID jobVertexID = new JobVertexID();
-        return mockExecutionVertex(
-                attemptID,
-                jobVertexID,
-                Collections.singletonList(OperatorID.fromJobVertexID(jobVertexID)),
-                slot,
-                1,
-                1,
-                ExecutionState.RUNNING);
-    }
-
-    static ExecutionVertex mockExecutionVertex(
-            ExecutionAttemptID attemptID,
-            JobVertexID jobVertexID,
-            List<OperatorID> jobVertexIDs,
-            int parallelism,
-            int maxParallelism,
-            ExecutionState state,
-            ExecutionState... successiveStates) {
-
-        return mockExecutionVertex(
-                attemptID,
-                jobVertexID,
-                jobVertexIDs,
-                null,
-                parallelism,
-                maxParallelism,
-                state,
-                successiveStates);
-    }
-
-    static ExecutionVertex mockExecutionVertex(
-            ExecutionAttemptID attemptID,
-            JobVertexID jobVertexID,
-            List<OperatorID> jobVertexIDs,
-            @Nullable LogicalSlot slot,
-            int parallelism,
-            int maxParallelism,
-            ExecutionState state,
-            ExecutionState... successiveStates) {
-
-        ExecutionVertex vertex = mock(ExecutionVertex.class);
-        when(vertex.getID()).thenReturn(ExecutionGraphTestUtils.createRandomExecutionVertexId());
-        when(vertex.getJobId()).thenReturn(new JobID());
-
-        final Execution exec =
-                spy(
-                        new Execution(
-                                mock(Executor.class), vertex, 1, 1L, 1L, Time.milliseconds(500L)));
-        if (slot != null) {
-            // is there a better way to do this?
-            Whitebox.setInternalState(exec, "assignedResource", slot);
-        }
-
-        when(exec.getAttemptId()).thenReturn(attemptID);
-        when(exec.getState()).thenReturn(state, successiveStates);
-
-        when(vertex.getJobvertexId()).thenReturn(jobVertexID);
-        when(vertex.getCurrentExecutionAttempt()).thenReturn(exec);
-        when(vertex.getTotalNumberOfParallelSubtasks()).thenReturn(parallelism);
-        when(vertex.getMaxParallelism()).thenReturn(maxParallelism);
-
-        ExecutionJobVertex jobVertex = mock(ExecutionJobVertex.class);
-        List<OperatorIDPair> operatorIDPairs = new ArrayList<>();
-        for (OperatorID operatorID : jobVertexIDs) {
-            operatorIDPairs.add(OperatorIDPair.generatedIDOnly(operatorID));
-        }
-        when(jobVertex.getOperatorIDs()).thenReturn(operatorIDPairs);
-
-        when(vertex.getJobVertex()).thenReturn(jobVertex);
-
-        return vertex;
-    }
-
     static TaskStateSnapshot mockSubtaskState(
             JobVertexID jobVertexID, int index, KeyGroupRange keyGroupRange) throws IOException {
 
@@ -561,82 +433,333 @@ public class CheckpointCoordinatorTestingUtils {
         return new KeyGroupsStateHandle(keyGroupRangeOffsets, allSerializedStatesHandle);
     }
 
-    static Execution mockExecution() {
-        Execution mock = mock(Execution.class);
-        when(mock.getAttemptId()).thenReturn(new ExecutionAttemptID());
-        when(mock.getState()).thenReturn(ExecutionState.RUNNING);
-        return mock;
+    public static Tuple2<List<StateObject>, OperatorSubtaskState>
+            generateSampleOperatorSubtaskState() throws IOException {
+        JobVertexID jobVertexID = new JobVertexID();
+        int index = 0;
+        Random random = new Random();
+        OperatorStateHandle managedOpHandle =
+                generatePartitionableStateHandle(jobVertexID, index, 2, 8, false);
+        OperatorStateHandle rawOpHandle =
+                generatePartitionableStateHandle(jobVertexID, index, 2, 8, true);
+        KeyedStateHandle managedKeyedHandle =
+                generateKeyGroupState(jobVertexID, new KeyGroupRange(0, random.nextInt(12)), false);
+        KeyedStateHandle rawKeyedHandle =
+                generateKeyGroupState(jobVertexID, new KeyGroupRange(0, random.nextInt(10)), true);
+        InputChannelStateHandle inputChannelStateHandle =
+                createNewInputChannelStateHandle(3, random);
+        ResultSubpartitionStateHandle resultSubpartitionStateHandle =
+                createNewResultSubpartitionStateHandle(3, random);
+        OperatorSubtaskState operatorSubtaskState =
+                OperatorSubtaskState.builder()
+                        .setManagedOperatorState(managedOpHandle)
+                        .setRawOperatorState(rawOpHandle)
+                        .setManagedKeyedState(managedKeyedHandle)
+                        .setRawKeyedState(rawKeyedHandle)
+                        .setInputChannelState(
+                                StateObjectCollection.singleton(inputChannelStateHandle))
+                        .setResultSubpartitionState(
+                                StateObjectCollection.singleton(resultSubpartitionStateHandle))
+                        .setInputRescalingDescriptor(
+                                InflightDataRescalingDescriptorUtil.rescalingDescriptor(
+                                        new int[1],
+                                        new RescaleMappings[0],
+                                        Collections.singleton(1)))
+                        .setOutputRescalingDescriptor(
+                                InflightDataRescalingDescriptorUtil.rescalingDescriptor(
+                                        new int[1],
+                                        new RescaleMappings[0],
+                                        Collections.singleton(2)))
+                        .build();
+        return new Tuple2<>(
+                Arrays.asList(
+                        managedOpHandle,
+                        rawOpHandle,
+                        managedKeyedHandle,
+                        rawKeyedHandle,
+                        inputChannelStateHandle,
+                        resultSubpartitionStateHandle),
+                operatorSubtaskState);
     }
 
-    static Execution mockExecution(CheckpointConsumer checkpointConsumer) {
-        ExecutionVertex executionVertex = mock(ExecutionVertex.class);
-        final JobID jobId = new JobID();
-        when(executionVertex.getJobId()).thenReturn(jobId);
-        Execution mock = mock(Execution.class);
-        ExecutionAttemptID executionAttemptID = new ExecutionAttemptID();
-        when(mock.getAttemptId()).thenReturn(executionAttemptID);
-        when(mock.getState()).thenReturn(ExecutionState.RUNNING);
-        when(mock.getVertex()).thenReturn(executionVertex);
-        doAnswer(
-                        (InvocationOnMock invocation) -> {
-                            final Object[] args = invocation.getArguments();
-                            checkpointConsumer.accept(
-                                    executionAttemptID,
-                                    jobId,
-                                    (long) args[0],
-                                    (long) args[1],
-                                    (CheckpointOptions) args[2],
-                                    false);
-                            return null;
-                        })
-                .when(mock)
-                .triggerCheckpoint(anyLong(), anyLong(), any(CheckpointOptions.class));
-        return mock;
+    public static TaskStateSnapshot createSnapshotWithUnionListState(
+            File stateFile, OperatorID operatorId, boolean isTaskFinished) throws IOException {
+        TaskStateSnapshot taskStateSnapshot = new TaskStateSnapshot(1, isTaskFinished);
+        taskStateSnapshot.putSubtaskStateByOperatorID(
+                operatorId, createSubtaskStateWithUnionListState(stateFile));
+        return taskStateSnapshot;
     }
 
-    static ExecutionVertex mockExecutionVertex(
-            Execution execution, JobVertexID vertexId, int subtask, int parallelism) {
-        ExecutionVertex mock = mock(ExecutionVertex.class);
-        when(mock.getJobvertexId()).thenReturn(vertexId);
-        when(mock.getParallelSubtaskIndex()).thenReturn(subtask);
-        when(mock.getCurrentExecutionAttempt()).thenReturn(execution);
-        when(mock.getTotalNumberOfParallelSubtasks()).thenReturn(parallelism);
-        when(mock.getMaxParallelism()).thenReturn(parallelism);
-        return mock;
+    public static OperatorSubtaskState createSubtaskStateWithUnionListState(File stateFile) {
+        return OperatorSubtaskState.builder()
+                .setManagedOperatorState(
+                        new OperatorStreamStateHandle(
+                                Collections.singletonMap(
+                                        "test",
+                                        new OperatorStateHandle.StateMetaInfo(
+                                                new long[0], OperatorStateHandle.Mode.UNION)),
+                                new FileStateHandle(new Path(stateFile.getAbsolutePath()), 0L)))
+                .build();
     }
 
-    static ExecutionJobVertex mockExecutionJobVertex(JobVertexID id, ExecutionVertex[] vertices) {
-        ExecutionJobVertex vertex = mock(ExecutionJobVertex.class);
-        when(vertex.getParallelism()).thenReturn(vertices.length);
-        when(vertex.getMaxParallelism()).thenReturn(vertices.length);
-        when(vertex.getJobVertexId()).thenReturn(id);
-        when(vertex.getTaskVertices()).thenReturn(vertices);
-        when(vertex.getOperatorIDs())
-                .thenReturn(
-                        Collections.singletonList(
-                                OperatorIDPair.generatedIDOnly(OperatorID.fromJobVertexID(id))));
-        when(vertex.getProducedDataSets()).thenReturn(new IntermediateResult[0]);
+    static class TriggeredCheckpoint {
+        final JobID jobId;
+        final long checkpointId;
+        final long timestamp;
+        final CheckpointOptions checkpointOptions;
 
-        for (ExecutionVertex v : vertices) {
-            when(v.getJobVertex()).thenReturn(vertex);
+        public TriggeredCheckpoint(
+                JobID jobId,
+                long checkpointId,
+                long timestamp,
+                CheckpointOptions checkpointOptions) {
+            this.jobId = jobId;
+            this.checkpointId = checkpointId;
+            this.timestamp = timestamp;
+            this.checkpointOptions = checkpointOptions;
         }
-        return vertex;
+    }
+
+    static class NotifiedCheckpoint {
+        final JobID jobId;
+        final long checkpointId;
+        final long timestamp;
+
+        public NotifiedCheckpoint(JobID jobId, long checkpointId, long timestamp) {
+            this.jobId = jobId;
+            this.checkpointId = checkpointId;
+            this.timestamp = timestamp;
+        }
+    }
+
+    static class CheckpointRecorderTaskManagerGateway extends SimpleAckingTaskManagerGateway {
+
+        private final Map<ExecutionAttemptID, List<TriggeredCheckpoint>> triggeredCheckpoints =
+                new HashMap<>();
+
+        private final Map<ExecutionAttemptID, List<NotifiedCheckpoint>>
+                notifiedCompletedCheckpoints = new HashMap<>();
+
+        private final Map<ExecutionAttemptID, List<NotifiedCheckpoint>> notifiedAbortCheckpoints =
+                new HashMap<>();
+
+        @Override
+        public CompletableFuture<Acknowledge> triggerCheckpoint(
+                ExecutionAttemptID attemptId,
+                JobID jobId,
+                long checkpointId,
+                long timestamp,
+                CheckpointOptions checkpointOptions) {
+            triggeredCheckpoints
+                    .computeIfAbsent(attemptId, k -> new ArrayList<>())
+                    .add(
+                            new TriggeredCheckpoint(
+                                    jobId, checkpointId, timestamp, checkpointOptions));
+            return CompletableFuture.completedFuture(Acknowledge.get());
+        }
+
+        @Override
+        public void notifyCheckpointOnComplete(
+                ExecutionAttemptID attemptId,
+                JobID jobId,
+                long completedCheckpointId,
+                long completedTimestamp,
+                long lastSubsumedCheckpointId) {
+            notifiedCompletedCheckpoints
+                    .computeIfAbsent(attemptId, k -> new ArrayList<>())
+                    .add(new NotifiedCheckpoint(jobId, completedCheckpointId, completedTimestamp));
+        }
+
+        @Override
+        public void notifyCheckpointAborted(
+                ExecutionAttemptID attemptId,
+                JobID jobId,
+                long checkpointId,
+                long latestCompletedCheckpointId,
+                long timestamp) {
+            notifiedAbortCheckpoints
+                    .computeIfAbsent(attemptId, k -> new ArrayList<>())
+                    .add(new NotifiedCheckpoint(jobId, checkpointId, timestamp));
+        }
+
+        public void resetCount() {
+            triggeredCheckpoints.clear();
+            notifiedAbortCheckpoints.clear();
+            notifiedCompletedCheckpoints.clear();
+        }
+
+        public List<TriggeredCheckpoint> getTriggeredCheckpoints(ExecutionAttemptID attemptId) {
+            return triggeredCheckpoints.getOrDefault(attemptId, Collections.emptyList());
+        }
+
+        public TriggeredCheckpoint getOnlyTriggeredCheckpoint(ExecutionAttemptID attemptId) {
+            List<TriggeredCheckpoint> triggeredCheckpoints = getTriggeredCheckpoints(attemptId);
+            assertEquals(
+                    "There should be exactly one checkpoint triggered for " + attemptId,
+                    1,
+                    triggeredCheckpoints.size());
+            return triggeredCheckpoints.get(0);
+        }
+
+        public List<NotifiedCheckpoint> getNotifiedCompletedCheckpoints(
+                ExecutionAttemptID attemptId) {
+            return notifiedCompletedCheckpoints.getOrDefault(attemptId, Collections.emptyList());
+        }
+
+        public NotifiedCheckpoint getOnlyNotifiedCompletedCheckpoint(ExecutionAttemptID attemptId) {
+            List<NotifiedCheckpoint> completedCheckpoints =
+                    getNotifiedCompletedCheckpoints(attemptId);
+            assertEquals(
+                    "There should be exactly one checkpoint notified completed for " + attemptId,
+                    1,
+                    completedCheckpoints.size());
+            return completedCheckpoints.get(0);
+        }
+
+        public List<NotifiedCheckpoint> getNotifiedAbortedCheckpoints(
+                ExecutionAttemptID attemptId) {
+            return notifiedAbortCheckpoints.getOrDefault(attemptId, Collections.emptyList());
+        }
+
+        public NotifiedCheckpoint getOnlyNotifiedAbortedCheckpoint(ExecutionAttemptID attemptId) {
+            List<NotifiedCheckpoint> abortedCheckpoints = getNotifiedAbortedCheckpoints(attemptId);
+            assertEquals(
+                    "There should be exactly one checkpoint notified aborted for " + attemptId,
+                    1,
+                    abortedCheckpoints.size());
+            return abortedCheckpoints.get(0);
+        }
+    }
+
+    static class CheckpointExecutionGraphBuilder {
+        private final List<JobVertex> sourceVertices = new ArrayList<>();
+        private final List<JobVertex> nonSourceVertices = new ArrayList<>();
+        private DistributionPattern distributionPattern;
+        private boolean transitToRunning;
+        private TaskManagerGateway taskManagerGateway;
+        private ComponentMainThreadExecutor mainThreadExecutor;
+
+        CheckpointExecutionGraphBuilder() {
+            this.distributionPattern = DistributionPattern.ALL_TO_ALL;
+            this.transitToRunning = true;
+            this.mainThreadExecutor = ComponentMainThreadExecutorServiceAdapter.forMainThread();
+        }
+
+        public CheckpointExecutionGraphBuilder addJobVertex(JobVertexID id) {
+            return addJobVertex(id, true);
+        }
+
+        public CheckpointExecutionGraphBuilder addJobVertex(JobVertexID id, boolean isSource) {
+            return addJobVertex(id, 1, 32768, Collections.emptyList(), isSource);
+        }
+
+        public CheckpointExecutionGraphBuilder addJobVertex(
+                JobVertexID id, int parallelism, int maxParallelism) {
+            return addJobVertex(id, parallelism, maxParallelism, Collections.emptyList(), true);
+        }
+
+        public CheckpointExecutionGraphBuilder addJobVertex(
+                JobVertexID id,
+                int parallelism,
+                int maxParallelism,
+                List<OperatorIDPair> operators,
+                boolean isSource) {
+
+            JobVertex jobVertex =
+                    operators.size() == 0
+                            ? new JobVertex("anon", id)
+                            : new JobVertex("anon", id, operators);
+            jobVertex.setParallelism(parallelism);
+            jobVertex.setMaxParallelism(maxParallelism);
+            jobVertex.setInvokableClass(NoOpInvokable.class);
+
+            return addJobVertex(jobVertex, isSource);
+        }
+
+        public CheckpointExecutionGraphBuilder addJobVertex(JobVertex jobVertex, boolean isSource) {
+            if (isSource) {
+                sourceVertices.add(jobVertex);
+            } else {
+                nonSourceVertices.add(jobVertex);
+            }
+
+            return this;
+        }
+
+        public CheckpointExecutionGraphBuilder setTaskManagerGateway(
+                TaskManagerGateway taskManagerGateway) {
+            this.taskManagerGateway = taskManagerGateway;
+            return this;
+        }
+
+        public CheckpointExecutionGraphBuilder setDistributionPattern(
+                DistributionPattern distributionPattern) {
+            this.distributionPattern = distributionPattern;
+            return this;
+        }
+
+        public CheckpointExecutionGraphBuilder setTransitToRunning(boolean transitToRunning) {
+            this.transitToRunning = transitToRunning;
+            return this;
+        }
+
+        public CheckpointExecutionGraphBuilder setMainThreadExecutor(
+                ComponentMainThreadExecutor mainThreadExecutor) {
+            this.mainThreadExecutor = mainThreadExecutor;
+            return this;
+        }
+
+        ExecutionGraph build(ScheduledExecutorService executorService) throws Exception {
+            // Lets connect source vertices and non-source vertices
+            for (JobVertex source : sourceVertices) {
+                for (JobVertex nonSource : nonSourceVertices) {
+                    connectNewDataSetAsInput(
+                            nonSource, source, distributionPattern, ResultPartitionType.PIPELINED);
+                }
+            }
+
+            List<JobVertex> allVertices = new ArrayList<>();
+            allVertices.addAll(sourceVertices);
+            allVertices.addAll(nonSourceVertices);
+
+            ExecutionGraph executionGraph =
+                    ExecutionGraphTestUtils.createExecutionGraph(
+                            executorService, allVertices.toArray(new JobVertex[0]));
+            executionGraph.start(mainThreadExecutor);
+
+            if (taskManagerGateway != null) {
+                executionGraph
+                        .getAllExecutionVertices()
+                        .forEach(
+                                task -> {
+                                    LogicalSlot slot =
+                                            new TestingLogicalSlotBuilder()
+                                                    .setTaskManagerGateway(taskManagerGateway)
+                                                    .createTestingLogicalSlot();
+                                    task.tryAssignResource(slot);
+                                });
+            }
+
+            if (transitToRunning) {
+                executionGraph.transitionToRunning();
+                executionGraph
+                        .getAllExecutionVertices()
+                        .forEach(
+                                task ->
+                                        task.getCurrentExecutionAttempt()
+                                                .transitionState(ExecutionState.RUNNING));
+            }
+
+            return executionGraph;
+        }
     }
 
     /** A helper builder for {@link CheckpointCoordinator} to deduplicate test codes. */
     public static class CheckpointCoordinatorBuilder {
-        private JobID jobId = new JobID();
-
         private CheckpointCoordinatorConfiguration checkpointCoordinatorConfiguration =
                 new CheckpointCoordinatorConfigurationBuilder()
                         .setMaxConcurrentCheckpoints(Integer.MAX_VALUE)
                         .build();
-
-        private ExecutionVertex[] tasksToTrigger;
-
-        private ExecutionVertex[] tasksToWaitFor;
-
-        private ExecutionVertex[] tasksToCommitTo;
 
         private Collection<OperatorCoordinatorCheckpointContext> coordinatorsToCheckpoint =
                 Collections.emptyList();
@@ -646,7 +769,7 @@ public class CheckpointCoordinatorTestingUtils {
         private CompletedCheckpointStore completedCheckpointStore =
                 new StandaloneCompletedCheckpointStore(1);
 
-        private StateBackend checkpointStateBackend = new MemoryStateBackend();
+        private CheckpointStorage checkpointStorage = new JobManagerCheckpointStorage();
 
         private Executor ioExecutor = Executors.directExecutor();
 
@@ -654,50 +777,26 @@ public class CheckpointCoordinatorTestingUtils {
 
         private ScheduledExecutor timer = new ManuallyTriggeredScheduledExecutor();
 
-        private SharedStateRegistryFactory sharedStateRegistryFactory =
-                SharedStateRegistry.DEFAULT_FACTORY;
-
         private CheckpointFailureManager failureManager =
                 new CheckpointFailureManager(0, NoOpFailJobCall.INSTANCE);
 
-        public CheckpointCoordinatorBuilder() {
-            ExecutionVertex vertex = mockExecutionVertex(new ExecutionAttemptID());
-            ExecutionVertex[] defaultVertices = new ExecutionVertex[] {vertex};
-            tasksToTrigger = defaultVertices;
-            tasksToWaitFor = defaultVertices;
-            tasksToCommitTo = defaultVertices;
-        }
+        private boolean allowCheckpointsAfterTasksFinished;
 
-        public CheckpointCoordinatorBuilder setJobId(JobID jobId) {
-            this.jobId = jobId;
-            return this;
-        }
+        private CheckpointStatsTracker checkpointStatsTracker =
+                new DefaultCheckpointStatsTracker(
+                        1, UnregisteredMetricGroups.createUnregisteredJobManagerJobMetricGroup());
+
+        private BiFunction<
+                        Set<ExecutionJobVertex>,
+                        Map<OperatorID, OperatorState>,
+                        VertexFinishedStateChecker>
+                vertexFinishedStateCheckerFactory = VertexFinishedStateChecker::new;
+
+        private Clock clock = SystemClock.getInstance();
 
         public CheckpointCoordinatorBuilder setCheckpointCoordinatorConfiguration(
                 CheckpointCoordinatorConfiguration checkpointCoordinatorConfiguration) {
             this.checkpointCoordinatorConfiguration = checkpointCoordinatorConfiguration;
-            return this;
-        }
-
-        public CheckpointCoordinatorBuilder setTasks(ExecutionVertex[] tasks) {
-            this.tasksToTrigger = tasks;
-            this.tasksToWaitFor = tasks;
-            this.tasksToCommitTo = tasks;
-            return this;
-        }
-
-        public CheckpointCoordinatorBuilder setTasksToTrigger(ExecutionVertex[] tasksToTrigger) {
-            this.tasksToTrigger = tasksToTrigger;
-            return this;
-        }
-
-        public CheckpointCoordinatorBuilder setTasksToWaitFor(ExecutionVertex[] tasksToWaitFor) {
-            this.tasksToWaitFor = tasksToWaitFor;
-            return this;
-        }
-
-        public CheckpointCoordinatorBuilder setTasksToCommitTo(ExecutionVertex[] tasksToCommitTo) {
-            this.tasksToCommitTo = tasksToCommitTo;
             return this;
         }
 
@@ -707,21 +806,27 @@ public class CheckpointCoordinatorTestingUtils {
             return this;
         }
 
+        public CheckpointCoordinatorBuilder setCheckpointsCleaner(
+                CheckpointsCleaner checkpointsCleaner) {
+            this.checkpointsCleaner = checkpointsCleaner;
+            return this;
+        }
+
         public CheckpointCoordinatorBuilder setCheckpointIDCounter(
                 CheckpointIDCounter checkpointIDCounter) {
             this.checkpointIDCounter = checkpointIDCounter;
             return this;
         }
 
-        public CheckpointCoordinatorBuilder setCompletedCheckpointStore(
-                CompletedCheckpointStore completedCheckpointStore) {
-            this.completedCheckpointStore = completedCheckpointStore;
+        public CheckpointCoordinatorBuilder setCheckpointFailureManager(
+                CheckpointFailureManager checkpointFailureManager) {
+            this.failureManager = checkpointFailureManager;
             return this;
         }
 
-        public CheckpointCoordinatorBuilder setCheckpointStateBackend(
-                StateBackend checkpointStateBackend) {
-            this.checkpointStateBackend = checkpointStateBackend;
+        public CheckpointCoordinatorBuilder setCompletedCheckpointStore(
+                CompletedCheckpointStore completedCheckpointStore) {
+            this.completedCheckpointStore = completedCheckpointStore;
             return this;
         }
 
@@ -735,39 +840,76 @@ public class CheckpointCoordinatorTestingUtils {
             return this;
         }
 
-        public CheckpointCoordinatorBuilder setSharedStateRegistryFactory(
-                SharedStateRegistryFactory sharedStateRegistryFactory) {
-            this.sharedStateRegistryFactory = sharedStateRegistryFactory;
-            return this;
-        }
-
         public CheckpointCoordinatorBuilder setFailureManager(
                 CheckpointFailureManager failureManager) {
             this.failureManager = failureManager;
             return this;
         }
 
-        public CheckpointCoordinatorBuilder setStateBackEnd(StateBackend stateBackEnd) {
-            this.checkpointStateBackend = stateBackEnd;
+        public CheckpointCoordinatorBuilder setCheckpointStorage(CheckpointStorage stateBackEnd) {
+            this.checkpointStorage = stateBackEnd;
             return this;
         }
 
-        public CheckpointCoordinator build() {
+        public CheckpointCoordinatorBuilder setAllowCheckpointsAfterTasksFinished(
+                boolean allowCheckpointsAfterTasksFinished) {
+            this.allowCheckpointsAfterTasksFinished = allowCheckpointsAfterTasksFinished;
+            return this;
+        }
+
+        public CheckpointCoordinatorBuilder setCheckpointStatsTracker(
+                CheckpointStatsTracker checkpointStatsTracker) {
+            this.checkpointStatsTracker = checkpointStatsTracker;
+            return this;
+        }
+
+        public CheckpointCoordinatorBuilder setVertexFinishedStateCheckerFactory(
+                BiFunction<
+                                Set<ExecutionJobVertex>,
+                                Map<OperatorID, OperatorState>,
+                                VertexFinishedStateChecker>
+                        vertexFinishedStateCheckerFactory) {
+            this.vertexFinishedStateCheckerFactory = vertexFinishedStateCheckerFactory;
+            return this;
+        }
+
+        public CheckpointCoordinatorBuilder setClock(Clock clock) {
+            this.clock = clock;
+            return this;
+        }
+
+        public CheckpointCoordinator build(ScheduledExecutorService executorService)
+                throws Exception {
+            return build(
+                    new CheckpointExecutionGraphBuilder()
+                            .addJobVertex(new JobVertexID())
+                            .build(executorService));
+        }
+
+        public CheckpointCoordinator build(ExecutionGraph executionGraph) throws Exception {
+
+            DefaultCheckpointPlanCalculator checkpointPlanCalculator =
+                    new DefaultCheckpointPlanCalculator(
+                            executionGraph.getJobID(),
+                            new ExecutionGraphCheckpointPlanCalculatorContext(executionGraph),
+                            executionGraph.getVerticesTopologically(),
+                            allowCheckpointsAfterTasksFinished);
+
             return new CheckpointCoordinator(
-                    jobId,
+                    executionGraph.getJobID(),
                     checkpointCoordinatorConfiguration,
-                    tasksToTrigger,
-                    tasksToWaitFor,
-                    tasksToCommitTo,
                     coordinatorsToCheckpoint,
                     checkpointIDCounter,
                     completedCheckpointStore,
-                    checkpointStateBackend,
+                    checkpointStorage,
                     ioExecutor,
                     checkpointsCleaner,
                     timer,
-                    sharedStateRegistryFactory,
-                    failureManager);
+                    failureManager,
+                    checkpointPlanCalculator,
+                    clock,
+                    checkpointStatsTracker,
+                    vertexFinishedStateCheckerFactory);
         }
     }
 
@@ -797,9 +939,9 @@ public class CheckpointCoordinatorTestingUtils {
 
     // ----------------- Mock class builders ---------------
 
-    public static final class MockOperatorCheckpointCoordinatorContextBuilder {
+    static final class MockOperatorCheckpointCoordinatorContextBuilder {
         private BiConsumer<Long, CompletableFuture<byte[]>> onCallingCheckpointCoordinator = null;
-        private Consumer<Long> onCallingAfterSourceBarrierInjection = null;
+        private Runnable onCallingAbortCurrentTriggering = null;
         private OperatorID operatorID = null;
 
         public MockOperatorCheckpointCoordinatorContextBuilder setOnCallingCheckpointCoordinator(
@@ -808,10 +950,9 @@ public class CheckpointCoordinatorTestingUtils {
             return this;
         }
 
-        public MockOperatorCheckpointCoordinatorContextBuilder
-                setOnCallingAfterSourceBarrierInjection(
-                        Consumer<Long> onCallingAfterSourceBarrierInjection) {
-            this.onCallingAfterSourceBarrierInjection = onCallingAfterSourceBarrierInjection;
+        public MockOperatorCheckpointCoordinatorContextBuilder setOnCallingAbortCurrentTriggering(
+                Runnable onCallingAbortCurrentTriggering) {
+            this.onCallingAbortCurrentTriggering = onCallingAbortCurrentTriggering;
             return this;
         }
 
@@ -823,9 +964,7 @@ public class CheckpointCoordinatorTestingUtils {
 
         public MockOperatorCoordinatorCheckpointContext build() {
             return new MockOperatorCoordinatorCheckpointContext(
-                    onCallingCheckpointCoordinator,
-                    onCallingAfterSourceBarrierInjection,
-                    operatorID);
+                    onCallingCheckpointCoordinator, onCallingAbortCurrentTriggering, operatorID);
         }
     }
 
@@ -838,17 +977,17 @@ public class CheckpointCoordinatorTestingUtils {
     public static final class MockOperatorCoordinatorCheckpointContext
             implements OperatorCoordinatorCheckpointContext {
         private final BiConsumer<Long, CompletableFuture<byte[]>> onCallingCheckpointCoordinator;
-        private final Consumer<Long> onCallingAfterSourceBarrierInjection;
+        private final Runnable onCallingAbortCurrentTriggering;
         private final OperatorID operatorID;
         private final List<Long> completedCheckpoints;
         private final List<Long> abortedCheckpoints;
 
         private MockOperatorCoordinatorCheckpointContext(
                 BiConsumer<Long, CompletableFuture<byte[]>> onCallingCheckpointCoordinator,
-                Consumer<Long> onCallingAfterSourceBarrierInjection,
+                Runnable onCallingAbortCurrentTriggering,
                 OperatorID operatorID) {
             this.onCallingCheckpointCoordinator = onCallingCheckpointCoordinator;
-            this.onCallingAfterSourceBarrierInjection = onCallingAfterSourceBarrierInjection;
+            this.onCallingAbortCurrentTriggering = onCallingAbortCurrentTriggering;
             this.operatorID = operatorID;
             this.completedCheckpoints = new ArrayList<>();
             this.abortedCheckpoints = new ArrayList<>();
@@ -863,14 +1002,11 @@ public class CheckpointCoordinatorTestingUtils {
         }
 
         @Override
-        public void afterSourceBarrierInjection(long checkpointId) {
-            if (onCallingAfterSourceBarrierInjection != null) {
-                onCallingAfterSourceBarrierInjection.accept(checkpointId);
+        public void abortCurrentTriggering() {
+            if (onCallingAbortCurrentTriggering != null) {
+                onCallingAbortCurrentTriggering.run();
             }
         }
-
-        @Override
-        public void abortCurrentTriggering() {}
 
         @Override
         public void notifyCheckpointComplete(long checkpointId) {

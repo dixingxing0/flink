@@ -22,6 +22,7 @@ import org.apache.flink.runtime.io.network.ConnectionID;
 import org.apache.flink.runtime.io.network.ConnectionManager;
 import org.apache.flink.runtime.io.network.metrics.InputChannelMetrics;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
+import org.apache.flink.runtime.io.network.partition.ResultSubpartitionIndexSet;
 
 import java.io.IOException;
 
@@ -34,21 +35,25 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 public class RemoteRecoveredInputChannel extends RecoveredInputChannel {
     private final ConnectionID connectionId;
     private final ConnectionManager connectionManager;
+    private final int partitionRequestListenerTimeout;
 
     RemoteRecoveredInputChannel(
             SingleInputGate inputGate,
             int channelIndex,
             ResultPartitionID partitionId,
+            ResultSubpartitionIndexSet consumedSubpartitionIndexSet,
             ConnectionID connectionId,
             ConnectionManager connectionManager,
             int initialBackOff,
             int maxBackoff,
+            int partitionRequestListenerTimeout,
             int networkBuffersPerChannel,
             InputChannelMetrics metrics) {
         super(
                 inputGate,
                 channelIndex,
                 partitionId,
+                consumedSubpartitionIndexSet,
                 initialBackOff,
                 maxBackoff,
                 metrics.getNumBytesInRemoteCounter(),
@@ -57,24 +62,27 @@ public class RemoteRecoveredInputChannel extends RecoveredInputChannel {
 
         this.connectionId = checkNotNull(connectionId);
         this.connectionManager = checkNotNull(connectionManager);
+        this.partitionRequestListenerTimeout = partitionRequestListenerTimeout;
     }
 
     @Override
-    protected InputChannel toInputChannelInternal() throws IOException {
+    protected InputChannel toInputChannelInternal(boolean needsRecovery) throws IOException {
         RemoteInputChannel remoteInputChannel =
                 new RemoteInputChannel(
                         inputGate,
                         getChannelIndex(),
                         partitionId,
+                        consumedSubpartitionIndexSet,
                         connectionId,
                         connectionManager,
                         initialBackoff,
                         maxBackoff,
+                        partitionRequestListenerTimeout,
                         networkBuffersPerChannel,
                         numBytesIn,
                         numBuffersIn,
-                        channelStateWriter);
-        remoteInputChannel.setup();
+                        channelStateWriter,
+                        needsRecovery);
         return remoteInputChannel;
     }
 }

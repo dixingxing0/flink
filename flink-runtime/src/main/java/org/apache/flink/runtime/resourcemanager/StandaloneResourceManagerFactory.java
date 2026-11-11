@@ -18,19 +18,20 @@
 
 package org.apache.flink.runtime.resourcemanager;
 
-import org.apache.flink.api.common.time.Time;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ConfigurationUtils;
 import org.apache.flink.configuration.ResourceManagerOptions;
-import org.apache.flink.runtime.akka.AkkaUtils;
+import org.apache.flink.configuration.RpcOptions;
+import org.apache.flink.runtime.blocklist.BlocklistUtils;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.entrypoint.ClusterInformation;
 import org.apache.flink.runtime.heartbeat.HeartbeatServices;
-import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
 import org.apache.flink.runtime.io.network.partition.ResourceManagerPartitionTrackerImpl;
 import org.apache.flink.runtime.metrics.groups.ResourceManagerMetricGroup;
 import org.apache.flink.runtime.rpc.FatalErrorHandler;
 import org.apache.flink.runtime.rpc.RpcService;
+import org.apache.flink.runtime.security.token.DelegationTokenManager;
 import org.apache.flink.util.ConfigurationException;
 
 import org.slf4j.Logger;
@@ -38,6 +39,8 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.time.Duration;
+import java.util.UUID;
 import java.util.concurrent.Executor;
 
 /** {@link ResourceManagerFactory} which creates a {@link StandaloneResourceManager}. */
@@ -59,8 +62,9 @@ public final class StandaloneResourceManagerFactory extends ResourceManagerFacto
             Configuration configuration,
             ResourceID resourceId,
             RpcService rpcService,
-            HighAvailabilityServices highAvailabilityServices,
+            UUID leaderSessionId,
             HeartbeatServices heartbeatServices,
+            DelegationTokenManager delegationTokenManager,
             FatalErrorHandler fatalErrorHandler,
             ClusterInformation clusterInformation,
             @Nullable String webInterfaceUrl,
@@ -68,22 +72,24 @@ public final class StandaloneResourceManagerFactory extends ResourceManagerFacto
             ResourceManagerRuntimeServices resourceManagerRuntimeServices,
             Executor ioExecutor) {
 
-        final Time standaloneClusterStartupPeriodTime =
+        final Duration standaloneClusterStartupPeriodTime =
                 ConfigurationUtils.getStandaloneClusterStartupPeriodTime(configuration);
 
         return new StandaloneResourceManager(
                 rpcService,
+                leaderSessionId,
                 resourceId,
-                highAvailabilityServices,
                 heartbeatServices,
+                delegationTokenManager,
                 resourceManagerRuntimeServices.getSlotManager(),
                 ResourceManagerPartitionTrackerImpl::new,
+                BlocklistUtils.loadBlocklistHandlerFactory(configuration),
                 resourceManagerRuntimeServices.getJobLeaderIdService(),
                 clusterInformation,
                 fatalErrorHandler,
                 resourceManagerMetricGroup,
                 standaloneClusterStartupPeriodTime,
-                AkkaUtils.getTimeoutAsTime(configuration),
+                configuration.get(RpcOptions.ASK_TIMEOUT_DURATION),
                 ioExecutor);
     }
 
@@ -92,7 +98,7 @@ public final class StandaloneResourceManagerFactory extends ResourceManagerFacto
             createResourceManagerRuntimeServicesConfiguration(Configuration configuration)
                     throws ConfigurationException {
         return ResourceManagerRuntimeServicesConfiguration.fromConfiguration(
-                getConfigurationWithoutMaxSlotNumberIfSet(configuration),
+                getConfigurationWithoutResourceLimitationIfSet(configuration),
                 ArbitraryWorkerResourceSpecFactory.INSTANCE);
     }
 
@@ -102,17 +108,52 @@ public final class StandaloneResourceManagerFactory extends ResourceManagerFacto
      * @param configuration configuration object
      * @return the configuration for standalone ResourceManager
      */
-    private static Configuration getConfigurationWithoutMaxSlotNumberIfSet(
+    @VisibleForTesting
+    public static Configuration getConfigurationWithoutResourceLimitationIfSet(
             Configuration configuration) {
         final Configuration copiedConfig = new Configuration(configuration);
-        // The max slot limit should not take effect for standalone cluster, we overwrite the
-        // configure in case user
-        // sets this value by mistake.
-        if (copiedConfig.removeConfig(ResourceManagerOptions.MAX_SLOT_NUM)) {
+        removeResourceLimitationConfig(copiedConfig);
+
+        return copiedConfig;
+    }
+
+    private static void removeResourceLimitationConfig(Configuration configuration) {
+        // The slot/cpu/memory limit should not take effect for standalone cluster, we overwrite the
+        // configure in case user sets this value by mistake.
+        if (configuration.removeConfig(ResourceManagerOptions.MIN_SLOT_NUM)) {
+            LOG.warn(
+                    "Config option {} will be ignored in standalone mode.",
+                    ResourceManagerOptions.MIN_SLOT_NUM.key());
+        }
+
+        if (configuration.removeConfig(ResourceManagerOptions.MIN_TOTAL_CPU)) {
+            LOG.warn(
+                    "Config option {} will be ignored in standalone mode.",
+                    ResourceManagerOptions.MIN_TOTAL_CPU.key());
+        }
+
+        if (configuration.removeConfig(ResourceManagerOptions.MIN_TOTAL_MEM)) {
+            LOG.warn(
+                    "Config option {} will be ignored in standalone mode.",
+                    ResourceManagerOptions.MIN_TOTAL_MEM.key());
+        }
+
+        if (configuration.removeConfig(ResourceManagerOptions.MAX_SLOT_NUM)) {
             LOG.warn(
                     "Config option {} will be ignored in standalone mode.",
                     ResourceManagerOptions.MAX_SLOT_NUM.key());
         }
-        return copiedConfig;
+
+        if (configuration.removeConfig(ResourceManagerOptions.MAX_TOTAL_CPU)) {
+            LOG.warn(
+                    "Config option {} will be ignored in standalone mode.",
+                    ResourceManagerOptions.MAX_TOTAL_CPU.key());
+        }
+
+        if (configuration.removeConfig(ResourceManagerOptions.MAX_TOTAL_MEM)) {
+            LOG.warn(
+                    "Config option {} will be ignored in standalone mode.",
+                    ResourceManagerOptions.MAX_TOTAL_MEM.key());
+        }
     }
 }

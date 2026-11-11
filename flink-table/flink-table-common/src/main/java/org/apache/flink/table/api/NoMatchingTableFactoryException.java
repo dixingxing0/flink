@@ -18,8 +18,9 @@
 
 package org.apache.flink.table.api;
 
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.descriptors.DescriptorProperties;
-import org.apache.flink.table.factories.TableFactory;
+import org.apache.flink.table.legacy.factories.TableFactory;
 
 import javax.annotation.Nullable;
 
@@ -27,7 +28,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-/** Exception for not finding a {@link TableFactory} for the given properties. */
+/**
+ * Exception for not finding a {@link TableFactory} for the given properties.
+ *
+ * @deprecated This exception is considered internal and has been erroneously placed in the *.api
+ *     package. It is replaced by {@link
+ *     org.apache.flink.table.factories.NoMatchingTableFactoryException} and should not be used
+ *     directly anymore.
+ */
+@Internal
+@Deprecated
 public class NoMatchingTableFactoryException extends RuntimeException {
 
     // message that indicates the current matching step

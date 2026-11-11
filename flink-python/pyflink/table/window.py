@@ -16,11 +16,11 @@
 # limitations under the License.
 ################################################################################
 from py4j.java_gateway import get_method
-from typing import Union
 
 from pyflink.java_gateway import get_gateway
 from pyflink.table import Expression
 from pyflink.table.expression import _get_java_expression
+from pyflink.util.api_stability_decorators import PublicEvolving
 
 __all__ = [
     'Tumble',
@@ -31,7 +31,10 @@ __all__ = [
     'OverWindow'
 ]
 
+from pyflink.table.utils import to_expression_jarray
 
+
+@PublicEvolving()
 class GroupWindow(object):
     """
     A group window specification.
@@ -50,6 +53,7 @@ class GroupWindow(object):
         self._java_window = java_window
 
 
+@PublicEvolving()
 class Tumble(object):
     """
     Helper class for creating a tumbling window. Tumbling windows are consecutive, non-overlapping
@@ -59,16 +63,14 @@ class Tumble(object):
     Example:
     ::
 
-        >>> from pyflink.table import expressions as expr
-        >>> Tumble.over(expr.lit(10).minutes)
-        ...       .on(expr.col("rowtime"))
+        >>> from pyflink.table.expressions import col, lit
+        >>> Tumble.over(lit(10).minutes) \\
+        ...       .on(col("rowtime")) \\
         ...       .alias("w")
-
-        >>> Tumble.over("10.minutes").on("rowtime").alias("w")
     """
 
     @classmethod
-    def over(cls, size: Union[str, Expression]) -> 'TumbleWithSize':
+    def over(cls, size: Expression) -> 'TumbleWithSize':
         """
         Creates a tumbling window. Tumbling windows are fixed-size, consecutive, non-overlapping
         windows of a specified fixed length. For example, a tumbling window of 5 minutes size
@@ -80,6 +82,7 @@ class Tumble(object):
         return TumbleWithSize(get_gateway().jvm.Tumble.over(_get_java_expression(size)))
 
 
+@PublicEvolving()
 class TumbleWithSize(object):
     """
     Tumbling window.
@@ -92,7 +95,7 @@ class TumbleWithSize(object):
     def __init__(self, java_window):
         self._java_window = java_window
 
-    def on(self, time_field: Union[str, Expression]) -> 'TumbleWithSizeOnTime':
+    def on(self, time_field: Expression) -> 'TumbleWithSizeOnTime':
         """
         Specifies the time attribute on which rows are grouped.
 
@@ -107,6 +110,7 @@ class TumbleWithSize(object):
         return TumbleWithSizeOnTime(self._java_window.on(_get_java_expression(time_field)))
 
 
+@PublicEvolving()
 class TumbleWithSizeOnTime(object):
     """
     Tumbling window on time. You need to assign an alias for the window.
@@ -129,6 +133,7 @@ class TumbleWithSizeOnTime(object):
         return GroupWindow(get_method(self._java_window, "as")(alias))
 
 
+@PublicEvolving()
 class Session(object):
     """
     Helper class for creating a session window. The boundary of session windows are defined by
@@ -138,17 +143,14 @@ class Session(object):
     Example:
     ::
 
-        >>> from pyflink.table import expressions as expr
-        >>> Session.with_gap(expr.lit(10).minutes)
-        ...        .on(expr.col("rowtime"))
+        >>> from pyflink.table.expressions import col, lit
+        >>> Session.with_gap(lit(10).minutes) \\
+        ...        .on(col("rowtime")) \\
         ...        .alias("w")
-
-        >>> Session.with_gap("10.minutes").on("rowtime").alias("w")
-
     """
 
     @classmethod
-    def with_gap(cls, gap: Union[str, Expression]) -> 'SessionWithGap':
+    def with_gap(cls, gap: Expression) -> 'SessionWithGap':
         """
         Creates a session window. The boundary of session windows are defined by
         intervals of inactivity, i.e., a session window is closes if no event appears for a defined
@@ -161,6 +163,7 @@ class Session(object):
         return SessionWithGap(get_gateway().jvm.Session.withGap(_get_java_expression(gap)))
 
 
+@PublicEvolving()
 class SessionWithGap(object):
     """
     Session window.
@@ -173,7 +176,7 @@ class SessionWithGap(object):
     def __init__(self, java_window):
         self._java_window = java_window
 
-    def on(self, time_field: Union[str, Expression]) -> 'SessionWithGapOnTime':
+    def on(self, time_field: Expression) -> 'SessionWithGapOnTime':
         """
         Specifies the time attribute on which rows are grouped.
 
@@ -188,6 +191,7 @@ class SessionWithGap(object):
         return SessionWithGapOnTime(self._java_window.on(_get_java_expression(time_field)))
 
 
+@PublicEvolving()
 class SessionWithGapOnTime(object):
     """
     Session window on time. You need to assign an alias for the window.
@@ -210,6 +214,7 @@ class SessionWithGapOnTime(object):
         return GroupWindow(get_method(self._java_window, "as")(alias))
 
 
+@PublicEvolving()
 class Slide(object):
     """
     Helper class for creating a sliding window. Sliding windows have a fixed size and slide by
@@ -223,17 +228,15 @@ class Slide(object):
     Example:
     ::
 
-        >>> from pyflink.table import expressions as expr
-        >>> Slide.over(expr.lit(10).minutes)
-        ...      .every(expr.lit(5).minutes)
-        ...      .on(expr.col("rowtime"))
+        >>> from pyflink.table.expressions import col, lit
+        >>> Slide.over(lit(10).minutes) \\
+        ...      .every(lit(5).minutes) \\
+        ...      .on(col("rowtime")) \\
         ...      .alias("w")
-
-        >>> Slide.over("10.minutes").every("5.minutes").on("rowtime").alias("w")
     """
 
     @classmethod
-    def over(cls, size: Union[str, Expression]) -> 'SlideWithSize':
+    def over(cls, size: Expression) -> 'SlideWithSize':
         """
         Creates a sliding window. Sliding windows have a fixed size and slide by
         a specified slide interval. If the slide interval is smaller than the window size, sliding
@@ -249,6 +252,7 @@ class Slide(object):
         return SlideWithSize(get_gateway().jvm.Slide.over(_get_java_expression(size)))
 
 
+@PublicEvolving()
 class SlideWithSize(object):
     """
     Partially specified sliding window. The size of the window either as time or row-count
@@ -258,7 +262,7 @@ class SlideWithSize(object):
     def __init__(self, java_window):
         self._java_window = java_window
 
-    def every(self, slide: Union[str, Expression]) -> 'SlideWithSizeAndSlide':
+    def every(self, slide: Expression) -> 'SlideWithSizeAndSlide':
         """
         Specifies the window's slide as time or row-count interval.
 
@@ -275,6 +279,7 @@ class SlideWithSize(object):
         return SlideWithSizeAndSlide(self._java_window.every(_get_java_expression(slide)))
 
 
+@PublicEvolving()
 class SlideWithSizeAndSlide(object):
     """
     Sliding window. The size of the window either as time or row-count interval.
@@ -287,7 +292,7 @@ class SlideWithSizeAndSlide(object):
     def __init__(self, java_window):
         self._java_window = java_window
 
-    def on(self, time_field: Union[str, Expression]) -> 'SlideWithSizeAndSlideOnTime':
+    def on(self, time_field: Expression) -> 'SlideWithSizeAndSlideOnTime':
         """
         Specifies the time attribute on which rows are grouped.
 
@@ -299,6 +304,7 @@ class SlideWithSizeAndSlide(object):
         return SlideWithSizeAndSlideOnTime(self._java_window.on(_get_java_expression(time_field)))
 
 
+@PublicEvolving()
 class SlideWithSizeAndSlideOnTime(object):
     """
     Sliding window on time. You need to assign an alias for the window.
@@ -321,6 +327,7 @@ class SlideWithSizeAndSlideOnTime(object):
         return GroupWindow(get_method(self._java_window, "as")(alias))
 
 
+@PublicEvolving()
 class Over(object):
     """
     Helper class for creating an over window. Similar to SQL, over window aggregates compute an
@@ -331,17 +338,15 @@ class Over(object):
     Example:
     ::
 
-        >>> from pyflink.table import expressions as expr
+        >>> from pyflink.table.expressions import col, UNBOUNDED_RANGE
         >>> Over.partition_by(col("a")) \\
         ...     .order_by(col("rowtime")) \\
-        ...     .preceding(expr.UNBOUNDED_RANGE) \\
+        ...     .preceding(UNBOUNDED_RANGE) \\
         ...     .alias("w")
-
-        >>> Over.partition_by("a").order_by("rowtime").preceding("unbounded_range").alias("w")
     """
 
     @classmethod
-    def order_by(cls, order_by: Union[str, Expression]) -> 'OverWindowPartitionedOrdered':
+    def order_by(cls, order_by: Expression) -> 'OverWindowPartitionedOrdered':
         """
         Specifies the time attribute on which rows are ordered.
 
@@ -355,7 +360,7 @@ class Over(object):
             _get_java_expression(order_by)))
 
     @classmethod
-    def partition_by(cls, partition_by: Union[str, Expression]) -> 'OverWindowPartitioned':
+    def partition_by(cls, *partition_by: Expression) -> 'OverWindowPartitioned':
         """
         Partitions the elements on some partition keys.
 
@@ -366,9 +371,10 @@ class Over(object):
         :return: An over window with defined partitioning.
         """
         return OverWindowPartitioned(get_gateway().jvm.Over.partitionBy(
-            _get_java_expression(partition_by)))
+            to_expression_jarray(partition_by)))
 
 
+@PublicEvolving()
 class OverWindowPartitionedOrdered(object):
     """
     Partially defined over window with (optional) partitioning and order.
@@ -386,8 +392,7 @@ class OverWindowPartitionedOrdered(object):
         """
         return OverWindow(get_method(self._java_over_window, "as")(alias))
 
-    def preceding(self, preceding: Union[str, Expression]) \
-            -> 'OverWindowPartitionedOrderedPreceding':
+    def preceding(self, preceding: Expression) -> 'OverWindowPartitionedOrderedPreceding':
         """
         Set the preceding offset (based on time or row-count intervals) for over window.
 
@@ -398,6 +403,7 @@ class OverWindowPartitionedOrdered(object):
             self._java_over_window.preceding(_get_java_expression(preceding)))
 
 
+@PublicEvolving()
 class OverWindowPartitionedOrderedPreceding(object):
     """
     Partially defined over window with (optional) partitioning, order, and preceding.
@@ -416,8 +422,7 @@ class OverWindowPartitionedOrderedPreceding(object):
         """
         return OverWindow(get_method(self._java_over_window, "as")(alias))
 
-    def following(self, following: Union[str, Expression]) \
-            -> 'OverWindowPartitionedOrderedPreceding':
+    def following(self, following: Expression) -> 'OverWindowPartitionedOrderedPreceding':
         """
         Set the following offset (based on time or row-count intervals) for over window.
 
@@ -428,6 +433,7 @@ class OverWindowPartitionedOrderedPreceding(object):
             self._java_over_window.following(_get_java_expression(following)))
 
 
+@PublicEvolving()
 class OverWindowPartitioned(object):
     """
     Partially defined over window with partitioning.
@@ -436,7 +442,7 @@ class OverWindowPartitioned(object):
     def __init__(self, java_over_window):
         self._java_over_window = java_over_window
 
-    def order_by(self, order_by: Union[str, Expression]) -> 'OverWindowPartitionedOrdered':
+    def order_by(self, order_by: Expression) -> 'OverWindowPartitionedOrdered':
         """
         Specifies the time attribute on which rows are ordered.
 
@@ -452,6 +458,7 @@ class OverWindowPartitioned(object):
             _get_java_expression(order_by)))
 
 
+@PublicEvolving()
 class OverWindow(object):
     """
     An over window specification.

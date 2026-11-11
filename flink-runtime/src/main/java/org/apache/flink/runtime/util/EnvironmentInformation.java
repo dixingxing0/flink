@@ -18,6 +18,7 @@
 
 package org.apache.flink.runtime.util;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.configuration.GlobalConfiguration;
 import org.apache.flink.util.OperatingSystem;
 
@@ -33,6 +34,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
 
@@ -41,6 +43,8 @@ import java.util.Properties;
  * startup options, or the JVM version.
  */
 public class EnvironmentInformation {
+    @VisibleForTesting public static final String UNKNOWN_COMMIT_ID = "DecafC0ffeeD0d0F00d";
+    @VisibleForTesting public static final String UNKNOWN_COMMIT_ID_ABBREV = "DeadD0d0";
 
     private static final Logger LOG = LoggerFactory.getLogger(EnvironmentInformation.class);
 
@@ -64,7 +68,9 @@ public class EnvironmentInformation {
         return getVersionsInstance().scalaVersion;
     }
 
-    /** @return The Instant this version of the software was built. */
+    /**
+     * @return The Instant this version of the software was built.
+     */
     public static Instant getBuildTime() {
         return getVersionsInstance().gitBuildTime;
     }
@@ -77,17 +83,23 @@ public class EnvironmentInformation {
         return getVersionsInstance().gitBuildTimeStr;
     }
 
-    /** @return The last known commit id of this version of the software. */
+    /**
+     * @return The last known commit id of this version of the software.
+     */
     public static String getGitCommitId() {
         return getVersionsInstance().gitCommitId;
     }
 
-    /** @return The last known abbreviated commit id of this version of the software. */
+    /**
+     * @return The last known abbreviated commit id of this version of the software.
+     */
     public static String getGitCommitIdAbbrev() {
         return getVersionsInstance().gitCommitIdAbbrev;
     }
 
-    /** @return The Instant of the last commit of this code. */
+    /**
+     * @return The Instant of the last commit of this code.
+     */
     public static Instant getGitCommitTime() {
         return getVersionsInstance().gitCommitTime;
     }
@@ -113,8 +125,6 @@ public class EnvironmentInformation {
     private static final class Versions {
         private static final Instant DEFAULT_TIME_INSTANT = Instant.EPOCH;
         private static final String DEFAULT_TIME_STRING = "1970-01-01T00:00:00+0000";
-        private static final String UNKNOWN_COMMIT_ID = "DecafC0ffeeD0d0F00d";
-        private static final String UNKNOWN_COMMIT_ID_ABBREV = "DeadD0d0";
         private String projectVersion = UNKNOWN;
         private String scalaVersion = UNKNOWN;
         private Instant gitBuildTime = DEFAULT_TIME_INSTANT;
@@ -402,6 +412,8 @@ public class EnvironmentInformation {
 
             String inheritedLogs = System.getenv("FLINK_INHERITED_LOGS");
 
+            String arch = System.getProperty("os.arch");
+
             long maxHeapMegabytes = getMaxJvmHeapMemory() >>> 20;
 
             if (inheritedLogs != null) {
@@ -430,6 +442,7 @@ public class EnvironmentInformation {
             log.info(" OS current user: " + System.getProperty("user.name"));
             log.info(" Current Hadoop/Kerberos user: " + getHadoopUser());
             log.info(" JVM: " + jvmVersion);
+            log.info(" Arch: " + arch);
             log.info(" Maximum heap size: " + maxHeapMegabytes + " MiBytes");
             log.info(" JAVA_HOME: " + (javaHome == null ? "(not set)" : javaHome));
 
@@ -454,7 +467,7 @@ public class EnvironmentInformation {
             } else {
                 log.info(" Program Arguments:");
                 for (String s : commandLineArgs) {
-                    if (GlobalConfiguration.isSensitive(s)) {
+                    if (GlobalConfiguration.isSensitive(s, Collections.emptyList())) {
                         log.info(
                                 "    "
                                         + GlobalConfiguration.HIDDEN_CONTENT

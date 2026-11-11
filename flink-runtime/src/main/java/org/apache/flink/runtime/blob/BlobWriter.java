@@ -22,6 +22,7 @@ import org.apache.flink.api.common.JobID;
 import org.apache.flink.types.Either;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.SerializedValue;
+import org.apache.flink.util.clock.SystemClock;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -59,6 +60,14 @@ public interface BlobWriter {
     PermanentBlobKey putPermanent(JobID jobId, InputStream inputStream) throws IOException;
 
     /**
+     * Delete the uploaded data with the given {@link JobID} and {@link PermanentBlobKey}.
+     *
+     * @param jobId ID of the job this blob belongs to
+     * @param permanentBlobKey the key of this blob
+     */
+    boolean deletePermanent(JobID jobId, PermanentBlobKey permanentBlobKey);
+
+    /**
      * Returns the min size before data will be offloaded to the BLOB store.
      *
      * @return minimum offloading size
@@ -79,24 +88,51 @@ public interface BlobWriter {
     static <T> Either<SerializedValue<T>, PermanentBlobKey> serializeAndTryOffload(
             T value, JobID jobId, BlobWriter blobWriter) throws IOException {
         Preconditions.checkNotNull(value);
-        Preconditions.checkNotNull(jobId);
-        Preconditions.checkNotNull(blobWriter);
 
         final SerializedValue<T> serializedValue = new SerializedValue<>(value);
 
+        return tryOffload(serializedValue, jobId, blobWriter);
+    }
+
+    static <T> Either<SerializedValue<T>, PermanentBlobKey> tryOffload(
+            SerializedValue<T> serializedValue, JobID jobId, BlobWriter blobWriter) {
+        Preconditions.checkNotNull(serializedValue);
+        Preconditions.checkNotNull(jobId);
+        Preconditions.checkNotNull(blobWriter);
+
         if (serializedValue.getByteArray().length < blobWriter.getMinOffloadingSize()) {
-            return Either.Left(new SerializedValue<>(value));
+            return Either.Left(serializedValue);
         } else {
-            try {
-                final PermanentBlobKey permanentBlobKey =
-                        blobWriter.putPermanent(jobId, serializedValue.getByteArray());
+            return offloadWithException(serializedValue, jobId, blobWriter);
+        }
+    }
 
-                return Either.Right(permanentBlobKey);
-            } catch (IOException e) {
-                LOG.warn("Failed to offload value {} for job {} to BLOB store.", value, jobId, e);
-
-                return Either.Left(serializedValue);
-            }
+    static <T> Either<SerializedValue<T>, PermanentBlobKey> offloadWithException(
+            SerializedValue<T> serializedValue, JobID jobId, BlobWriter blobWriter) {
+        Preconditions.checkNotNull(serializedValue);
+        Preconditions.checkNotNull(jobId);
+        Preconditions.checkNotNull(blobWriter);
+        final SystemClock systemClock = SystemClock.getInstance();
+        final long offloadStartTs = systemClock.relativeTimeMillis();
+        try {
+            final PermanentBlobKey permanentBlobKey =
+                    blobWriter.putPermanent(jobId, serializedValue.getByteArray());
+            final Either<SerializedValue<T>, PermanentBlobKey> right =
+                    Either.Right(permanentBlobKey);
+            LOG.info(
+                    "BLOB for job {} with size: {} has been offloaded in {} millis",
+                    jobId,
+                    serializedValue.getByteArray().length,
+                    systemClock.relativeTimeMillis() - offloadStartTs);
+            return right;
+        } catch (IOException e) {
+            LOG.warn(
+                    "Failed to offload value for job {} to BLOB store with size: {} after {} millis",
+                    jobId,
+                    serializedValue.getByteArray().length,
+                    systemClock.relativeTimeMillis() - offloadStartTs,
+                    e);
+            return Either.Left(serializedValue);
         }
     }
 }

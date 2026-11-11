@@ -19,31 +19,31 @@
 package org.apache.flink.table.catalog;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.table.api.Schema;
+import org.apache.flink.table.api.Table;
+import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.operations.QueryOperation;
 
-import java.util.HashMap;
+import javax.annotation.Nullable;
+
+import java.util.Map;
 import java.util.Optional;
 
-/**
- * A view created from a {@link QueryOperation} via operations on {@link
- * org.apache.flink.table.api.Table}.
- */
+/** A view created from a {@link QueryOperation} via operations on {@link Table}. */
 @Internal
-public class QueryOperationCatalogView extends AbstractCatalogView {
+public final class QueryOperationCatalogView implements CatalogView {
+
     private final QueryOperation queryOperation;
+    private final @Nullable CatalogView originalView;
 
     public QueryOperationCatalogView(QueryOperation queryOperation) {
-        this(queryOperation, "");
+        this(queryOperation, null);
     }
 
-    public QueryOperationCatalogView(QueryOperation queryOperation, String comment) {
-        super(
-                queryOperation.asSummaryString(),
-                queryOperation.asSummaryString(),
-                queryOperation.getTableSchema(),
-                new HashMap<>(),
-                comment);
+    public QueryOperationCatalogView(
+            final QueryOperation queryOperation, final CatalogView originalView) {
         this.queryOperation = queryOperation;
+        this.originalView = originalView;
     }
 
     public QueryOperation getQueryOperation() {
@@ -51,8 +51,33 @@ public class QueryOperationCatalogView extends AbstractCatalogView {
     }
 
     @Override
+    public Schema getUnresolvedSchema() {
+        return Optional.ofNullable(originalView)
+                .map(CatalogView::getUnresolvedSchema)
+                .orElseGet(
+                        () ->
+                                Schema.newBuilder()
+                                        .fromResolvedSchema(queryOperation.getResolvedSchema())
+                                        .build());
+    }
+
+    @Override
+    public Map<String, String> getOptions() {
+        if (originalView == null) {
+            throw new TableException("A view backed by a query operation has no options.");
+        } else {
+            return originalView.getOptions();
+        }
+    }
+
+    @Override
+    public String getComment() {
+        return Optional.ofNullable(originalView).map(CatalogView::getComment).orElse("");
+    }
+
+    @Override
     public QueryOperationCatalogView copy() {
-        return new QueryOperationCatalogView(this.queryOperation, getComment());
+        return new QueryOperationCatalogView(queryOperation, originalView);
     }
 
     @Override
@@ -63,5 +88,35 @@ public class QueryOperationCatalogView extends AbstractCatalogView {
     @Override
     public Optional<String> getDetailedDescription() {
         return getDescription();
+    }
+
+    @Override
+    public String getOriginalQuery() {
+        if (originalView == null) {
+            throw new TableException(
+                    "A view backed by a query operation has no serializable representation.");
+        } else {
+            return originalView.getOriginalQuery();
+        }
+    }
+
+    @Override
+    public String getExpandedQuery() {
+        if (originalView == null) {
+            throw new TableException(
+                    "A view backed by a query operation has no serializable representation.");
+        } else {
+            return originalView.getExpandedQuery();
+        }
+    }
+
+    @Internal
+    public boolean supportsShowCreateView() {
+        return originalView != null;
+    }
+
+    @Internal
+    public Optional<CatalogView> getOriginalView() {
+        return Optional.ofNullable(originalView);
     }
 }

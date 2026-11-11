@@ -24,6 +24,8 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.util.Set;
 
 public class TestFileUtils {
 
@@ -135,12 +137,38 @@ public class TestFileUtils {
         return f.toURI().toString();
     }
 
+    public static String createTempFileDirForProvidedFormats(File tempDir, Set<String> formats)
+            throws IOException {
+        File f = null;
+        do {
+            f = new File(tempDir, randomFileName(FILE_SUFFIX));
+        } while (f.exists());
+        f.mkdirs();
+        f.deleteOnExit();
+
+        for (String extension : formats) {
+            File child = new File(f, randomFileName("." + extension));
+            child.deleteOnExit();
+
+            try (BufferedWriter out = new BufferedWriter(new FileWriter(child))) {
+                out.write("random text " + Math.random());
+            }
+        }
+        return f.toURI().toString();
+    }
+
     public static String randomFileName() {
         return randomFileName(FILE_SUFFIX);
     }
 
     public static String randomFileName(String fileSuffix) {
         return FILE_PREFIX + ((int) (Math.random() * Integer.MAX_VALUE)) + fileSuffix;
+    }
+
+    public static File createTempDir() throws IOException {
+        final File tempDirectory = Files.createTempDirectory(FILE_PREFIX).toFile();
+        tempDirectory.deleteOnExit();
+        return tempDirectory;
     }
 
     // ------------------------------------------------------------------------

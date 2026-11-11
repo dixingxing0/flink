@@ -18,6 +18,8 @@
 
 package org.apache.flink.table.catalog;
 
+import org.apache.flink.annotation.Internal;
+
 import javax.annotation.Nullable;
 
 import java.util.HashMap;
@@ -27,6 +29,7 @@ import java.util.Optional;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /** A implementation of {@link CatalogDatabase}. */
+@Internal
 public class CatalogDatabaseImpl implements CatalogDatabase {
     // Property of the database
     private final Map<String, String> properties;
@@ -58,6 +61,11 @@ public class CatalogDatabaseImpl implements CatalogDatabase {
      * @return a copy of CatalogDatabase instance
      */
     public CatalogDatabase copy() {
+        return copy(getProperties());
+    }
+
+    @Override
+    public CatalogDatabase copy(Map<String, String> properties) {
         return new CatalogDatabaseImpl(new HashMap<>(properties), comment);
     }
 

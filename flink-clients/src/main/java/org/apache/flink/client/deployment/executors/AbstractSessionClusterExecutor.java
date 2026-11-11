@@ -19,6 +19,7 @@
 package org.apache.flink.client.deployment.executors;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.dag.Pipeline;
 import org.apache.flink.client.ClientUtils;
 import org.apache.flink.client.deployment.ClusterClientFactory;
@@ -27,14 +28,30 @@ import org.apache.flink.client.deployment.ClusterDescriptor;
 import org.apache.flink.client.program.ClusterClient;
 import org.apache.flink.client.program.ClusterClientProvider;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.DeploymentOptions;
+import org.apache.flink.core.execution.CacheSupportedPipelineExecutor;
 import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.core.execution.JobRetrievalSupportedPipelineExecutor;
+import org.apache.flink.core.execution.JobStatusChangedListener;
+import org.apache.flink.core.execution.JobStatusChangedListenerUtils;
 import org.apache.flink.core.execution.PipelineExecutor;
-import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
+import org.apache.flink.streaming.api.graph.StreamGraph;
+import org.apache.flink.util.AbstractID;
+import org.apache.flink.util.concurrent.ExecutorThreadFactory;
+import org.apache.flink.util.concurrent.FutureUtils;
 import org.apache.flink.util.function.FunctionUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
 
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkState;
@@ -50,12 +67,25 @@ import static org.apache.flink.util.Preconditions.checkState;
 @Internal
 public class AbstractSessionClusterExecutor<
                 ClusterID, ClientFactory extends ClusterClientFactory<ClusterID>>
-        implements PipelineExecutor {
+        implements CacheSupportedPipelineExecutor, JobRetrievalSupportedPipelineExecutor {
+    private static final Logger LOG = LoggerFactory.getLogger(AbstractSessionClusterExecutor.class);
+    private final ExecutorService executorService =
+            Executors.newFixedThreadPool(
+                    1, new ExecutorThreadFactory("Flink-SessionClusterExecutor-IO"));
 
     private final ClientFactory clusterClientFactory;
+    private final Configuration configuration;
+    private final List<JobStatusChangedListener> jobStatusChangedListeners;
 
-    public AbstractSessionClusterExecutor(@Nonnull final ClientFactory clusterClientFactory) {
+    public AbstractSessionClusterExecutor(
+            @Nonnull final ClientFactory clusterClientFactory, Configuration configuration) {
         this.clusterClientFactory = checkNotNull(clusterClientFactory);
+        this.configuration = configuration;
+        this.jobStatusChangedListeners =
+                JobStatusChangedListenerUtils.createJobStatusChangedListeners(
+                        Thread.currentThread().getContextClassLoader(),
+                        configuration,
+                        executorService);
     }
 
     @Override
@@ -64,7 +94,7 @@ public class AbstractSessionClusterExecutor<
             @Nonnull final Configuration configuration,
             @Nonnull final ClassLoader userCodeClassloader)
             throws Exception {
-        final JobGraph jobGraph = PipelineExecutorUtils.getJobGraph(pipeline, configuration);
+        StreamGraph streamGraph = PipelineExecutorUtils.getStreamGraph(pipeline, configuration);
 
         try (final ClusterDescriptor<ClusterID> clusterDescriptor =
                 clusterClientFactory.createClusterDescriptor(configuration)) {
@@ -74,8 +104,10 @@ public class AbstractSessionClusterExecutor<
             final ClusterClientProvider<ClusterID> clusterClientProvider =
                     clusterDescriptor.retrieve(clusterID);
             ClusterClient<ClusterID> clusterClient = clusterClientProvider.getClusterClient();
+
+            streamGraph.serializeUserDefinedInstances();
             return clusterClient
-                    .submitJob(jobGraph)
+                    .submitJob(streamGraph)
                     .thenApplyAsync(
                             FunctionUtils.uncheckedFunction(
                                     jobId -> {
@@ -92,7 +124,78 @@ public class AbstractSessionClusterExecutor<
                                                     clusterClientProvider,
                                                     jobID,
                                                     userCodeClassloader))
-                    .whenComplete((ignored1, ignored2) -> clusterClient.close());
+                    .whenCompleteAsync(
+                            (jobClient, throwable) -> {
+                                if (throwable == null) {
+                                    PipelineExecutorUtils.notifyJobStatusListeners(
+                                            pipeline, streamGraph, jobStatusChangedListeners);
+                                } else {
+                                    LOG.error(
+                                            "Failed to submit job graph to remote session cluster.",
+                                            throwable);
+                                }
+                                clusterClient.close();
+                            });
+        }
+    }
+
+    @Override
+    public CompletableFuture<JobClient> retrieveJobClient(
+            JobID jobId, Configuration configuration, ClassLoader userCodeClassloader) {
+        try {
+            final ClusterID clusterId = clusterClientFactory.getClusterId(configuration);
+            checkState(
+                    clusterId != null,
+                    "No cluster id is configured for execution target '%s'.",
+                    configuration.get(DeploymentOptions.TARGET));
+
+            try (ClusterDescriptor<ClusterID> clusterDescriptor =
+                    clusterClientFactory.createClusterDescriptor(
+                            new Configuration(configuration))) {
+                return CompletableFuture.completedFuture(
+                        new ClusterClientJobClientAdapter<>(
+                                clusterDescriptor.retrieve(clusterId), jobId, userCodeClassloader));
+            }
+        } catch (Exception e) {
+            return FutureUtils.completedExceptionally(e);
+        }
+    }
+
+    @Override
+    public CompletableFuture<Set<AbstractID>> listCompletedClusterDatasetIds(
+            Configuration configuration, ClassLoader userCodeClassloader) throws Exception {
+
+        try (final ClusterDescriptor<ClusterID> clusterDescriptor =
+                clusterClientFactory.createClusterDescriptor(configuration)) {
+            final ClusterID clusterID = clusterClientFactory.getClusterId(configuration);
+            checkState(clusterID != null);
+
+            final ClusterClientProvider<ClusterID> clusterClientProvider =
+                    clusterDescriptor.retrieve(clusterID);
+
+            final ClusterClient<ClusterID> clusterClient = clusterClientProvider.getClusterClient();
+            return clusterClient.listCompletedClusterDatasetIds();
+        }
+    }
+
+    @Override
+    public CompletableFuture<Void> invalidateClusterDataset(
+            AbstractID clusterDatasetId,
+            Configuration configuration,
+            ClassLoader userCodeClassloader)
+            throws Exception {
+        try (final ClusterDescriptor<ClusterID> clusterDescriptor =
+                clusterClientFactory.createClusterDescriptor(configuration)) {
+            final ClusterID clusterID = clusterClientFactory.getClusterId(configuration);
+            checkState(clusterID != null);
+
+            final ClusterClientProvider<ClusterID> clusterClientProvider =
+                    clusterDescriptor.retrieve(clusterID);
+
+            final ClusterClient<ClusterID> clusterClient = clusterClientProvider.getClusterClient();
+            return clusterClient
+                    .invalidateClusterDataset(new IntermediateDataSetID(clusterDatasetId))
+                    .thenApply(acknowledge -> null);
         }
     }
 }

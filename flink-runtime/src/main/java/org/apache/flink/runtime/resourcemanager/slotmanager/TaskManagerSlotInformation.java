@@ -18,15 +18,27 @@
 
 package org.apache.flink.runtime.resourcemanager.slotmanager;
 
+import org.apache.flink.api.common.JobID;
+import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.clusterframework.types.SlotID;
 import org.apache.flink.runtime.instance.InstanceID;
 import org.apache.flink.runtime.resourcemanager.registration.TaskExecutorConnection;
 
-/** Basic information about a {@link TaskManagerSlot}. */
+import javax.annotation.Nullable;
+
+/** Basic information about a TaskManager slot. */
 public interface TaskManagerSlotInformation {
 
     SlotID getSlotId();
+
+    @Nullable
+    AllocationID getAllocationId();
+
+    @Nullable
+    JobID getJobId();
+
+    SlotState getState();
 
     InstanceID getInstanceId();
 
@@ -48,4 +60,18 @@ public interface TaskManagerSlotInformation {
      * @return resource profile of this slot
      */
     ResourceProfile getResourceProfile();
+
+    /**
+     * Set the number of tasks assigned to the current slot.
+     *
+     * @param assignedTasks The number of tasks assigned to the current slot.
+     */
+    void setAssignedTasks(int assignedTasks);
+
+    /**
+     * Get the number of tasks assigned to the current slot.
+     *
+     * @return The number of tasks assigned to the current slot.
+     */
+    int getAssignedTasks();
 }
